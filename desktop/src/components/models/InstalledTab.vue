@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { runWithLicenseConsent } from "@studio/composables/useLicenseAcceptance";
 /*
  * Ready to use — every style on any connected machine, grouped by family
  * under a mono heading (README §04 table). A disk meter opens the shelf when
@@ -46,7 +47,7 @@ import { familyLabel } from "@studio/lib/modelFamily";
 import { openExternal } from "../../lib/openExternal";
 import { loadModel, removeModel, unloadModel } from "../../lib/api/models";
 import { startCatalogDownload } from "../../lib/api/catalog";
-import { ApiError } from "../../lib/api/client";
+import { ApiError, currentTarget } from "../../lib/api/client";
 import { formatGB, percent } from "../../lib/format";
 import { mediaTypeMatches, type MediaType } from "../../lib/modelAvailability";
 import { useGalleryStore } from "../../stores/gallery";
@@ -255,6 +256,7 @@ async function remove(m: LibraryModelEntry) {
 const drawerRepairing = ref(false);
 
 function requestDownload(m: LibraryModelEntry) {
+  if (drawerRepairing.value) return;
   const candidates = installPlan(m).targets;
   if (candidates.length === 0) {
     toasts.push("No online machine is available for this style.", "error");
@@ -270,10 +272,17 @@ function requestDownload(m: LibraryModelEntry) {
 async function downloadOnHost(m: LibraryModelEntry, host: HostView | null) {
   pendingRepair.value = null;
   drawerRepairing.value = true;
+  busy.value = m.name;
   const owns = (m.hostIds ?? ["local"]).includes(host?.id ?? "local");
   try {
-    const target = targetForHost(host);
-    await startCatalogDownload(m.name, target, !!target);
+    const target = targetForHost(host) ?? currentTarget();
+    const outcome = await runWithLicenseConsent({
+      hostLabel: host?.label ?? "This device",
+      target,
+      installModel: m.name,
+      start: () => startCatalogDownload(m.name, target, host?.kind === "remote"),
+    });
+    if (outcome.kind === "declined") return;
     toasts.push(
       `${owns ? "Repairing" : "Getting"} ${modelDisplayName(m)}${host ? ` on ${host.label}` : ""}`,
     );
@@ -286,6 +295,7 @@ async function downloadOnHost(m: LibraryModelEntry, host: HostView | null) {
     );
   } finally {
     drawerRepairing.value = false;
+    busy.value = null;
   }
 }
 
@@ -475,6 +485,7 @@ async function unload(m: LibraryModelEntry) {
     :entry="installedModelToEntry(detailModel)"
     :pulling="drawerRepairing"
     :target="targetFor(detailModel)"
+    :host-label="targetHost(detailModel)?.label"
     :forward-credentials="!!targetFor(detailModel)"
     :mode="installPlan(detailModel).label === 'Repair' ? 'repair' : 'fresh'"
     :runtime-notice="modelRuntimeNotice(detailModel)"
