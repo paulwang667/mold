@@ -1,0 +1,101 @@
+import MoldClient
+import SwiftUI
+
+// The two bodies. Every bound is the HOST's -- the size range, the axes it
+// accepts, the origins, and the turntable's own limits -- so a control here
+// can never ask for something the server refuses.
+extension MeshExportSheet {
+
+    @ViewBuilder var geometryBody: some View {
+        if let capabilities = prompt.capabilities {
+            // Only where the host's own default for this format is unscaled:
+            // everywhere else an absent `size_mm` means ITS default, not
+            // "leave it alone", and the toggle would be a lie.
+            if prompt.offersAsStored {
+                Toggle("Resize for printing", isOn: $scaled)
+            }
+            if scaled || !prompt.offersAsStored {
+                HStack {
+                    Text("Longest side")
+                    Slider(value: Binding(
+                        get: { geometry.sizeMm ?? capabilities.sizeMm.default },
+                        set: { geometry.sizeMm = $0 }),
+                        in: capabilities.sizeMm.min...capabilities.sizeMm.max)
+                    Text("\(Int((geometry.sizeMm ?? capabilities.sizeMm.default).rounded())) mm")
+                        .monospacedDigit()
+                        .frame(width: 70, alignment: .trailing)
+                }
+            }
+            Picker("Up axis", selection: $geometry.upAxis) {
+                ForEach(capabilities.upAxes, id: \.self) { axis in
+                    Text(axis == .z ? "Z up" : "Y up").tag(axis)
+                }
+            }
+            Picker("Origin", selection: $geometry.origin) {
+                ForEach(capabilities.origins, id: \.self) { origin in
+                    Text(origin == .floor ? "On the floor" : "Centred").tag(origin)
+                }
+            }
+            Text(MeshExportGeometry.sizeLabel(bounds: prompt.bounds, options: resolved))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        } else {
+            // Absence of `capabilities.mesh.export_geometry` is the ONE gate:
+            // an older host DROPS these keys rather than refusing them, so
+            // offering knobs would promise a resize it never performs.
+            Text("This machine writes the mesh in its stored units.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// What `resolved` would post, so the sentence and the request agree.
+    var resolved: MeshExportGeometry {
+        var value = geometry
+        if !scaled, prompt.offersAsStored { value.sizeMm = nil }
+        return value
+    }
+
+    @ViewBuilder var turntableBody: some View {
+        // The stepper's ceiling is the BUDGET's, not the field's: the server
+        // refuses a whole sweep whose frame buffer is over 256 MiB, and 36
+        // views at 2048 px is 432 MiB. Re-derived as the size and the
+        // backdrop change, and the held value follows it down.
+        Stepper(value: $turntable.frames,
+                in: MeshTurntableOptions.frameBounds.lowerBound...frameCeiling, step: 4) {
+            Text("\(turntable.frames) views around the mesh")
+        }
+        Stepper(value: $turntable.fps, in: MeshTurntableOptions.fpsBounds) {
+            Text("\(turntable.fps) frames a second")
+        }
+        Picker("Size", selection: $turntable.maxDimension) {
+            ForEach(Self.offeredDimensions, id: \.self) { edge in
+                Text("\(edge) px").tag(edge)
+            }
+        }
+        Toggle("Transparent background", isOn: $turntable.transparent)
+        Text(duration).font(.callout).foregroundStyle(.secondary)
+        if let note = turntable.budgetNote {
+            Text(note).font(.callout).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Every size worth offering between the server's own floor and ceiling.
+    static var offeredDimensions: [Int] {
+        [MeshTurntableOptions.dimensionBounds.lowerBound, 512, 1024,
+         MeshTurntableOptions.dimensionBounds.upperBound]
+    }
+
+    /// The most views this size and this backdrop can afford.
+    var frameCeiling: Int {
+        MeshTurntableOptions.maximumFrames(atDimension: turntable.maxDimension,
+                                           transparent: turntable.transparent)
+    }
+
+    /// How long the clip will run, which is the thing the two steppers
+    /// together decide and neither says on its own.
+    private var duration: String {
+        let seconds = Double(turntable.frames) / Double(max(turntable.fps, 1))
+        return "\(String(format: "%.1f", seconds)) seconds a turn"
+    }
+}

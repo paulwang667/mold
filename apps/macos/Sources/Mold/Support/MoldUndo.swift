@@ -1,0 +1,118 @@
+import Foundation
+import MoldClient
+
+/// The Edit menu's Undo, for library edits.
+///
+/// Thin on purpose. Everything interesting about undoing a library edit --
+/// what a change actually altered, and what reverses it -- is `PrintEdit`, a
+/// value in `MoldClient` with tests. This is only the bridge to AppKit.
+@MainActor
+final class MoldUndo {
+    /// The WINDOW's undo manager, handed over by the view that owns the
+    /// library, never one of our own making.
+    ///
+    /// SwiftUI's `.undoRedo` command group targets whatever the responder
+    /// chain answers with, so a private manager would give us a working stack
+    /// and a dead menu item. Taking the window's is also what lets ⌘Z reach a
+    /// text field's own manager while one is first responder: the field is
+    /// nearer in the chain, and our registrations simply are not what ⌘Z finds.
+    var manager: UndoManager?
+
+    /// Every token this store has registered against, so `forget()` can still
+    /// clear the lot when a change makes the whole stack meaningless.
+    private var ours: [UndoToken] = []
+    /// Which registration each outbox entry is carrying, so a refusal removes
+    /// one entry's inverse rather than everything.
+    private var byEntry: [String: UndoToken] = [:]
+
+    /// Registers the inverse of a change that just happened.
+    ///
+    /// The caller hands over the edit it APPLIED; what is registered is that
+    /// edit's inverse. An empty edit registers nothing, which is what keeps
+    /// favouriting an already-favourite print out of the Edit menu entirely.
+    ///
+    /// `apply` must be the same funnel the original change went through. That
+    /// is what makes redo free: undoing calls it with the inverse, which
+    /// registers the inverse's inverse -- the original change again.
+    @discardableResult
+    func register(_ edit: PrintEdit, apply: @escaping (PrintEdit) -> Void) -> UndoToken? {
+        guard !edit.isEmpty else { return nil }
+        let inverse = edit.inverse
+        return register(edit.actionName) { apply(inverse) }
+    }
+
+    /// Registers an inverse for a change that is not about a set of prints --
+    /// renaming a tag across the whole library, say.
+    ///
+    /// `inverse` must go through the same path the original change took. That
+    /// is what makes redo free: undoing calls it, and it registers its own
+    /// inverse in turn, which is the original change again.
+    @discardableResult
+    func register(_ actionName: String, inverse: @escaping () -> Void) -> UndoToken? {
+        guard let manager else { return nil }
+        // Against a token of its OWN, never against this object: `UndoManager`
+        // has no per-registration removal, only `removeAllActions(withTarget:)`,
+        // so one shared target meant a refused edit threw away every library
+        // entry on both stacks -- the favourite that DID happen could no longer
+        // be undone, and "Redo Favorite" vanished with it.
+        let token = UndoToken()
+        ours.append(token)
+        manager.registerUndo(withTarget: token) { _ in
+            // `UndoManager` calls back on whichever thread invoked undo, and
+            // for a menu item that is the main one. The store it is about to
+            // touch is `@MainActor`, so state the fact rather than hopping --
+            // a hop would let a second undo start before the first finished.
+            MainActor.assumeIsolated { inverse() }
+        }
+        // While undoing, the registration above IS the redo entry, and naming
+        // it after the inverse would put "Redo Unfavorite" in the menu of
+        // someone who asked to undo a favourite.
+        if !manager.isUndoing {
+            manager.setActionName(actionName)
+        }
+        return token
+    }
+
+    /// Ties a registration to the outbox entries carrying it to the machines,
+    /// so a refusal can name exactly one.
+    func attach(_ token: UndoToken?, to entryIDs: [String]) {
+        guard let token else { return }
+        for id in entryIDs { byEntry[id] = token }
+    }
+
+    /// This entry reached its machine. The registration stays; only the note
+    /// of which entry it belonged to goes.
+    func settled(entry id: String) {
+        byEntry[id] = nil
+    }
+
+    /// This entry was refused. Its inverse describes something that never
+    /// happened, so that ONE registration goes -- and nothing else does.
+    func forget(entry id: String) {
+        guard let token = byEntry.removeValue(forKey: id) else { return }
+        manager?.removeAllActions(withTarget: token)
+        ours.removeAll { $0 === token }
+    }
+
+    /// Forgets OUR entries. For a change that makes them meaningless -- a tag
+    /// deleted everywhere, or an edit a machine refused.
+    ///
+    /// Scoped to this target, because `manager` is the WINDOW's and is shared
+    /// with every `NSTextField` field editor in it: `removeAllActions()` threw
+    /// away the rename you were about to undo and whatever a focused field had
+    /// recorded. `register` already registers `withTarget: self`, so the
+    /// targeted form removes exactly what this object put there.
+    func forget() {
+        for token in ours { manager?.removeAllActions(withTarget: token) }
+        ours.removeAll()
+        byEntry.removeAll()
+    }
+}
+
+/// One edit's registration, and the reason it exists: `UndoManager` removes by
+/// TARGET, so a target per edit is the only way to take back one entry.
+///
+/// Held by `MoldUndo` for as long as the entry it belongs to might be refused,
+/// and by the manager itself for as long as the registration lives.
+@MainActor
+final class UndoToken {}

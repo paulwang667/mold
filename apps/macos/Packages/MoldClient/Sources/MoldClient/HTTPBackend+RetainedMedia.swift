@@ -1,0 +1,82 @@
+import Foundation
+
+// Reading a print's retained private conditioning media, and minting the
+// one-use handle that lets the host hydrate a request from it.
+public extension HTTPBackend {
+
+    /// What this host retained for one print.
+    ///
+    /// A keyed host rejects the probe in MIDDLEWARE, before the handler can
+    /// answer -- that IS the auth state, and the one case this wording is
+    /// about, so it is reported rather than thrown for a caller's `catch` to
+    /// swallow into silence (`gallerySourceMedia.ts:54-64`). Everything else
+    /// still throws, so the server stays the only authority on the other
+    /// three states.
+    func retainedSourceMedia(
+        for filename: String
+    ) async throws -> RetainedSourceMedia.Inventory {
+        do {
+            return try await get(retainedSourceMediaPath(filename))
+        } catch MoldClientError.unauthorized {
+            return RetainedSourceMedia.Inventory(availability: .unavailableAuth)
+        }
+    }
+
+    /// One retained file's original bytes.
+    ///
+    /// STREAMED and bounded as it arrives, not read whole and then measured:
+    /// a retained member is the one answer in this app that is routinely tens
+    /// or hundreds of megabytes, so a ceiling applied after the fact stops
+    /// this app KEEPING the bytes without stopping the allocation. The
+    /// declared length is refused before a byte is read, and the count is
+    /// kept as it comes in because a host that lies about the length is
+    /// exactly the one a ceiling exists for (`ResponseCeiling`, and the
+    /// thumbnail route's own note).
+    func retainedSourceMediaBytes(
+        for filename: String, member memberId: String
+    ) async throws -> Data {
+        let route = retainedSourceMediaPath(filename) + "/\(escaped(memberId))"
+        let (stream, response) = try await session.bytes(
+            for: request(route), delegate: redirectGuard)
+        guard let http = response as? HTTPURLResponse else {
+            throw MoldClientError.malformedResponse
+        }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            if http.statusCode == 401 { throw MoldClientError.unauthorized }
+            throw MoldClientError.http(status: http.statusCode, code: nil, message: nil)
+        }
+        guard http.expectedContentLength <= Int64(ResponseCeiling.media) else {
+            throw ResponseCeiling.Exceeded(
+                bytes: Int(clamping: http.expectedContentLength),
+                ceiling: ResponseCeiling.media, what: "retained source media")
+        }
+        return try await stream.collected(upTo: ResponseCeiling.media)
+    }
+
+    /// Mints the handle for a SAME-HOST reuse.
+    ///
+    /// The host hashes `target_request`, so the handle is bound to the exact
+    /// request about to be submitted: any later edit to a hydrated role makes
+    /// it a `RETAINED_MEDIA_REUSE_SCOPE_MISMATCH` and it has to be minted
+    /// again. Never logged, never persisted, never put in a URL.
+    func retainedMediaReuseSession(
+        for filename: String, members memberIds: [String], target: GenerateRequest
+    ) async throws -> RetainedSourceMedia.ReuseSession {
+        try await post(retainedSourceMediaPath(filename) + "/reuse-sessions",
+                       body: ReuseSessionBody(targetRequest: target, memberIds: memberIds))
+    }
+}
+
+/// The body of `POST …/reuse-sessions` (`CreateReuseSessionRequest`).
+struct ReuseSessionBody: Encodable {
+    let targetRequest: GenerateRequest
+    let memberIds: [String]
+}
+
+/// Path construction, split out so a test can pin it without a network call
+/// -- the `historyPath` / `transferExportPath` precedent.
+extension HTTPBackend {
+    func retainedSourceMediaPath(_ filename: String) -> String {
+        "/api/gallery/source-media/\(escaped(filename))"
+    }
+}

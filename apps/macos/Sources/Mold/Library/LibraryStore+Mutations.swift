@@ -1,0 +1,130 @@
+import Foundation
+import MoldClient
+
+// What the UI asks for. Each of these narrows a request to the prints it would
+// actually change and hands it to `apply`, which is the one place that mutates,
+// registers the undo and talks to the machines.
+@MainActor
+extension LibraryStore {
+
+    // MARK: - Trash
+
+    func refreshTrash() async {
+        await withTaskGroup(of: (MoldHost, Result<Fetched<[GalleryPrint]>, Error>).self) { group in
+            for host in hosts.hosts {
+                let client = hosts.backend(for: host)
+                let etag = trashEtags[host.id]
+                group.addTask {
+                    do { return (host, .success(try await client.trashedPrints(etag: etag))) }
+                    catch { return (host, .failure(error)) }
+                }
+            }
+            for await (host, result) in group {
+                switch result {
+                case let .success(.fresh(prints, etag)):
+                    trashPerHost[host.id] = prints.map { LibraryEntry(host: host, print: $0) }
+                    if let etag { trashEtags[host.id] = etag }
+                    // Scoped: this passive listing runs right after
+                    // `emptyTrash` too, and must not clear what THAT reported.
+                    hosts.succeeded(on: host.id, doing: "list its trash")
+                case .success(.notModified):
+                    hosts.succeeded(on: host.id, doing: "list its trash")
+                case let .failure(error):
+                    hosts.report(error, on: host.id, doing: "list its trash")
+                }
+            }
+        }
+        trashed = trashPerHost.values.flatMap(\.self)
+            .sorted { ($0.print.trashedAt ?? 0) > ($1.print.trashedAt ?? 0) }
+        rows.bump()
+    }
+
+    // MARK: - Mutations
+
+    func setFavorite(_ favorite: Bool, on entries: [LibraryEntry]) {
+        apply(PrintEdit.plan(.favorite(favorite), over: entries))
+    }
+
+    func setTag(_ tag: String, adding: Bool, on entries: [LibraryEntry]) {
+        let clean = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        apply(PrintEdit.plan(.tag(clean, adding: adding), over: entries))
+    }
+
+    /// Names one print. The old name travels with the change so undo can put
+    /// it back -- see `PrintChange.title`.
+    func setTitle(_ title: String, on entry: LibraryEntry) {
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        apply(PrintEdit.plan(.title(from: entry.print.title ?? "", to: clean), over: [entry]))
+    }
+
+    /// Trash keeps the bytes and starts a purge countdown; it is not a delete.
+    ///
+    /// Deliberately NOT on the undo stack. It already has a better answer --
+    /// the print sits in Recently Deleted with its own countdown and its own
+    /// Put Back, which survives quitting the app in a way an undo stack does
+    /// not.
+    func moveToTrash(_ entries: [LibraryEntry]) async {
+        let ids = Set(entries.map(\.id))
+        for (hostID, group) in Dictionary(grouping: entries, by: \.hostID) {
+            let before = perHost[hostID]
+            perHost[hostID] = (perHost[hostID] ?? []).filter { !ids.contains($0.id) }
+            rebuild()
+            guard let client = hosts.backend(for: hostID) else { continue }
+            do {
+                try await client.trash(group.map(\.print.filename))
+                hosts.succeeded(on: hostID)
+            } catch {
+                // Only THIS machine's rows come back -- a refusal here says
+                // nothing about the machines that already succeeded.
+                perHost[hostID] = before
+                rebuild()
+                hosts.report(error, on: hostID, doing: "move those to the trash")
+            }
+        }
+        trashEtags.removeAll()
+    }
+
+    func restore(_ entries: [LibraryEntry]) async {
+        for (hostID, group) in Dictionary(grouping: entries, by: \.hostID) {
+            guard let client = hosts.backend(for: hostID) else { continue }
+            do {
+                try await client.restoreFromTrash(group.map(\.print.filename))
+                hosts.succeeded(on: hostID)
+            } catch {
+                hosts.report(error, on: hostID, doing: "put those back")
+            }
+        }
+        etags.removeAll()
+        trashEtags.removeAll()
+    }
+
+    /// Permanent on the host. Nothing here can undo it, which is why the panes
+    /// ask first.
+    func deleteForever(_ entries: [LibraryEntry]) async {
+        for (hostID, group) in Dictionary(grouping: entries, by: \.hostID) {
+            guard let client = hosts.backend(for: hostID) else { continue }
+            do {
+                try await client.deleteForever(group.map(\.print.filename))
+                hosts.succeeded(on: hostID)
+            } catch {
+                hosts.report(error, on: hostID, doing: "delete those permanently")
+            }
+        }
+        trashEtags.removeAll()
+    }
+
+    /// Empties every machine's trash at once. The confirmation lives in
+    /// `LibraryActions+Destructive`; this is what runs once someone agrees.
+    func emptyTrash() async {
+        for host in hosts.hosts {
+            do {
+                try await hosts.backend(for: host).emptyTrash()
+                hosts.succeeded(on: host.id)
+            } catch {
+                hosts.report(error, on: host.id, doing: "empty the trash")
+            }
+        }
+        await refreshTrash()
+    }
+}

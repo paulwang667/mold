@@ -1,0 +1,111 @@
+import Foundation
+import MoldClient
+
+// Asking each machine whether it is there, and what it can do.
+@MainActor
+extension HostStore {
+    /// The single place a concrete backend is built. `make lint` fails if
+    /// one is constructed anywhere else, which keeps "what is this app
+    /// talking to" a decision in one file -- and is what makes swapping in
+    /// the in-process engine a change here rather than everywhere.
+    static let http: @MainActor (MoldHost) -> any MoldBackend = { HTTPBackend(host: $0) }
+
+    func backend(for host: MoldHost) -> any MoldBackend { makeBackend(host) }
+
+    /// The backend for a machine still in the list. `nil` means it was
+    /// removed -- the caller's request has nowhere left to go.
+    func backend(for id: MoldHost.ID) -> (any MoldBackend)? { host(id).map(backend(for:)) }
+
+    func host(_ id: MoldHost.ID) -> MoldHost? { hosts.first { $0.id == id } }
+
+    func name(of id: MoldHost.ID) -> String? { host(id)?.name }
+
+    func refreshAll() async {
+        await withTaskGroup(of: Void.self) { group in
+            for host in hosts {
+                group.addTask { await self.refresh(host) }
+            }
+        }
+        // Once every answer is in, rather than once per machine: a fleet-wide
+        // check reconciles as one decision.
+        reconcileEventStreams()
+    }
+
+    func refresh(_ host: MoldHost) async {
+        reachability[host.id] = .checking
+        let state = await check(host)
+        reachability[host.id] = state
+        // It answered, so whatever "can't be reached" line it was carrying
+        // is no longer true -- a real refusal, if this same check also
+        // surfaces one below, reports its own line separately.
+        if case .up = state {
+            succeeded(on: host.id, doing: HostFailure.reachVerb)
+        }
+        // Capabilities change only when the host is rebuilt, so one fetch per
+        // reachability check is plenty. Reconciling comes AFTER them, because
+        // whether a machine wants watching is something its capabilities say.
+        defer { reconcileEventStreams() }
+        guard case .up = state, capabilities[host.id] == nil else { return }
+        let client = backend(for: host)
+        capabilities[host.id] = try? await client.capabilities()
+        exportOptions[host.id] = try? await client.exportOptions()
+    }
+
+    /// Asks one machine what it is, and answers rather than recording.
+    ///
+    /// Separated from `refresh` so the host editor can try an address the
+    /// person is still typing without that attempt landing in the machine
+    /// list -- a half-typed hostname must not turn a working row red.
+    func check(_ host: MoldHost) async -> Reachability {
+        do {
+            return .up(try await backend(for: host).status())
+        } catch MoldClientError.unauthorized {
+            return .needsKey
+        } catch {
+            // The sidebar row reads this alone, so it is a sentence on its own
+            // -- "Could not connect to the server." -- not the banner's
+            // machine-first clause.
+            return .down(error.reasonSentence)
+        }
+    }
+
+    /// Tries an address nobody has committed to yet.
+    func probe(url: URL, apiKey: String?) async -> Reachability {
+        await check(MoldHost(name: "", baseURL: url, apiKey: apiKey))
+    }
+
+    func reachability(of host: MoldHost) -> Reachability {
+        reachability[host.id] ?? .unknown
+    }
+
+    func capabilities(of host: MoldHost) -> Capabilities? { capabilities[host.id] }
+
+    func isUp(_ host: MoldHost) -> Bool {
+        if case .up = reachability(of: host) { return true }
+        return false
+    }
+
+    /// The machine to work on by default.
+    ///
+    /// An explicit choice (`HostStore+Default.swift`) outranks the heuristic
+    /// below, even when that machine is down -- the pane says "can't be
+    /// reached" rather than looking broken. A default that has been REMOVED
+    /// (`remove(_:)`) falls through to it: deliberately not "the first one
+    /// configured", since the list starts with this Mac, which on most setups
+    /// is not running a server at all, and landing there shows an empty model
+    /// picker and reads as the app being broken.
+    var preferredHost: MoldHost? {
+        defaultMachine.flatMap(host) ?? hosts.first(where: isUp) ?? hosts.first
+    }
+
+    /// The machine a remembered `uuidString` names, or somewhere real.
+    ///
+    /// The Machines pane and the sidebar each read the same `@AppStorage` key
+    /// and both resolve it HERE, because a stored id outlives the machine it
+    /// named: removing a machine must land you on another one rather than on
+    /// an empty page that cannot be got out of.
+    func machine(selected stored: String?) -> MoldHost? {
+        guard let stored, let id = UUID(uuidString: stored) else { return preferredHost }
+        return host(id) ?? preferredHost
+    }
+}

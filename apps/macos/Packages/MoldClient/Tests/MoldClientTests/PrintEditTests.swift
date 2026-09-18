@@ -1,0 +1,189 @@
+import Foundation
+import Testing
+
+@testable import MoldClient
+
+/// What an edit would actually change, and what puts it back.
+///
+/// The rule under test is "only what actually changed": an undo that reverses
+/// prints the change never touched is worse than no undo at all, because it
+/// silently edits rows the person never acted on.
+@Suite struct PrintEditSuite {
+    let workstation = UUID()
+    let hal = UUID()
+
+    // MARK: - Favourite
+
+    @Test func favoritingSkipsThePrintsAlreadyFavorite() {
+        let entries = [
+            PrintFixtures.entry("a.png", host: workstation, favorite: true),
+            PrintFixtures.entry("b.png", host: workstation, favorite: false),
+            PrintFixtures.entry("c.png", host: workstation),
+        ]
+        let edit = PrintEdit.plan(.favorite(true), over: entries)
+        #expect(edit.targets[workstation] == ["b.png", "c.png"])
+    }
+
+    @Test func favoritingNothingNewIsNoEditAtAll() {
+        let entries = [PrintFixtures.entry("a.png", host: workstation, favorite: true)]
+        #expect(PrintEdit.plan(.favorite(true), over: entries).isEmpty)
+    }
+
+    @Test func theInverseOfFavoriteIsUnfavoriteOverTheSameTargets() {
+        let entries = [
+            PrintFixtures.entry("a.png", host: workstation, favorite: true),
+            PrintFixtures.entry("b.png", host: workstation),
+        ]
+        let edit = PrintEdit.plan(.favorite(true), over: entries)
+        #expect(edit.inverse.change == .favorite(false))
+        // "b.png" only -- "a.png" was already a favourite, so putting it back
+        // must not un-favourite something the action never touched.
+        #expect(edit.inverse.targets[workstation] == ["b.png"])
+    }
+
+    // MARK: - Tags
+
+    @Test func taggingIsCaseInsensitiveAboutWhatIsAlreadyThere() {
+        let entries = [
+            PrintFixtures.entry("a.png", host: workstation, tags: ["Owls"]),
+            PrintFixtures.entry("b.png", host: workstation, tags: ["barns"]),
+        ]
+        let edit = PrintEdit.plan(.tag("owls", adding: true), over: entries)
+        #expect(edit.targets[workstation] == ["b.png"])
+        #expect(edit.inverse.change == .tag("owls", adding: false))
+    }
+
+    @Test func untaggingOnlyNamesThePrintsThatCarryIt() {
+        let entries = [
+            PrintFixtures.entry("a.png", host: workstation, tags: ["owls"]),
+            PrintFixtures.entry("b.png", host: workstation, tags: []),
+        ]
+        #expect(PrintEdit.plan(.tag("owls", adding: false), over: entries).targets[workstation]
+            == ["a.png"])
+    }
+
+    // MARK: - Collections
+
+    @Test func filingSkipsThePrintsAlreadyOnTheShelf() {
+        let entries = [
+            PrintFixtures.entry("a.png", host: workstation, collections: ["col-7"]),
+            PrintFixtures.entry("b.png", host: workstation, collections: []),
+        ]
+        let edit = PrintEdit.plan(.collection(name: "Hangar", slug: "hangar", filing: true),
+                                  over: entries, collectionIDs: [workstation: "col-7"])
+        #expect(edit.targets[workstation] == ["b.png"])
+        #expect(edit.inverse.change
+            == .collection(name: "Hangar", slug: "hangar", filing: false))
+    }
+
+    /// A machine that has never seen the shelf will create it, so every print
+    /// there is affected -- the absence of an id is not the absence of a change.
+    @Test func filingOntoAMachineWithNoSuchShelfAffectsEveryPrint() {
+        let entries = [
+            PrintFixtures.entry("a.png", host: hal, hostName: "hal9000", collections: ["x"]),
+        ]
+        let edit = PrintEdit.plan(.collection(name: "Hangar", slug: "hangar", filing: true),
+                                  over: entries, collectionIDs: [:])
+        #expect(edit.targets[hal] == ["a.png"])
+    }
+
+    /// The mirror image: you cannot take a print off a shelf that machine has
+    /// never heard of.
+    @Test func unfilingFromAMachineWithNoSuchShelfChangesNothing() {
+        let entries = [PrintFixtures.entry("a.png", host: hal, collections: ["x"])]
+        let edit = PrintEdit.plan(.collection(name: "Hangar", slug: "hangar", filing: false),
+                                  over: entries, collectionIDs: [:])
+        #expect(edit.isEmpty)
+    }
+
+    // MARK: - Titles
+
+    /// A title is the one change whose inverse cannot be derived from the
+    /// change alone -- "call it Helmet" reverses to "call it what it was", and
+    /// only the caller knows that. So the change carries both ends.
+    @Test func aTitleChangeCarriesWhatItWasSoItCanBePutBack() {
+        let entries = [PrintFixtures.entry("a.png", host: workstation, title: "Old")]
+        let edit = PrintEdit.plan(.title(from: "Old", to: "New"), over: entries)
+        #expect(edit.targets[workstation] == ["a.png"])
+        #expect(edit.inverse.change == .title(from: "New", to: "Old"))
+    }
+
+    @Test func renamingAPrintToWhatItIsCalledIsNoEdit() {
+        let entries = [PrintFixtures.entry("a.png", host: workstation, title: "Helmet")]
+        #expect(PrintEdit.plan(.title(from: "Helmet", to: "Helmet"), over: entries).isEmpty)
+    }
+
+    /// An untitled print has no title, not an empty one -- so clearing a title
+    /// that was never set changes nothing.
+    @Test func clearingATitleThatWasNeverSetIsNoEdit() {
+        let entries = [PrintFixtures.entry("a.png", host: workstation)]
+        #expect(PrintEdit.plan(.title(from: "", to: ""), over: entries).isEmpty)
+    }
+
+    @Test func clearingARealTitleIsAnEdit() {
+        let entries = [PrintFixtures.entry("a.png", host: workstation, title: "Helmet")]
+        #expect(PrintEdit.plan(.title(from: "Helmet", to: ""), over: entries).targets[workstation]
+            == ["a.png"])
+    }
+
+    // MARK: - Fleets
+
+    @Test func targetsAreGroupedByMachine() {
+        let entries = [
+            PrintFixtures.entry("a.png", host: workstation),
+            PrintFixtures.entry("b.png", host: hal, hostName: "hal9000"),
+        ]
+        let edit = PrintEdit.plan(.favorite(true), over: entries)
+        #expect(edit.targets[workstation] == ["a.png"])
+        #expect(edit.targets[hal] == ["b.png"])
+    }
+
+    /// A machine with nothing to change must not appear at all, or the store
+    /// sends it an empty mutation and the outbox retries an edit that is not one.
+    @Test func aMachineWithNothingToChangeIsAbsent() {
+        let entries = [
+            PrintFixtures.entry("a.png", host: workstation, favorite: true),
+            PrintFixtures.entry("b.png", host: hal, hostName: "hal9000"),
+        ]
+        let edit = PrintEdit.plan(.favorite(true), over: entries)
+        #expect(edit.targets[workstation] == nil)
+        #expect(edit.targets.count == 1)
+    }
+
+    // MARK: - Display
+
+    @Test func aPrintIsCalledItsTitleIfItHasOneAndItsFilenameOtherwise() {
+        #expect(PrintFixtures.print("a.png", title: "Owl at dusk").displayName == "Owl at dusk")
+        #expect(PrintFixtures.print("a.png").displayName == "a.png")
+        // A cleared field is not a name.
+        #expect(PrintFixtures.print("a.png", title: "   ").displayName == "a.png")
+    }
+
+    // MARK: - Names
+
+    @Test func everyChangeNamesItselfForTheEditMenu() {
+        #expect(PrintChange.favorite(true).actionName == "Favourite")
+        #expect(PrintChange.favorite(false).actionName == "Unfavourite")
+        #expect(PrintChange.tag("owls", adding: true).actionName == "Tag")
+        #expect(PrintChange.tag("owls", adding: false).actionName == "Remove Tag")
+        #expect(PrintChange.collection(name: "Hangar", slug: "hangar", filing: true)
+            .actionName == "Move to Hangar")
+        #expect(PrintChange.collection(name: "Hangar", slug: "hangar", filing: false)
+            .actionName == "Remove from Hangar")
+        #expect(PrintChange.title(from: "Old", to: "New").actionName == "Rename")
+        // Clearing is not renaming, and the Edit menu should say which.
+        #expect(PrintChange.title(from: "Old", to: "").actionName == "Clear Title")
+    }
+
+    /// `HostStore.report` wraps this into "Couldn't ⟨verb⟩ on ⟨machine⟩.
+    /// ⟨reason⟩" -- so it reads as a phrase, not a restatement of the noun.
+    @Test func everyChangeNamesWhatItWasDoing() {
+        #expect(PrintChange.favorite(true).verb == "update those prints")
+        #expect(PrintChange.tag("owls", adding: true).verb == "change those tags")
+        #expect(PrintChange.collection(name: "Hangar", slug: "hangar", filing: true).verb
+            == "file those into Hangar")
+        #expect(PrintChange.collection(name: "Hangar", slug: "hangar", filing: false).verb
+            == "take those out of Hangar")
+        #expect(PrintChange.title(from: "Old", to: "New").verb == "rename that print")
+    }
+}

@@ -1,0 +1,143 @@
+import Foundation
+
+/// Editing one print.
+public struct GalleryPatch: Codable, Sendable {
+    public var title: String?
+    public var favorite: Bool?
+    public var addTags: [String]?
+    public var removeTags: [String]?
+
+    public init(title: String? = nil, favorite: Bool? = nil,
+                addTags: [String]? = nil, removeTags: [String]? = nil) {
+        self.title = title
+        self.favorite = favorite
+        self.addTags = addTags
+        self.removeTags = removeTags
+    }
+}
+
+/// A collection named in a request.
+///
+/// The app ALWAYS sends a name. The host resolves it by slug and creates it
+/// when it has never seen it, which is what makes one request work against
+/// every machine in a fleet -- an id is only ever right on one of them, and
+/// sending one is how a single shelf becomes two.
+public struct CollectionRef: Codable, Hashable, Sendable {
+    public let name: String?
+
+    public static func named(_ name: String) -> CollectionRef { CollectionRef(name: name) }
+}
+
+/// Editing several prints at once, replay-safely.
+///
+/// `operationId` is the fence: the host applies a given id once, so a retry
+/// after a dropped connection cannot double-apply a change. Mint it ONCE per
+/// intended change and reuse it for every attempt -- a fresh id per attempt is
+/// exactly the double-apply the fence exists to prevent.
+public struct GalleryBulkMutation: Codable, Sendable {
+    public let operationId: String
+    public let filenames: [String]
+    public var favorite: Bool?
+    public var addTags: [String]
+    public var removeTags: [String]
+    /// Ensure this collection exists on the serving host, then add every
+    /// filename to it.
+    public var addToCollection: CollectionRef?
+    /// Removal names the slug, because that is the identity the app and the
+    /// host agree on.
+    public var removeFromCollectionSlug: String?
+
+    public init(filenames: [String], favorite: Bool? = nil,
+                addTags: [String] = [], removeTags: [String] = [],
+                addToCollection: CollectionRef? = nil,
+                removeFromCollectionSlug: String? = nil,
+                operationId: String = UUID().uuidString) {
+        self.operationId = operationId
+        self.filenames = filenames
+        self.favorite = favorite
+        self.addTags = addTags
+        self.removeTags = removeTags
+        self.addToCollection = addToCollection
+        self.removeFromCollectionSlug = removeFromCollectionSlug
+    }
+}
+
+public struct TrashRequest: Codable, Sendable {
+    public let filenames: [String]
+    public init(filenames: [String]) { self.filenames = filenames }
+}
+
+/// A named group of prints, as ONE machine holds it. `CollectionShelf.merge`
+/// is what turns several of these into the one shelf a person sees.
+public struct Collection: Codable, Hashable, Sendable, Identifiable {
+    public let id: String
+    public let name: String
+    public let slug: String
+    public let description: String?
+    /// The tile to show. Absent lets the app pick the newest member.
+    public let coverFilename: String?
+    /// Trashed members are still counted -- they keep their membership until
+    /// they are purged, so a restored print returns to its shelf.
+    public let count: Int?
+    public let hidden: Bool?
+
+    public init(id: String, name: String, slug: String, description: String? = nil,
+                coverFilename: String? = nil, count: Int? = nil, hidden: Bool? = nil) {
+        self.id = id
+        self.name = name
+        self.slug = slug
+        self.description = description
+        self.coverFilename = coverFilename
+        self.count = count
+        self.hidden = hidden
+    }
+}
+
+public struct TagCount: Codable, Hashable, Sendable, Identifiable {
+    public let name: String
+    public let count: Int
+    public var id: String { name }
+
+    public init(name: String, count: Int) {
+        self.name = name
+        self.count = count
+    }
+}
+
+/// What a host will convert a stored CLIP into.
+///
+/// `GET /api/gallery/export-options` answers one flat list covering both
+/// kinds, and the animated containers are the clip's half of it.
+///
+/// There is deliberately no mesh view here any more. A mesh's containers are
+/// `capabilities.mesh.export_formats` — the host's own advertised list, split
+/// by `MeshExport.split` — and the client set this used to filter through
+/// (`obj`/`stl`/`ply`/`zip`) could neither see a container a host added nor
+/// tell a turntable's options from a transcode's (review 03-L1).
+public struct ExportOptions: Codable, Hashable, Sendable {
+    public let formats: [String]
+
+    /// What a clip can be turned into: the animated containers only, which is
+    /// a fact about clips rather than about one host.
+    public var forVideo: [String] { formats.filter(MeshExport.animated.contains) }
+}
+
+// What a client SENDS about a collection. Beside `Collection` rather than
+// in `HTTPBackend+Organize.swift`: both are on `MoldBackend`, so they are
+// the protocol's vocabulary and not one transport's route group.
+public struct CollectionCreate: Encodable, Sendable {
+    public let name: String
+    public let description: String?
+}
+
+public struct CollectionChange: Encodable, Sendable {
+    public var name: String?
+    public var coverFilename: String?
+    public var hidden: Bool?
+
+    public init(name: String? = nil, coverFilename: String? = nil, hidden: Bool? = nil) {
+        self.name = name
+        self.coverFilename = coverFilename
+        self.hidden = hidden
+    }
+}
