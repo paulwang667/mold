@@ -65,11 +65,14 @@ struct MenuSurfaceTests {
             .deletingLastPathComponent() // Tests/MoldTests
             .deletingLastPathComponent() // Tests
             .deletingLastPathComponent() // apps/macos
-        return ["Sources/Mold", "Packages/MoldStyle/Sources", "Packages/MoldClient/Sources"]
+        return ["Sources/Mold", "../shared/Packages/MoldStyle/Sources", "../shared/Packages/MoldClient/Sources"]
             .flatMap { path -> [URL] in
                 let files = FileManager.default.enumerator(at: macos.appending(path: path),
                                                            includingPropertiesForKeys: nil)
-                return (files?.allObjects as? [URL] ?? []).filter { $0.pathExtension == "swift" }
+                let swift = (files?.allObjects as? [URL] ?? []).filter { $0.pathExtension == "swift" }
+                // A root that moved would enumerate nothing and pass silently.
+                #expect(!swift.isEmpty, "no Swift sources under \(path)")
+                return swift
             }
     }
 }
