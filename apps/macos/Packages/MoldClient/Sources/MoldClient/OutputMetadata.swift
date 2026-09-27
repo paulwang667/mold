@@ -108,6 +108,10 @@ public struct OutputMetadata: Codable, Hashable, Sendable {
     public let temporalUpscale: String?
     public let outputFormat: String?
     public let upscaleModel: String?
+    /// The FILE has a pixel below full opacity. Read via `showsAlphaBed`.
+    public let hasAlpha: Bool?
+    /// The REQUEST's toggle -- the only thing Reuse restores it from.
+    public let transparentBackground: Bool?
 
     // Where it came from.
     public let generationTimeMs: Int?
