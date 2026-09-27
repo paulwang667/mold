@@ -1080,6 +1080,45 @@ fn merge_render_warnings(mut warnings: RequestWarnings, from_render: &[String]) 
     warnings
 }
 
+/// The "not a recommended resolution" advisory for a single-pass family,
+/// except on the canvas a `canvas: last-reference` recipe (Qwen Image 2.1)
+/// tells every client to derive from its references:
+/// `mold_core::last_reference_canvas`, the LAST reference's aspect at
+/// upstream's fixed 1024x1024 area clamped into the recipe's bounds — the
+/// same function the CLI, MCP, Discord and Studio call, and deliberately NOT
+/// this host's configured default size, which no client can see. That canvas
+/// is usually not a preset, and advising against the size the recipe itself
+/// chose tells the user they did something wrong when they did not.
+fn dimension_advisory(
+    family: &str,
+    model: &str,
+    width: u32,
+    height: u32,
+    edit_images: Option<&[Vec<u8>]>,
+) -> Option<String> {
+    let rule = mold_core::generation_profile::reference_images_for_recipe(family, model).canvas;
+    let derived = (rule == Some(mold_core::ReferenceCanvasRule::LastReference))
+        .then(|| edit_images?.last())
+        .flatten()
+        .and_then(|last| mold_core::reference_image::oriented_dimensions(last).ok())
+        .map(|(ref_width, ref_height)| {
+            mold_core::last_reference_canvas(
+                ref_width,
+                ref_height,
+                mold_core::CanvasLimits::for_model(model, Some(family)),
+            )
+        });
+    if derived == Some((width, height)) {
+        return None;
+    }
+    mold_core::dimension_warning_composed(
+        width,
+        height,
+        family,
+        mold_core::validation::Ltx2SpatialComposition::SinglePass,
+    )
+}
+
 fn merge_request_warnings(
     mut admitted: RequestWarnings,
     deferred: RequestWarnings,
@@ -1099,10 +1138,29 @@ fn merge_request_warnings(
     admitted
 }
 
+/// Refuse a manifest tier this build's GPU backend cannot execute at all
+/// ([`mold_core::manifest::backend_refusal`]) — before a download is
+/// enqueued or a generation admitted, rather than after gigabytes land and
+/// the engine refuses them at load.
+fn require_server_backend_support(
+    model_name: &str,
+    backend: Option<mold_core::GpuBackend>,
+) -> Result<(), ApiError> {
+    match backend.and_then(|backend| mold_core::manifest::backend_refusal(model_name, backend)) {
+        Some(reason) => Err(ApiError::with_code(
+            reason,
+            "MODEL_BACKEND_UNSUPPORTED",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )),
+        None => Ok(()),
+    }
+}
+
 pub(crate) async fn require_server_model_activation(
     state: &AppState,
     model_name: &str,
 ) -> Result<Option<String>, ApiError> {
+    require_server_backend_support(model_name, mold_inference::compiled_gpu_backend())?;
     let family = model_manager::family_for_model(state, model_name).await;
     mold_core::require_model_activation(model_name, family.as_deref())
         .map_err(ApiError::model_activation)?;
@@ -1153,6 +1211,7 @@ async fn require_server_model_acquisition(
     state: &AppState,
     model_name: &str,
 ) -> Result<Option<String>, ApiError> {
+    require_server_backend_support(model_name, mold_inference::compiled_gpu_backend())?;
     let family = model_manager::family_for_model(state, model_name).await;
     mold_core::require_model_acquisition(model_name, family.as_deref())
         .map_err(ApiError::model_activation)?;
@@ -1523,6 +1582,14 @@ async fn prepare_generation_inner(
     } else {
         resolved_generation_profile(state, &request.model, &canonical_model).await
     };
+    // A negative prompt sent to a recipe that hides the control (a turbo,
+    // distilled or fixed-schedule tier) conditions nothing. Older clients and
+    // saved drafts send one regardless, so this is an advisory rather than a
+    // refusal — asked of the CALLER's request, before expansion or a family
+    // default could write the field.
+    let negative_prompt_warning = resolved_profile
+        .as_ref()
+        .and_then(|profile| mold_core::negative_prompt_ignored_warning(profile, request));
     // Expand only after live catalog resolution, so opaque cv:/hf: IDs use
     // their authoritative family and conditioning-aware task template. The
     // resolved profile is looked up first so the expander sees the recipe's
@@ -1541,6 +1608,7 @@ async fn prepare_generation_inner(
     // other family's explicit format passes through to be validated against
     // its recipe.
     request.pin_output_format_for_family(resolved_family.as_deref());
+    request.normalize_transparent_background();
     // The effective, delivery-qualified recipe owns the output default. A
     // family heuristic here can select MP4 even when this binary did not link
     // the encoder, causing an omitted field to fail its own advertised profile.
@@ -1610,6 +1678,7 @@ async fn prepare_generation_inner(
         other: apply_lip_dub_reference_timing(state, request).await?,
         ..RequestWarnings::default()
     };
+    warnings.other.extend(negative_prompt_warning);
 
     let mut singleton_validation;
     let validation_request = if request.batch_size > 1 && state.scheduled_work.v2_authoritative() {
@@ -1724,12 +1793,25 @@ async fn prepare_generation_inner(
             // Per model: a composing LTX-2 checkpoint advertises the
             // composed rungs, so judging it against the single-pass list
             // would flag the very shapes it exists to render.
-            let composition = if f == "ltx2" {
-                mold_core::validation::ltx2_spatial_composition(&request.model, request.pipeline)
-            } else {
-                mold_core::validation::Ltx2SpatialComposition::SinglePass
-            };
-            mold_core::dimension_warning_composed(request.width, request.height, f, composition)
+            if f == "ltx2" {
+                let composition = mold_core::validation::ltx2_spatial_composition(
+                    &request.model,
+                    request.pipeline,
+                );
+                return mold_core::dimension_warning_composed(
+                    request.width,
+                    request.height,
+                    f,
+                    composition,
+                );
+            }
+            dimension_advisory(
+                f,
+                &request.model,
+                request.width,
+                request.height,
+                request.edit_images.as_deref(),
+            )
         })
     };
 
@@ -11905,6 +11987,37 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
+    /// A Metal server refuses an FP8 tier at the download and admission
+    /// doors with a 422 naming the reason, before any byte is fetched; CUDA
+    /// and CPU-only builds, and every other tier, pass.
+    #[test]
+    fn a_tier_the_backend_cannot_run_is_refused_before_download() {
+        let error = require_server_backend_support(
+            "qwen-image-2.1:fp8",
+            Some(mold_core::GpuBackend::Metal),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code, "MODEL_BACKEND_UNSUPPORTED");
+        assert_eq!(
+            error.error,
+            mold_core::manifest::QWEN_IMAGE21_FP8_METAL_REFUSAL
+        );
+        for (model, backend) in [
+            ("qwen-image-2.1:fp8", Some(mold_core::GpuBackend::Cuda)),
+            ("qwen-image-2.1:fp8", None),
+            (
+                "qwen-image-2.1:int8-conv",
+                Some(mold_core::GpuBackend::Metal),
+            ),
+        ] {
+            assert!(
+                require_server_backend_support(model, backend).is_ok(),
+                "{model} {backend:?}"
+            );
+        }
+    }
+
     #[test]
     fn hidden_mesh_workers_have_internal_generation_profiles() {
         for model in [
@@ -12272,6 +12385,69 @@ mod tests {
     /// Both families run through it because the seam has to pass the resolved
     /// family through: a call that hardcoded either constant would satisfy one
     /// assertion and break the other.
+    /// Admission is where a negative prompt sent to a recipe that hides the
+    /// control becomes an advisory: drive `prepare_generation_inner` itself on
+    /// an installed (sparse) turbo tier, and read the warning off the route it
+    /// returns. The request is admitted — never refused — and a recipe that
+    /// reads the negative prompt says nothing.
+    #[tokio::test]
+    async fn admission_warns_when_a_hidden_negative_prompt_is_sent() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::for_tests();
+        state.config.write().await.models_dir = temp.path().display().to_string();
+        for name in ["qwen-image-2.1-turbo:q8", "qwen-image-2.1:q8"] {
+            let manifest = mold_core::manifest::find_manifest(name).unwrap();
+            for file in &manifest.files {
+                let path = temp
+                    .path()
+                    .join(mold_core::manifest::storage_path(manifest, file));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(file.size_bytes)
+                    .unwrap();
+            }
+        }
+        let request = |model: &str, steps: u32| -> mold_core::GenerateRequest {
+            serde_json::from_value(serde_json::json!({
+                "prompt": "a paper lantern",
+                "negative_prompt": "blurry",
+                "model": model,
+                "width": 1024,
+                "height": 1024,
+                "steps": steps,
+                "guidance": 1.0,
+                "batch_size": 1,
+                "output_format": "png"
+            }))
+            .unwrap()
+        };
+
+        let mut turbo = request("qwen-image-2.1-turbo:q8", 6);
+        let route = prepare_generation_inner(&state, &mut turbo, None, None)
+            .await
+            .unwrap_or_else(|error| panic!("the turbo tier is admitted: {error:?}"));
+        let warnings: Vec<&str> = route.warnings.all().collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("negative prompt ignored by this recipe")),
+            "{warnings:?}"
+        );
+
+        let mut base = request("qwen-image-2.1:q8", 40);
+        let route = prepare_generation_inner(&state, &mut base, None, None)
+            .await
+            .unwrap_or_else(|error| panic!("the base tier is admitted: {error:?}"));
+        assert!(
+            route
+                .warnings
+                .all()
+                .all(|warning| !warning.starts_with("negative prompt ignored")),
+            "a recipe that reads the negative prompt says nothing"
+        );
+    }
+
     #[tokio::test]
     async fn admission_materializes_the_resolved_familys_extend_carryover() {
         let temp = tempfile::tempdir().unwrap();
@@ -12563,6 +12739,105 @@ mod tests {
         assert_eq!(
             control_pending_download_bytes(adapter, &weights),
             adapter.total_size_bytes()
+        );
+    }
+
+    /// Qwen Image 2.1's `canvas: last-reference` rule sizes an unsized request
+    /// to the last reference's aspect at the default area, exactly as upstream
+    /// `calculate_dimensions` does — 1344x768 for a 1344x768 reference, which
+    /// is not one of the recipe's presets. Every client applies that rule, so
+    /// the "not a recommended resolution" advisory must not fire on the very
+    /// canvas the recipe asked the client to pick (UAT: `mold run` with three
+    /// references printed it for its own default). Any other size, and any
+    /// family without the rule, keeps the advisory.
+    #[test]
+    fn the_last_reference_canvas_is_not_an_unrecommended_resolution() {
+        let png = |width: u32, height: u32| {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .unwrap();
+            bytes
+        };
+        let refs = vec![png(640, 640), png(1344, 768)];
+        let advisory = |family: &str, model: &str, width: u32, height: u32, refs: &[Vec<u8>]| {
+            super::dimension_advisory(family, model, width, height, Some(refs))
+        };
+        assert_eq!(
+            advisory("qwen-image21", "qwen-image-2.1:bf16", 1344, 768, &refs),
+            None,
+            "the canvas the last-reference rule derives"
+        );
+        assert!(
+            advisory("qwen-image21", "qwen-image-2.1:bf16", 1344, 768, &refs[..1]).is_some(),
+            "a square last reference derives 1024x1024, so 1344x768 was chosen by hand"
+        );
+        assert!(
+            advisory("qwen-image21", "qwen-image-2.1:bf16", 1344, 768, &[]).is_some(),
+            "no reference, no derived canvas"
+        );
+        assert!(
+            super::dimension_advisory("qwen-image21", "qwen-image-2.1:bf16", 1344, 768, None)
+                .is_some()
+        );
+        // A panorama's derived canvas is the CLAMPED one every client sends.
+        assert_eq!(
+            advisory(
+                "qwen-image21",
+                "qwen-image-2.1:bf16",
+                2752,
+                320,
+                &[png(8000, 1000)]
+            ),
+            None,
+            "the clamped canvas a panorama derives"
+        );
+        assert!(
+            advisory("flux2", "flux2-dev:q8", 1344, 768, &refs).is_some(),
+            "FLUX.2 [dev] takes references but has no canvas rule"
+        );
+        assert_eq!(
+            advisory("qwen-image21", "qwen-image-2.1:bf16", 1024, 1024, &[]),
+            None,
+            "a preset never warns"
+        );
+    }
+
+    /// A phone photo stored as 96x48 landscape pixels with EXIF
+    /// `Orientation = 6` is a PORTRAIT reference: the engine decodes it
+    /// upright, so the canvas every client derives is portrait, and that
+    /// canvas must not draw the advisory (the raw header would have called it
+    /// hand-picked and blessed the landscape one instead).
+    #[test]
+    fn the_last_reference_canvas_follows_the_exif_orientation() {
+        let portrait =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../mold-core/testdata/reference_orientation/landscape_96x48_orientation6.jpg",
+            ))
+            .unwrap();
+        let refs = vec![portrait];
+        let (width, height) = mold_core::last_reference_canvas(
+            48,
+            96,
+            mold_core::CanvasLimits::for_model("qwen-image-2.1:bf16", Some("qwen-image21")),
+        );
+        assert!(height > width);
+        let advisory = |width: u32, height: u32| {
+            super::dimension_advisory(
+                "qwen-image21",
+                "qwen-image-2.1:bf16",
+                width,
+                height,
+                Some(&refs),
+            )
+        };
+        assert_eq!(advisory(width, height), None, "the upright canvas");
+        assert!(
+            advisory(height, width).is_some(),
+            "the raw header's landscape canvas is not what the recipe derives"
         );
     }
 

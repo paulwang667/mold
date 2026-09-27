@@ -552,7 +552,12 @@ is_schnell = false
     #[test]
     fn manifest_model_is_downloaded_respects_component_env_overrides() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("MOLD_MODELS_DIR");
+        // An EMPTY models dir, never the developer's own: with none set the
+        // default resolves to `~/.mold/models`, where an interrupted pull's
+        // `.pulling` marker made this test fail on a machine that had one.
+        let models_dir = test_models_dir("manifest-env-overrides-models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::env::set_var("MOLD_MODELS_DIR", &models_dir);
         let dir = test_models_dir("manifest-env-overrides");
         for rel in [
             "transformer.gguf",
@@ -588,7 +593,40 @@ is_schnell = false
         ] {
             std::env::remove_var(var);
         }
+        std::env::remove_var("MOLD_MODELS_DIR");
         let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(models_dir);
+    }
+
+    /// The bug this pins: a developer's `$MOLD_HOME/models` carrying a stale
+    /// `.pulling` marker from an interrupted pull made
+    /// `manifest_model_is_downloaded_respects_component_env_overrides` fail
+    /// on a real machine before it was made hermetic (models_dir now points
+    /// at an isolated temp dir rather than falling through to the default).
+    /// This test names that scenario directly: `MOLD_HOME` points at a
+    /// polluted mold home, and `MOLD_MODELS_DIR` must still be the only
+    /// thing `resolved_models_dir()` consults.
+    #[test]
+    fn manifest_model_is_downloaded_ignores_a_polluted_mold_home() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let polluted_mold_home = test_models_dir("polluted-mold-home");
+        create_pulling_marker(&polluted_mold_home.join("models"), "flux-schnell:q8");
+        std::env::set_var("MOLD_HOME", &polluted_mold_home);
+
+        let clean_dir = test_models_dir("polluted-mold-home-override");
+        populate_manifest_files(&clean_dir, "flux-schnell:q8");
+        std::env::set_var("MOLD_MODELS_DIR", &clean_dir);
+
+        let cfg = Config::default();
+        assert!(
+            cfg.manifest_model_is_downloaded("flux-schnell:q8"),
+            "MOLD_MODELS_DIR must be read instead of a polluted MOLD_HOME/models"
+        );
+
+        std::env::remove_var("MOLD_MODELS_DIR");
+        std::env::remove_var("MOLD_HOME");
+        let _ = std::fs::remove_dir_all(clean_dir);
+        let _ = std::fs::remove_dir_all(polluted_mold_home);
     }
 
     #[test]

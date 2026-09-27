@@ -240,6 +240,8 @@ jobs:
               - 'scripts/tests/minimax-h3-attention-release-contract.sh'
               - 'scripts/bench-qwen.sh'
               - 'scripts/tests/bench-qwen-parse.sh'
+              - 'scripts/bench-qwen21.sh'
+              - 'scripts/tests/bench-qwen21-parse.sh'
               - 'scripts/regression-matrix.sh'
               - 'scripts/tests/regression-matrix-aggregate-failures.sh'
               - 'scripts/tests/regression-matrix-concurrency.sh'
@@ -545,6 +547,7 @@ jobs:
           bash scripts/tests/cuda-qualification-contract.sh
           bash scripts/tests/minimax-h3-attention-release-contract.sh
           bash scripts/tests/bench-qwen-parse.sh
+          bash scripts/tests/bench-qwen21-parse.sh
           bash scripts/tests/regression-matrix-aggregate-failures.sh
           bash scripts/tests/regression-matrix-concurrency.sh
           bash scripts/tests/regression-matrix-family-sizing.sh
@@ -684,13 +687,20 @@ jobs:
       - name: Test private MiniMax H3 foundations
         if: env.RUN_RUST_SUITE == 'true' && github.event_name == 'push'
         run: cargo test -p mold-ai-inference --lib --features h3-private-uat minimax_h3
-      - name: Test the MiniMax H3 conditioner cache with the cache enabled
-        # The cache is deliberately inert under `h3-private-uat`, so the step
-        # above runs every one of its tests against a disabled cache. Filtered
-        # to the module because the unfiltered `--features h3` graph carries
-        # private-UAT-only fixtures that only the capture feature satisfies.
+      - name: Test the public MiniMax H3 inference build
+        # The whole `mold-ai-inference` lib suite under the public `h3` graph,
+        # in the build this step always compiled. It covers the conditioner
+        # cache ENABLED (inert under `h3-private-uat`, so the step above runs
+        # its tests against a disabled cache) and every test whose answer the
+        # public engine changes. It was filtered to `minimax_h3::conditioner_cache`
+        # until the unfiltered suite was repaired: with nothing running it, 16
+        # `h3`-only assertions drifted red across #1010, #1464, #1601 and #1746.
+        # nextest, not `cargo test`: one process per test, so the suite's
+        # process-environment overrides (MOLD_*) cannot race across threads,
+        # and main's one retry reports a lone flake as FLAKY. Same test
+        # binary as `cargo test --lib`, so no extra compile.
         if: env.RUN_RUST_SUITE == 'true' && github.event_name == 'push'
-        run: cargo test -p mold-ai-inference --lib --features h3 minimax_h3::conditioner_cache
+        run: cargo nextest run --profile main -p mold-ai-inference --lib --features h3
       # One lint pass over the optional-feature union replaces the former
       # per-feature clippy steps (PuLID x3, mesh, mDNS, the `mold` CLI
       # feature set) and the `h3,mp4` runtime compile check: `h3` is added

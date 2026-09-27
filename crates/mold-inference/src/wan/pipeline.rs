@@ -2457,6 +2457,7 @@ impl WanEngine {
             model: self.base.model_name.clone(),
             seed_used: seed,
             gpu: None,
+            prefix_cache: None,
         })
     }
 }
@@ -2495,6 +2496,7 @@ fn still_response(
         model: model_name.to_string(),
         seed_used: seed,
         gpu: None,
+        prefix_cache: None,
     })
 }
 
@@ -2941,6 +2943,14 @@ mod tests {
 
     use super::*;
 
+    /// `MOLD_WAN_SOLVER` / `MOLD_WAN_SHIFT` are process-global, and
+    /// `cargo test` runs this module's tests on several threads at once.
+    /// Every test that reads or writes either var takes this lock for its
+    /// whole body (never across an `.await` — these are plain `#[test]`s)
+    /// so one test's `remove_var` cannot land between another's `set_var`
+    /// and its assertion.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[derive(Debug)]
     struct ZeroizeProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
@@ -3338,6 +3348,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         }
     }
 
@@ -3697,6 +3708,7 @@ mod tests {
     #[test]
     fn flow_shift_defaults_and_validates() {
         // The env var is process-global; this test owns it for its duration.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var(FLOW_SHIFT_ENV).ok();
         unsafe { std::env::remove_var(FLOW_SHIFT_ENV) };
         assert_eq!(resolve_flow_shift(None, false).unwrap(), DEFAULT_FLOW_SHIFT);
@@ -3739,6 +3751,7 @@ mod tests {
     #[test]
     fn wan_solver_resolves_request_env_and_default() {
         use mold_core::Scheduler;
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var(SOLVER_ENV).ok();
         unsafe { std::env::remove_var(SOLVER_ENV) };
 
@@ -4763,6 +4776,7 @@ mod tests {
     #[test]
     fn wan_dmd_tier_pins_its_solver_and_refuses_a_scheduler_override() {
         use mold_core::Scheduler;
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var(SOLVER_ENV).ok();
         let shift_previous = std::env::var(FLOW_SHIFT_ENV).ok();
         unsafe { std::env::remove_var(SOLVER_ENV) };

@@ -374,10 +374,14 @@ const PRODUCTION_FAMILY_CAPABILITIES: &[FamilyBatchCapability] = &[
         determinism: EXACT,
         seed_contract: CPU_SEED,
         media: MediaKind::Image,
+        // Up to ten ordered references through the one image-conditioned
+        // path (`generation_profile::reference_images_for_recipe`), and LoRA
+        // as forward-time bypass on every tier. There is no img2img source:
+        // references REPLACE it.
         workflows: WorkflowCapabilities {
             source: false,
-            edit_references: false,
-            lora: false,
+            edit_references: true,
+            lora: true,
             generated_audio: false,
             chain: false,
         },
@@ -696,6 +700,18 @@ pub fn production_family_capability_for_family(
         .find(|entry| entry.family == family || entry.aliases.contains(&family))
 }
 
+/// The canonical engine family for `family`, resolving the factory's aliases
+/// (`flux.2`, `flux2-klein`, `ltx-2`, `ltx2.3`, `sd3.5`, …) through this
+/// registry — the same table `create_engine_with_frozen_config` dispatches on,
+/// pinned to the factory's match arms by
+/// `family_batch_registry_resolves_factory_aliases_and_rejects_runtime_drift`.
+/// Every per-family policy table (attention, convolution, activation budget)
+/// keys on the answer, so an alias can never take a different policy from the
+/// engine it constructs. An unregistered family is returned unchanged.
+pub fn canonical_production_family(family: &str) -> &str {
+    production_family_capability_for_family(family).map_or(family, |entry| entry.family)
+}
+
 pub fn batch_execution_capability_for_family(family: &str) -> Option<BatchExecutionCapability> {
     production_family_capability_for_family(family).map(|entry| entry.execution)
 }
@@ -746,10 +762,32 @@ mod tests {
             "wuerstchen",
             "hunyuan3d",
         ];
+        // The H3 entry sits directly after LTX-Video in the registry. Anchor
+        // it by name: a positional index silently went stale when #1746
+        // inserted `qwen-image21` ahead of it.
         #[cfg(feature = "h3")]
         let expected = {
             let mut expected = expected;
-            expected.insert(9, mold_core::minimax_h3::FAMILY);
+            let after_ltx_video = expected
+                .iter()
+                .position(|family| *family == "ltx-video")
+                .expect("the registry lists ltx-video")
+                + 1;
+            expected.insert(after_ltx_video, mold_core::minimax_h3::FAMILY);
+            expected
+        };
+        // The hidden mesh preprocessing workers close the registry in the
+        // builds that compile them.
+        #[cfg(feature = "mesh-matting")]
+        let expected = {
+            let mut expected = expected;
+            expected.push("hunyuan3d-matting");
+            expected
+        };
+        #[cfg(feature = "mesh-delight")]
+        let expected = {
+            let mut expected = expected;
+            expected.push("hunyuan3d-delight");
             expected
         };
         assert_eq!(

@@ -41,6 +41,8 @@ import {
   effectiveGenerationRecipe,
   fixedRecipeControlOverrides,
 } from "@studio/lib/generationProfile";
+import { referenceCanvasSize, stagedReferenceDimensions } from "@studio/lib/referenceCanvas";
+import { showsAlphaBed } from "@studio/lib/alphaMedia";
 import {
   conditioningFingerprint,
   defaultRemixDimensions,
@@ -63,7 +65,7 @@ import {
   type SourceDimensions,
   type SourceResolutionResult,
 } from "@studio/lib/sourceResolution";
-import type { CanvasIntent } from "@studio/lib/outputShape";
+import { restoredCanvasIntent, type CanvasIntent } from "@studio/lib/outputShape";
 import { groupLogicalGalleryPrints } from "@studio/lib/galleryPrintIdentity";
 import { virtualGridWindow } from "@studio/lib/virtualGrid";
 import { galleryThumbnailScheduler, type ThumbnailHandle } from "@studio/lib/thumbnailScheduler";
@@ -2094,7 +2096,36 @@ function generationProfileHashForHost(hostId: string, model: string): string | n
 let previousStillSource = "";
 let previousStillResolution: SourceResolutionResult | null = null;
 let previousStillAutomaticResolution: SourceDimensions | null = null;
-const canvasIntent = ref<CanvasIntent>("model-default");
+// `restoreComposerDraft` (below) fills this in asynchronously from the saved
+// draft, but the synchronous initial value matters too: a draft saved before
+// `canvasIntent` was persisted carries none, and `restoredCanvasIntent` reads
+// the size already in `form` against the recipe's own default so a chosen
+// size never reads as "model-default" and gets re-snapped by the
+// `canvas: last-reference` watcher below the moment a reference changes.
+const canvasIntent = ref<CanvasIntent>(
+  restoredCanvasIntent(
+    { width: form.width, height: form.height },
+    effectiveGenerationRecipe(selectedGenerationModel.value, form.pipeline)?.defaults ?? null,
+  ),
+);
+// True while the last `restoredCanvasIntent` fallback had no recipe to
+// compare against — `restoreComposerDraft` runs before the model inventory
+// loads, so the restored model's recipe (and therefore its default size) is
+// not resolvable yet. Corrected once below, the first time the restored
+// model's recipe resolves; cleared so it never overrides a model the user
+// deliberately picked afterward.
+let canvasIntentPendingRecipeDefault = false;
+watch(selectedGenerationModel, (entry) => {
+  if (!canvasIntentPendingRecipeDefault || !entry) return;
+  if (form.model !== restoredComposerModel.value) return;
+  const recipe = effectiveGenerationRecipe(entry, form.pipeline);
+  if (!recipe) return;
+  canvasIntent.value = restoredCanvasIntent(
+    { width: form.width, height: form.height },
+    recipe.defaults,
+  );
+  canvasIntentPendingRecipeDefault = false;
+});
 
 function flushComposerDraft(): Promise<void> {
   if (composerDraftTimer !== null) clearTimeout(composerDraftTimer);
@@ -2143,7 +2174,23 @@ async function restoreComposerDraft(): Promise<void> {
     restoredComposerModel.value = restored.form.model || null;
     Object.assign(form, restored.form);
     form.fileUnderAutoTag = mobileSettings.autoTagTitle;
-    canvasIntent.value = restored.canvasIntent ?? "model-default";
+    // A draft saved before `canvasIntent` was persisted carries none. Reading
+    // that absence as "model-default" is exactly what let the
+    // `canvas: last-reference` watcher re-snap a size the draft's own
+    // width/height show was chosen the moment a reference changed —
+    // `restoredCanvasIntent` compares against the recipe's own default
+    // instead of assuming nothing was picked. The model inventory has not
+    // loaded yet this early, so the watcher above corrects this once the
+    // restored model's recipe actually resolves.
+    if (restored.canvasIntent) {
+      canvasIntent.value = restored.canvasIntent;
+    } else {
+      canvasIntentPendingRecipeDefault = true;
+      canvasIntent.value = restoredCanvasIntent(
+        { width: form.width, height: form.height },
+        effectiveGenerationRecipe(selectedGenerationModel.value, form.pipeline)?.defaults ?? null,
+      );
+    }
   }
   composerDraftError.value = restored.error;
   composerDraftMissing.value = restored.missing;
@@ -2305,6 +2352,37 @@ watch(
     }
   },
   { immediate: true },
+);
+
+/**
+ * `reference_images.canvas: last-reference` (Qwen Image 2.1): while the
+ * canvas intent is still the model default, the canvas follows the LAST
+ * reference's aspect at the recipe's default area, rounded half-to-even on
+ * its grid exactly like the CLI, the engine, web and desktop. A size the user
+ * picked never moves, and an emptied strip leaves the canvas where it is.
+ */
+watch(
+  [
+    () => caps.value.referenceImages?.canvas ?? null,
+    () => caps.value.sourceImageMode,
+    () => form.imageAttachments.map((image) => `${image.length}:${image.slice(-24)}`).join("|"),
+    () => canvasIntent.value,
+  ],
+  () => {
+    if (caps.value.sourceImageMode !== "references") return;
+    const recipe = effectiveGenerationRecipe(selectedGenerationModel.value, form.pipeline);
+    if (!recipe) return;
+    const next = referenceCanvasSize({
+      canvas: caps.value.referenceImages?.canvas ?? null,
+      references: stagedReferenceDimensions(form.imageAttachments.map((base64) => ({ base64 }))),
+      resolution: recipe.resolution,
+      intent: canvasIntent.value,
+    });
+    if (next && (next.width !== form.width || next.height !== form.height)) {
+      form.width = next.width;
+      form.height = next.height;
+    }
+  },
 );
 
 const sourceControlsValid = computed(() => !caps.value.supportsImg2img || sourceValid.value);
@@ -13135,7 +13213,16 @@ function onMobileQueueRowAction(row: MobileActivityRow, action: string): void {
                   <img
                     :src="print.thumbnailUrl"
                     :alt="print.metadata.prompt || print.filename"
-                    :class="{ 'is-thumbnail-pending': print.thumbnailPending }"
+                    :class="{
+                      'is-thumbnail-pending': print.thumbnailPending,
+                      'ms-alpha-bed':
+                        !print.thumbnailPending &&
+                        !isVideoItem(print) &&
+                        !isAudioItem(print) &&
+                        !isMeshItem(print) &&
+                        showsAlphaBed(print),
+                    }"
+                    :data-alpha="showsAlphaBed(print) ? 'true' : undefined"
                     loading="lazy"
                     @error="handleGalleryThumbnailError(print)"
                     @contextmenu="rememberNativeGalleryContext(print)"

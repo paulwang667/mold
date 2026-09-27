@@ -325,6 +325,7 @@ mod tests {
                 seed_used: req.seed.unwrap_or(42),
                 video: None,
                 gpu: None,
+                prefix_cache: None,
             })
         }
 
@@ -1265,6 +1266,9 @@ mod tests {
             id_image_sha256s: None,
             true_cfg: None,
             cfg_start_step: None,
+            has_alpha: None,
+            prefix_cache: None,
+            transparent_background: None,
         }
     }
 
@@ -6885,12 +6889,158 @@ mod tests {
         assert_eq!(response_body["code"], "VALIDATION_ERROR");
         assert_eq!(
             response_body["error"],
-            "requests[1]: output format 'gif' is not available for this recipe"
+            "output format 'gif' is not available for this recipe"
         );
         assert!(
             journal.list_all().is_empty(),
             "a refused request must enqueue nothing"
         );
+    }
+
+    /// `transparent_background` is refused at the door, with the one
+    /// profile sentence, on a recipe that cannot render it — and on a
+    /// transparency-capable recipe whose chosen container carries no alpha.
+    #[tokio::test(flavor = "current_thread")]
+    async fn transparency_is_refused_at_admission_where_the_recipe_cannot_deliver_it() {
+        let (state, _rx, _root) = durable_test_state(MockEngine::ready());
+        let journal = state.queue_journal.clone();
+        let app = app_with_state(state.clone());
+        let cases = [
+            ("flux-dev:q8", None, mold_core::TRANSPARENCY_UNSUPPORTED_REASON.to_string()),
+            (
+                "qwen-image-2.1:bf16",
+                Some("jpeg"),
+                "transparent_background needs a format with an alpha channel; use png or webp instead of jpeg"
+                    .to_string(),
+            ),
+        ];
+        for (model, format, expected) in cases {
+            let mut request_json = serde_json::from_str::<serde_json::Value>(
+                &generate_body_for_model("a paper lantern", model, 1024, 1024),
+            )
+            .unwrap();
+            request_json["transparent_background"] = serde_json::json!(true);
+            if let Some(format) = format {
+                request_json["output_format"] = serde_json::json!(format);
+            }
+            let body = serde_json::json!({
+                "client_batch_id": uuid::Uuid::new_v4().to_string(),
+                "requests": [request_json],
+            });
+            let response = app
+                .clone()
+                .oneshot(json_request("POST", "/api/generation-batches", body))
+                .await
+                .unwrap();
+            let status = response.status();
+            let response_body = json_body(response).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response_body}");
+            assert_eq!(response_body["error"], expected);
+        }
+        assert!(journal.list_all().is_empty());
+
+        // `false` is the same request as an absent field, and is admitted and
+        // persisted without it.
+        let mut request_json = serde_json::from_str::<serde_json::Value>(&generate_body_for_model(
+            "a paper lantern",
+            "flux-dev:q8",
+            1024,
+            1024,
+        ))
+        .unwrap();
+        request_json["transparent_background"] = serde_json::json!(false);
+        let body = serde_json::json!({
+            "client_batch_id": uuid::Uuid::new_v4().to_string(),
+            "requests": [request_json],
+        });
+        let response = app
+            .oneshot(json_request("POST", "/api/generation-batches", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let rows = journal.list_all();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].request_json.contains("transparent_background"));
+    }
+
+    /// A reference whose header declares 60000x60000 is a few dozen bytes on
+    /// the wire and ~14 GB once decoded. Both doors refuse it by name, before
+    /// a queue row exists (`reference_image::validate_reference_image_dimensions`
+    /// through the one reference validator).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversized_reference_is_refused_at_both_doors() {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let chunk = |kind: &[u8; 4], data: &[u8]| {
+            let mut out = (data.len() as u32).to_be_bytes().to_vec();
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+            out
+        };
+        let mut ihdr = 60_000u32.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&60_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(chunk(b"IHDR", &ihdr));
+        png.extend(chunk(
+            b"IDAT",
+            &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+        ));
+        png.extend(chunk(b"IEND", &[]));
+
+        let (state, _rx, _root) = durable_test_state(MockEngine::ready());
+        let journal = state.queue_journal.clone();
+        let app = app_with_state(state.clone());
+        let mut request_json = serde_json::from_str::<serde_json::Value>(&generate_body_for_model(
+            "the same lantern at dusk",
+            "qwen-image-2.1:bf16",
+            1024,
+            1024,
+        ))
+        .unwrap();
+        request_json["edit_images"] =
+            serde_json::json!([base64::engine::general_purpose::STANDARD.encode(&png)]);
+        let durable = serde_json::json!({
+            "client_batch_id": uuid::Uuid::new_v4().to_string(),
+            "requests": [request_json.clone()],
+        });
+        for (path, body) in [
+            ("/api/generation-batches", durable),
+            ("/api/generate", request_json),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(json_request("POST", path, body))
+                .await
+                .unwrap();
+            let status = response.status();
+            let response_body = json_body(response).await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}: {response_body}"
+            );
+            let error = response_body["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("Reference 1 is 60000x60000"),
+                "{path}: {response_body}"
+            );
+        }
+        assert!(journal.list_all().is_empty());
     }
 
     /// A mesh model stores binary glTF and nothing else, so an explicit
@@ -7032,7 +7182,7 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response_body}");
         assert_eq!(
             response_body["error"],
-            "requests[1]: mesh options are only supported by 3-D families; this model renders raster output"
+            "mesh options are only supported by 3-D families; this model renders raster output"
         );
         assert!(journal.list_all().is_empty());
     }
@@ -13209,7 +13359,7 @@ mod tests {
         assert_eq!(body["code"], "VALIDATION_ERROR");
         assert_eq!(
             body["error"],
-            "requests[1]: Qwen Image Edit needs at least one image. Add a Target image and try again."
+            "Qwen Image Edit needs at least one image. Add a Target image and try again."
         );
     }
 
@@ -13229,6 +13379,57 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = json_body(resp).await;
         assert_eq!(body["code"], "VALIDATION_ERROR");
+    }
+
+    /// A single request has no sibling to tell apart, so its refusal names
+    /// no child index; a real batch keeps `requests[n]:` so the caller knows
+    /// WHICH child was refused.
+    #[tokio::test]
+    async fn single_request_refusals_carry_no_batch_index_but_batches_do() {
+        let (app, _gallery_root) = app_with(MockEngine::ready());
+        let mut single = serde_json::from_str::<serde_json::Value>(&generate_body_for_model(
+            "a cat",
+            "flux-dev:q8",
+            1024,
+            1024,
+        ))
+        .unwrap();
+        single["steps"] = serde_json::json!(0);
+        for path in ["/api/generate", "/api/generate/stream"] {
+            let resp = app
+                .clone()
+                .oneshot(json_request("POST", path, single.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+            let body = json_body(resp).await;
+            let error = body["error"].as_str().unwrap();
+            assert!(!error.starts_with("requests["), "{path}: {error}");
+            assert!(error.contains("steps"), "{path}: {error}");
+        }
+
+        let valid = serde_json::from_str::<serde_json::Value>(&generate_body_for_model(
+            "a dog",
+            "flux-dev:q8",
+            1024,
+            1024,
+        ))
+        .unwrap();
+        let resp = app
+            .oneshot(json_request(
+                "POST",
+                "/api/generation-batches",
+                serde_json::json!({
+                    "client_batch_id": uuid::Uuid::new_v4().to_string(),
+                    "requests": [valid, single],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(resp).await;
+        let error = body["error"].as_str().unwrap();
+        assert!(error.starts_with("requests[2]: "), "{error}");
     }
 
     #[tokio::test]
@@ -17905,6 +18106,9 @@ mod tests {
             id_image_sha256s: None,
             true_cfg: None,
             cfg_start_step: None,
+            has_alpha: None,
+            prefix_cache: None,
+            transparent_background: None,
         };
         let mut rec = GenerationRecord::from_save(
             dir.path(),
@@ -18883,6 +19087,9 @@ mod tests {
             id_image_sha256s: None,
             true_cfg: None,
             cfg_start_step: None,
+            has_alpha: None,
+            prefix_cache: None,
+            transparent_background: None,
         };
         let rec = GenerationRecord::from_save(
             dir.path(),
@@ -20873,6 +21080,7 @@ mod tests {
             model: "ltx-2-19b-dev:fp8".into(),
             seed_used: 7,
             gpu: None,
+            prefix_cache: None,
         };
         let img = ImageData {
             data: waveform,
@@ -20926,6 +21134,7 @@ mod tests {
             model: "flux-dev:q8".into(),
             seed_used: 1,
             gpu: None,
+            prefix_cache: None,
         };
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -20965,6 +21174,7 @@ mod tests {
             model: "ltx-2-19b-dev:fp8".into(),
             seed_used: 1,
             gpu: None,
+            prefix_cache: None,
         };
         let mut headers = axum::http::HeaderMap::new();
         let body = crate::routes::apply_media_headers(&clip, img(), &mut headers);

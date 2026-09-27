@@ -23,6 +23,12 @@ const FACTORY_FAMILIES: &[&str] = &[
     "wan",
     "wuerstchen",
     "hunyuan3d",
+    // The hidden mesh preprocessing workers close the registry in the builds
+    // that compile them.
+    #[cfg(feature = "mesh-matting")]
+    "hunyuan3d-matting",
+    #[cfg(feature = "mesh-delight")]
+    "hunyuan3d-delight",
 ];
 
 #[test]
@@ -163,8 +169,8 @@ fn backend_and_deep_path_claims_match_current_runtime_boundaries() {
         .unwrap();
     assert_eq!(qwen21.tiled_vae, TiledVaeCapability::Unsupported);
     assert!(!qwen21.workflows.source);
-    assert!(!qwen21.workflows.edit_references);
-    assert!(!qwen21.workflows.lora);
+    assert!(qwen21.workflows.edit_references);
+    assert!(qwen21.workflows.lora);
     assert_eq!(ltx2.tiled_vae, TiledVaeCapability::NativeTemporalChunks);
 
     let expected = [
@@ -294,8 +300,8 @@ fn backend_and_deep_path_claims_match_current_runtime_boundaries() {
             MediaKind::Image,
             WorkflowCapabilities {
                 source: false,
-                edit_references: false,
-                lora: false,
+                edit_references: true,
+                lora: true,
                 generated_audio: false,
                 chain: false,
             },

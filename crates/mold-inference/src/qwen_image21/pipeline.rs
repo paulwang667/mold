@@ -5,17 +5,36 @@
 //! 32-block causal-condition transformer over unpatched 64-channel latents,
 //! followed by the 2.1 decoder. This engine keeps that sequence intact for
 //! both eager and sequential residency modes.
+//!
+//! A request with ordered reference images (`edit_images`) adds three things
+//! (diffusers `pipeline_qwenimage21.py`, cited `P:`): the Qwen3-VL vision
+//! tower conditions the prompt encoding (`P:233-327`), the VAE encoder turns
+//! each reference into a condition block laid into the joint sequence where
+//! its image slots were (`P:423-476`), and the output keeps its alpha plane
+//! when a reference carries transparency.
 
 use anyhow::{bail, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_transformers::models::z_image::postprocess_image;
+use mold_candle::qwen3_vl::Qwen3VlVisionModel;
 use mold_core::{GenerateRequest, GenerateResponse, ImageData, ModelPaths, OutputFormat};
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use super::scheduler::{QwenImage21Scheduler, QwenShiftPolicy};
+use super::layout::QwenImage21JointLayout;
+use super::lora::{
+    build_registry as build_lora_registry, fingerprint as lora_fingerprint, Qwen21LoraEntry,
+    Qwen21LoraFingerprint,
+};
+use super::reference::{
+    encode_prompt_with_images, encode_vision, load_vision_tower, prepare_reference,
+    PreparedReference, VisionFeatures,
+};
+use super::scheduler::{scheduler_for, step_timestep, ScheduleKind};
 use super::transformer::QwenImage21Transformer;
 use super::vae::QwenImage21Vae;
+use super::vae_encoder::QwenImage21VaeEncoder;
 use super::{
     encode_t2i_prompts, QwenImage21TextConditioning, QWEN_IMAGE_21_CANVAS_ALIGNMENT,
     QWEN_IMAGE_21_LATENT_CHANNELS, QWEN_IMAGE_21_VAE_SCALE_FACTOR,
@@ -25,7 +44,9 @@ use crate::encoders::qwen3::Qwen3Encoder;
 use crate::encoders::qwen3_bf16::Qwen3BF16Config;
 use crate::engine::{cfg_active, rand_seed, seeded_randn, InferenceEngine, LoadStrategy};
 use crate::engine_base::EngineBase;
-use crate::image::{build_output_metadata, encode_image};
+use crate::image::{
+    alpha_output_for_request, build_output_metadata, encode_image_with_alpha, AlphaOutput,
+};
 use crate::progress::{ProgressCallback, ProgressEvent, ProgressPhase, ProgressReporter};
 
 /// Components kept resident by an eager Qwen Image 2.1 engine.
@@ -33,22 +54,150 @@ struct LoadedQwenImage21 {
     transformer: QwenImage21Transformer,
     text_encoder: Qwen3Encoder,
     vae: QwenImage21Vae,
+    /// Loaded on the first reference-conditioned request, then kept.
+    vision: Option<Qwen3VlVisionModel>,
+    /// Loaded on the first reference-conditioned request, then kept.
+    vae_encoder: Option<QwenImage21VaeEncoder>,
+    text_paths: Vec<PathBuf>,
+    tokenizer: PathBuf,
+    vae_path: PathBuf,
     device: Device,
+    text_device: Device,
     vae_device: Device,
     dtype: DType,
+    text_dtype: DType,
     vae_dtype: DType,
 }
 
 /// Native inference engine for `Qwen/Qwen-Image-2.1`.
-///
-/// Text-to-image is the complete first runtime path. The upstream checkpoint
-/// can also consume image slots through Qwen3-VL's vision tower, but carrying
-/// a source image into this engine without that tower would be a wrong render,
-/// so those requests are rejected before weights are loaded.
 pub struct QwenImage21Engine {
     base: EngineBase<LoadedQwenImage21>,
     /// Placement is request-scoped because it affects component construction.
     pending_placement: Option<mold_core::types::DevicePlacement>,
+    /// The LoRA stack installed on the RESIDENT (eager) transformer, as
+    /// `lora::fingerprint` — empty means none. It describes the transformer
+    /// that is resident, not the request: written where adapters are
+    /// installed, cleared wherever the transformer goes away.
+    active_lora: Vec<Qwen21LoraFingerprint>,
+    /// Parity tests inject upstream's exact initial latents: torch's RNG is
+    /// not mold's ChaCha stream, so a seed cannot reproduce them.
+    #[cfg(test)]
+    injected_latents: Option<Tensor>,
+}
+
+/// The condition blocks of a reference-conditioned request: each
+/// reference's latent grid and their packed, normalized latents
+/// `[1, Σ h·w, 64]` in reference order, shared by both CFG branches.
+pub(crate) struct ConditionBlocks {
+    pub(crate) shapes: Vec<(usize, usize)>,
+    pub(crate) latents: Tensor,
+}
+
+/// How a denoise begins.
+pub(crate) struct DenoiseStart {
+    pub(crate) seed: u64,
+    /// Upstream's `latents=` (parity tests), else seeded noise.
+    pub(crate) initial_latents: Option<Tensor>,
+    /// Condition-image blocks; `None` is text-to-image.
+    pub(crate) condition: Option<ConditionBlocks>,
+    /// The transformer tier, for the denoise workspace the fast path's
+    /// prefix-cache budget subtracts (`None` = BF16 / unreadable header).
+    pub(crate) transformer_format: Option<crate::artifact_format::QwenImage21TransformerFormat>,
+}
+
+/// What a denoise hands back: the final latents and any request warnings it
+/// raised (a prefix cache that did not fit).
+pub(crate) struct Denoised {
+    pub(crate) latents: Tensor,
+    pub(crate) latent_height: usize,
+    pub(crate) latent_width: usize,
+    pub(crate) warnings: Vec<String>,
+    /// What the denoise did with its prompt prefix's K/V — the print's
+    /// provenance (`OutputMetadata::prefix_cache`).
+    pub(crate) prefix_cache: mold_core::PrefixCacheOutcome,
+}
+
+/// The print's prefix-cache provenance from the per-branch decisions.
+pub(crate) fn prefix_cache_outcome(
+    decisions: &[super::PrefixCacheDecision],
+) -> mold_core::PrefixCacheOutcome {
+    if decisions.contains(&super::PrefixCacheDecision::Recompute) {
+        mold_core::PrefixCacheOutcome::Recomputed
+    } else {
+        mold_core::PrefixCacheOutcome::Retained
+    }
+}
+
+/// The prefix-cache budget of the denoise about to run on `device` with
+/// `exec_path`: on the CUDA fast path the memory free on the card right now
+/// (every weight of this render is already resident) less the request's
+/// denoise workspace and the allocator margin; the request-only rule on the
+/// legacy path, Metal and CPU.
+fn denoise_cache_budget(
+    req: &GenerateRequest,
+    device: &Device,
+    exec_path: super::exec_path::Qwen21ExecPath,
+    format: Option<crate::artifact_format::QwenImage21TransformerFormat>,
+) -> super::PrefixCacheBudget {
+    let candle_core::DeviceLocation::Cuda { gpu_id } = device.location() else {
+        return super::PrefixCacheBudget::RequestOnly;
+    };
+    if exec_path.is_legacy() {
+        return super::PrefixCacheBudget::RequestOnly;
+    }
+    // Settle the frees queued behind the encoder park before sampling, and
+    // count what this process's pool still holds idle: both read as "used"
+    // to the driver, and the cache is ours to place there.
+    let _ = device.synchronize();
+    let free = crate::device::usable_allocatable_vram_bytes(gpu_id).unwrap_or(0);
+    let workspace = crate::device::qwen_image21_denoise_workspace_bytes(
+        format,
+        req.width,
+        req.height,
+        &crate::device::qwen_image21_reference_dimensions(
+            req.edit_images.as_deref().unwrap_or_default(),
+        ),
+        1,
+        2,
+    );
+    super::PrefixCacheBudget::Headroom(super::prefix_cache_headroom(free, 0, workspace))
+}
+
+/// The request warnings a denoise raises, in the order they were decided: an
+/// off-recipe turbo trajectory (`scheduler::scheduler_for`), then a prefix
+/// cache that did not fit. Both change what the render is, so both reach the
+/// response rather than the progress log alone.
+fn denoise_request_warnings(schedule: Option<String>, cache: Option<String>) -> Vec<String> {
+    schedule.into_iter().chain(cache).collect()
+}
+
+/// The positive prompt the encoder reads: the model card's RGBA recipe
+/// around the user's text when a transparent background was asked for
+/// (`mold_core::transparency`), else the text unchanged. The negative prompt
+/// is never wrapped.
+pub(crate) fn positive_prompt(req: &GenerateRequest) -> Cow<'_, str> {
+    if req.transparent_background == Some(true) {
+        mold_core::transparency::apply_rgba_prompt_recipe(&req.prompt)
+    } else {
+        Cow::Borrowed(req.prompt.as_str())
+    }
+}
+
+/// CFG branches a request encodes: the conditional one, plus the negative
+/// when guidance is active and a negative prompt was given.
+pub(crate) fn reference_branches(req: &GenerateRequest) -> usize {
+    if cfg_active(req.guidance) && req.negative_prompt.is_some() {
+        2
+    } else {
+        1
+    }
+}
+
+/// The request warning when a kept alpha plane had to be flattened.
+pub(crate) fn alpha_warning(alpha: AlphaOutput, format: OutputFormat) -> Option<&'static str> {
+    (alpha == AlphaOutput::Keep && format == OutputFormat::Jpeg).then_some(
+        "A Qwen Image 2.1 reference carries transparency, which JPEG cannot store; the output was composited over white. Choose PNG or WebP to keep the alpha channel.",
+    )
 }
 
 impl QwenImage21Engine {
@@ -61,6 +210,28 @@ impl QwenImage21Engine {
         Self {
             base: EngineBase::new(model_name, paths, load_strategy, gpu_ordinal),
             pending_placement: None,
+            #[cfg(test)]
+            injected_latents: None,
+            active_lora: Vec::new(),
+        }
+    }
+
+    /// Use `latents` `[1, target_tokens, 64]` as the next render's initial
+    /// latents, exactly as upstream's `latents=` argument (no sigma scaling:
+    /// the schedule starts at sigma 1).
+    #[cfg(test)]
+    pub(crate) fn inject_initial_latents(&mut self, latents: Tensor) {
+        self.injected_latents = Some(latents);
+    }
+
+    fn take_initial_latents(&mut self) -> Option<Tensor> {
+        #[cfg(test)]
+        {
+            self.injected_latents.take()
+        }
+        #[cfg(not(test))]
+        {
+            None
         }
     }
 
@@ -135,21 +306,266 @@ impl QwenImage21Engine {
         Ok((device, text_device, vae_device))
     }
 
+    /// Resolve which Qwen3-VL-8B language model to load (the BF16 shards or an
+    /// official GGUF, per `MOLD_QWEN3_VARIANT` and what the card has left),
+    /// and load it. `free_vram` is measured AFTER the transformer and VAE are
+    /// resident on an eager engine, before anything on a sequential one —
+    /// the same inputs `text_encoder_residency::plan` gives the planner.
     fn load_text_encoder(
-        paths: &[PathBuf],
+        bf16_paths: &[PathBuf],
         tokenizer: &PathBuf,
         device: &Device,
         dtype: DType,
+        free_vram: u64,
+        reference_conditioned: bool,
         progress: &ProgressReporter,
     ) -> Result<Qwen3Encoder> {
-        Qwen3Encoder::load_bf16(
-            paths,
-            tokenizer,
+        let preference = crate::runtime_env::value("MOLD_QWEN3_VARIANT");
+        let (paths, is_gguf, on_gpu, _label) =
+            crate::encoders::variant_resolution::resolve_qwen3_vl_variant(
+                progress,
+                preference.as_deref(),
+                device,
+                free_vram,
+                bf16_paths,
+                reference_conditioned,
+            )?;
+        let device = if on_gpu { device.clone() } else { Device::Cpu };
+        if is_gguf {
+            Qwen3Encoder::load_gguf(
+                &paths[0],
+                tokenizer,
+                &device,
+                &Qwen3BF16Config::qwen3_image_21_text_encoder(),
+            )
+        } else {
+            Qwen3Encoder::load_bf16(
+                &paths,
+                tokenizer,
+                &device,
+                if device.is_cpu() {
+                    crate::engine::gpu_dtype(&device)
+                } else {
+                    dtype
+                },
+                &Qwen3BF16Config::qwen3_image_21_text_encoder(),
+                progress,
+            )
+        }
+    }
+
+    /// Whether a resident encoder must be replaced by the BF16 shards before
+    /// it encodes this request: a reference request, a quantized encoder, and
+    /// no explicit GGUF `MOLD_QWEN3_VARIANT` asking for it.
+    fn reference_request_needs_bf16_encoder(
+        reference_conditioned: bool,
+        encoder_is_quantized: bool,
+        preference: Option<&str>,
+    ) -> bool {
+        reference_conditioned
+            && encoder_is_quantized
+            && crate::encoders::variant_resolution::qwen3_vl_explicit_gguf_on_references(
+                preference, true,
+            )
+            .is_none()
+    }
+
+    /// Free device bytes on the text encoder's device, or zero when it cannot
+    /// be measured (CPU, or an unmeasurable card — both resolve as today).
+    fn free_vram_for(device: &Device, ordinal: usize) -> u64 {
+        if device.is_cuda() {
+            crate::device::usable_free_vram_bytes(ordinal).unwrap_or(0)
+        } else if device.is_metal() {
+            crate::device::available_system_memory_bytes().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// After an eager encode, apply the ONE residency decision
+    /// (`text_encoder_residency::decide`) the planner priced: keep the encoder,
+    /// park it in host RAM, or drop it for the denoise. The decision is
+    /// returned so the caller applies its transformer-for-decode half too.
+    ///
+    /// `reference_encoders_on_card` is what the loaded vision tower and VAE
+    /// encoder hold on the card right now ([`Self::reference_encoders_on_card`]):
+    /// they are credited back into the usable memory like every other weight
+    /// this render loads, and charged to every phase they stay for.
+    /// `adapter_bytes` is the installed LoRA stack
+    /// (`text_encoder_residency::lora_stack_bytes`), likewise resident.
+    ///
+    /// The decision is made AFTER the encode, so the encode phase is not
+    /// charged (`encode_complete`): it is over, and charging it again parked
+    /// the transformer for the decode on cards with room for both.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_text_encoder_residency(
+        progress: &ProgressReporter,
+        paths: &ModelPaths,
+        text_encoder: &mut Qwen3Encoder,
+        req: &GenerateRequest,
+        ordinal: usize,
+        vae_dtype: DType,
+        reference_encoders_on_card: u64,
+        adapter_bytes: u64,
+    ) -> Result<super::text_encoder_residency::Qwen21TeDecision> {
+        use super::text_encoder_residency as residency;
+        let device = if !text_encoder.on_gpu || text_encoder.device.is_cpu() {
+            residency::TeDevice::Cpu
+        } else if text_encoder.device.is_metal() {
+            residency::TeDevice::Metal
+        } else {
+            residency::TeDevice::Cuda
+        };
+        let transformer_bytes = residency::transformer_device_bytes(paths);
+        let vae_bytes = std::fs::metadata(&paths.vae).map_or(0, |metadata| metadata.len());
+        let text_encoder_bytes =
+            residency::text_encoder_device_bytes(text_encoder.encoder_paths()).unwrap_or(0);
+        let resident_now = transformer_bytes
+            .saturating_add(vae_bytes)
+            .saturating_add(reference_encoders_on_card)
+            .saturating_add(adapter_bytes)
+            .saturating_add(if text_encoder.model.is_some() {
+                text_encoder_bytes
+            } else {
+                0
+            });
+        // Sampled right after the encode, whose freed activations (the vision
+        // tower's attention tiles, the multimodal prompt's rows — ~4 GB for
+        // three references) sit idle in this process's stream-ordered pool,
+        // which the driver reports as USED. The driver's view therefore
+        // charged the encode phase a second time against the denoise and
+        // parked the encoder on a card with room for it; read what this
+        // process can actually allocate, as the denoise-time cache decision
+        // (`denoise_cache_budget`) does.
+        let usable_free_bytes = match text_encoder.device.location() {
+            candle_core::DeviceLocation::Cuda { .. } if device == residency::TeDevice::Cuda => {
+                let _ = text_encoder.device.synchronize();
+                crate::device::usable_allocatable_vram_bytes(ordinal)
+                    .map_or(0, |free| free.saturating_add(resident_now))
+            }
+            _ => 0,
+        };
+        // The planner reads the same two functions: the prefix cache is
+        // planned beside the denoise (never the text encoder, which parks to
+        // make room for it), and the phases are sized separately so the
+        // decision charges their MAX, not their sum.
+        let references = crate::device::qwen_image21_reference_dimensions(
+            req.edit_images.as_deref().unwrap_or_default(),
+        );
+        let request = residency::Qwen21RenderRequest {
+            format: residency::transformer_format(paths),
+            width: req.width,
+            height: req.height,
+            batch: 1,
+            references: &references,
+            branches: reference_branches(req),
+            vae_dtype_bytes: crate::device::dtype_bytes(vae_dtype),
+        };
+        let cache_budget = match device {
+            residency::TeDevice::Cuda => residency::prefix_cache_budget(
+                &request,
+                Some(usable_free_bytes),
+                transformer_bytes.saturating_add(vae_bytes),
+            ),
+            _ => super::PrefixCacheBudget::RequestOnly,
+        };
+        let phases = residency::render_phases(&request, cache_budget);
+        let budget = residency::Qwen21TeBudget {
             device,
-            dtype,
-            &Qwen3BF16Config::qwen3_image_21_text_encoder(),
-            progress,
-        )
+            usable_free_bytes,
+            transformer_bytes,
+            vae_bytes,
+            text_encoder_bytes,
+            // What is actually loaded, which is also what the planner priced
+            // (the tower on the text encoder's placed device) — and a
+            // text-to-image request after a reference one still has it.
+            reference_encoder_bytes: reference_encoders_on_card,
+            adapter_bytes,
+            encode_complete: true,
+            encode_workspace_bytes: phases.encode_workspace_bytes,
+            denoise_workspace_bytes: phases.denoise_workspace_bytes,
+            decode_peak_bytes: phases.decode_peak_bytes,
+            host_total_bytes: crate::flux::pinned::total_system_ram_bytes().unwrap_or(0),
+            host_available_bytes: crate::device::available_host_ram_bytes().unwrap_or(0),
+            already_parked_bytes: text_encoder.parked_bytes(),
+            keep_te_ram: crate::device::keep_te_ram_mode(),
+        };
+        let decision = residency::decide(&budget);
+        tracing::debug!(
+            ?budget,
+            ?cache_budget,
+            ?decision,
+            "Qwen Image 2.1 residency"
+        );
+        match decision.residency {
+            residency::Qwen21TeResidency::Resident => {}
+            residency::Qwen21TeResidency::ParkHost => {
+                progress.info(&format!(
+                    "Parking Qwen3-VL text encoder: {}",
+                    decision.reason
+                ));
+                text_encoder.park_to_cpu()?;
+            }
+            residency::Qwen21TeResidency::Drop => {
+                progress.info(&format!(
+                    "Dropping Qwen3-VL text encoder: {}",
+                    decision.reason
+                ));
+                text_encoder.drop_weights();
+            }
+        }
+        // The planner credits this engine's park back exactly as `decide` just
+        // did (`already_parked_bytes`), instead of asking for a second copy.
+        residency::record_parked_text_encoder_bytes(paths, text_encoder.parked_bytes());
+        Ok(decision)
+    }
+
+    /// Device bytes the loaded reference encoders hold on a CUDA card (the
+    /// sizing `device::qwen_image21_reference_encoder_bytes` charges).
+    fn reference_encoders_on_card(loaded: &LoadedQwenImage21) -> u64 {
+        const F32: u64 = 4;
+        let vision = if loaded.vision.is_some() && loaded.text_device.is_cuda() {
+            crate::device::QWEN_IMAGE21_VISION_TOWER_BF16_BYTES * F32 / 2
+        } else {
+            0
+        };
+        let vae_encoder = if loaded.vae_encoder.is_some() && loaded.vae_device.is_cuda() {
+            crate::device::QWEN_IMAGE21_VAE_ENCODER_F32_BYTES
+        } else {
+            0
+        };
+        vision.saturating_add(vae_encoder)
+    }
+
+    fn load_vision(
+        progress: &ProgressReporter,
+        paths: &[PathBuf],
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Qwen3VlVisionModel> {
+        let label = format!("Loading Qwen3-VL vision tower ({})", device_label(device));
+        progress.stage_start(&label);
+        let start = Instant::now();
+        let tower = load_vision_tower(paths, device, dtype, progress)?;
+        progress.stage_done(&label, start.elapsed());
+        Ok(tower)
+    }
+
+    fn load_vae_encoder(
+        progress: &ProgressReporter,
+        path: &std::path::Path,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<QwenImage21VaeEncoder> {
+        let label = format!(
+            "Loading Qwen Image 2.1 VAE encoder ({})",
+            device_label(device)
+        );
+        progress.stage_start(&label);
+        let start = Instant::now();
+        let encoder = QwenImage21VaeEncoder::load(path, device, dtype, progress)?;
+        progress.stage_done(&label, start.elapsed());
+        Ok(encoder)
     }
 
     /// Load all components for the eager path.
@@ -194,24 +610,37 @@ impl QwenImage21Engine {
         );
         self.base.progress.stage_start(&text_label);
         let text_start = Instant::now();
+        // Loaded before any request is known, so as for text-to-image; a
+        // reference request that finds an auto-selected GGUF here reloads the
+        // BF16 shards (`generate_eager`).
         let text_encoder = Self::load_text_encoder(
             &text_paths,
             &tokenizer,
             &text_device,
             text_dtype,
+            Self::free_vram_for(&text_device, self.base.gpu_ordinal),
+            false,
             &self.base.progress,
         )?;
         self.base
             .progress
             .stage_done(&text_label, text_start.elapsed());
 
+        self.active_lora.clear();
         self.base.loaded = Some(LoadedQwenImage21 {
             transformer,
             text_encoder,
             vae,
+            vision: None,
+            vae_encoder: None,
+            text_paths,
+            tokenizer,
+            vae_path,
             device,
+            text_device,
             vae_device,
             dtype,
+            text_dtype,
             vae_dtype,
         });
         Ok(())
@@ -219,7 +648,7 @@ impl QwenImage21Engine {
 
     /// Keep direct callers honest too; the server validates the same contracts
     /// earlier, but an inference engine must never silently omit input media.
-    fn validate_text_to_image_request(req: &GenerateRequest) -> Result<()> {
+    fn validate_request(req: &GenerateRequest) -> Result<()> {
         anyhow::ensure!(
             req.batch_size == 1,
             "Qwen Image 2.1 currently supports one image per request"
@@ -235,48 +664,199 @@ impl QwenImage21Engine {
                 && (req.height as usize).is_multiple_of(QWEN_IMAGE_21_CANVAS_ALIGNMENT),
             "Qwen Image 2.1 width and height must be positive multiples of {QWEN_IMAGE_21_CANVAS_ALIGNMENT}"
         );
+        if let Some(images) = &req.edit_images {
+            let max = mold_core::validation::QWEN_IMAGE21_MAX_REFERENCE_IMAGES as usize;
+            anyhow::ensure!(
+                (1..=max).contains(&images.len()),
+                "Qwen Image 2.1 takes 1 to {max} reference images, got {}",
+                images.len()
+            );
+        }
+        let other_media = req.references.is_some()
+            || req.source_image.is_some()
+            || req.source_image_name.is_some()
+            || req.id_image.is_some()
+            || req.id_image_name.is_some()
+            || req.id_images.is_some()
+            || req.id_image_names.is_some()
+            || req.mask_image.is_some()
+            || req.control_image.is_some()
+            || req.audio_file.is_some()
+            || req.audio_file_path.is_some()
+            || req.source_video.is_some()
+            || req.source_video_path.is_some()
+            || req.extend_video.is_some()
+            || req.extend_video_path.is_some()
+            || req.keyframes.is_some();
         anyhow::ensure!(
-            !req.has_durable_media_inputs()
-                && req.control_model.is_none()
-                && req.mesh.is_none(),
-            "Qwen Image 2.1 native support is text-to-image only; reference, source, edit, control, and mesh inputs are not implemented"
+            !other_media && req.control_model.is_none() && req.mesh.is_none(),
+            "Qwen Image 2.1 conditions on ordered reference images (edit_images) only; source, mask, identity, control, audio, video, and mesh inputs are not supported"
         );
-        anyhow::ensure!(
-            req.caller_lora_stack().is_empty(),
-            "Qwen Image 2.1 LoRA adapters are not implemented"
-        );
+        let format = req.resolved_output_format();
         anyhow::ensure!(
             matches!(
-                req.resolved_output_format(),
-                OutputFormat::Png | OutputFormat::Jpeg
+                format,
+                OutputFormat::Png | OutputFormat::Jpeg | OutputFormat::Webp
             ),
-            "Qwen Image 2.1 supports PNG and JPEG output"
+            "Qwen Image 2.1 supports PNG, WebP and JPEG output"
+        );
+        anyhow::ensure!(
+            !(req.transparent_background == Some(true) && format == OutputFormat::Jpeg),
+            "Qwen Image 2.1 cannot deliver a transparent background as JPEG; choose PNG or WebP"
         );
         Ok(())
+    }
+
+    /// The render's LoRA stack, in installation order: a turbo tier's
+    /// distilled adapter first (at the recipe's scale), then the caller's.
+    fn lora_entries(&self, req: &GenerateRequest) -> Result<Vec<Qwen21LoraEntry>> {
+        let mut entries = Vec::new();
+        if let Some(turbo) = mold_core::manifest::qwen_image21_turbo_schedule(&req.model) {
+            let path = self
+                .base
+                .paths
+                .distilled_lora
+                .clone()
+                .filter(|path| path.is_file())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Qwen Image 2.1 turbo tier {} is missing its distilled adapter",
+                        req.model
+                    )
+                })?;
+            entries.push(Qwen21LoraEntry {
+                path,
+                scale: turbo.lora_scale,
+            });
+        }
+        entries.extend(
+            req.caller_lora_stack()
+                .into_iter()
+                .map(|lora| Qwen21LoraEntry {
+                    path: PathBuf::from(lora.path),
+                    scale: lora.scale,
+                }),
+        );
+        Ok(entries)
+    }
+
+    /// Install `entries` on `transformer` (an empty stack clears it).
+    fn install_lora(
+        progress: &ProgressReporter,
+        transformer: &mut QwenImage21Transformer,
+        entries: &[Qwen21LoraEntry],
+        compute: (&Device, DType),
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return transformer.install_lora(None);
+        }
+        let label = format!("Installing {} LoRA adapter(s)", entries.len());
+        progress.stage_start(&label);
+        let start = Instant::now();
+        let registry = build_lora_registry(entries, compute.0, compute.1)?;
+        transformer.install_lora(Some(&registry))?;
+        progress.stage_done(&label, start.elapsed());
+        progress.info(&format!(
+            "Qwen Image 2.1 LoRA bypass: {} linears, {:.2} GiB resident",
+            registry.len(),
+            registry.resident_bytes() as f64 / (1u64 << 30) as f64
+        ));
+        Ok(())
+    }
+
+    /// Decode and resize every reference, in request order.
+    fn prepare_references(
+        progress: &ProgressReporter,
+        req: &GenerateRequest,
+    ) -> Result<Vec<PreparedReference>> {
+        let Some(images) = req.edit_images.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let label = format!("Preparing {} reference image(s)", images.len());
+        progress.stage_start(&label);
+        let start = Instant::now();
+        let mut references = Vec::with_capacity(images.len());
+        for bytes in images {
+            progress.checkpoint()?;
+            references.push(prepare_reference(bytes)?);
+        }
+        progress.stage_done(&label, start.elapsed());
+        Ok(references)
+    }
+
+    fn run_vision(
+        progress: &ProgressReporter,
+        tower: &Qwen3VlVisionModel,
+        references: &[PreparedReference],
+        device: &Device,
+    ) -> Result<VisionFeatures> {
+        let label = "Encoding reference images (Qwen3-VL vision)";
+        progress.stage_start(label);
+        let start = Instant::now();
+        let features = encode_vision(
+            tower,
+            references,
+            device,
+            &mut || Ok(progress.checkpoint()?),
+        )?;
+        progress.stage_done(label, start.elapsed());
+        Ok(features)
+    }
+
+    /// VAE-encode every reference into its condition block (`P:423-476`).
+    fn encode_references(
+        progress: &ProgressReporter,
+        encoder: &QwenImage21VaeEncoder,
+        references: &[PreparedReference],
+        vae: (&Device, DType),
+        target: (&Device, DType),
+    ) -> Result<ConditionBlocks> {
+        let label = "Encoding reference images (VAE)";
+        progress.stage_start(label);
+        let start = Instant::now();
+        let mut blocks = Vec::with_capacity(references.len());
+        let mut shapes = Vec::with_capacity(references.len());
+        for reference in references {
+            progress.checkpoint()?;
+            let input = reference.vae_input(vae.0, vae.1)?;
+            let packed = {
+                let _conv = crate::conv_policy::ConvScope::for_family("qwen-image21");
+                encoder.encode_packed(&input)?
+            };
+            blocks.push(packed.to_device(target.0)?.to_dtype(target.1)?);
+            shapes.push(reference.latent_shape());
+        }
+        let latents = Tensor::cat(&blocks, 1)?;
+        progress.phase_done(ProgressPhase::Vae, label, start.elapsed());
+        Ok(ConditionBlocks { shapes, latents })
     }
 
     fn encode_conditioning(
         progress: &ProgressReporter,
         text_encoder: &mut Qwen3Encoder,
         req: &GenerateRequest,
-        target_device: &Device,
-        target_dtype: DType,
+        vision: Option<&VisionFeatures>,
+        target: (&Device, DType),
     ) -> Result<(
         QwenImage21TextConditioning,
         Option<QwenImage21TextConditioning>,
     )> {
+        let (target_device, target_dtype) = target;
         let label = "Encoding prompt (Qwen3-VL)";
         progress.stage_start(label);
         let start = Instant::now();
-        let conditional = encode_t2i_prompts(text_encoder, std::slice::from_ref(&req.prompt))?
-            .to_device_dtype(target_device, target_dtype)?;
+        let mut encode = |prompt: &str| -> Result<QwenImage21TextConditioning> {
+            let conditioning = match vision {
+                Some(vision) => encode_prompt_with_images(text_encoder, vision, prompt)?,
+                None => encode_t2i_prompts(text_encoder, &[prompt.to_string()])?,
+            };
+            conditioning.to_device_dtype(target_device, target_dtype)
+        };
+        let conditional = encode(&positive_prompt(req))?;
 
         let unconditional = if cfg_active(req.guidance) {
             match req.negative_prompt.as_ref() {
-                Some(negative_prompt) => Some(
-                    encode_t2i_prompts(text_encoder, std::slice::from_ref(negative_prompt))?
-                        .to_device_dtype(target_device, target_dtype)?,
-                ),
+                Some(negative_prompt) => Some(encode(negative_prompt)?),
                 None => {
                     progress.info(
                         "Qwen Image 2.1 guidance is above 1, but no negative prompt was supplied; using the native conditional-only path",
@@ -303,48 +883,133 @@ impl QwenImage21Engine {
         conditioning: &QwenImage21TextConditioning,
         negative_conditioning: Option<&QwenImage21TextConditioning>,
         compute: (&Device, DType),
-        seed: u64,
-    ) -> Result<(Tensor, usize, usize)> {
+        start: DenoiseStart,
+    ) -> Result<Denoised> {
         let (device, dtype) = compute;
+        let DenoiseStart {
+            seed,
+            initial_latents,
+            condition,
+            transformer_format,
+        } = start;
         let latent_height = req.height as usize / QWEN_IMAGE_21_VAE_SCALE_FACTOR;
         let latent_width = req.width as usize / QWEN_IMAGE_21_VAE_SCALE_FACTOR;
         let latent_tokens = latent_height * latent_width;
-        let mut scheduler = QwenImage21Scheduler::new(
+        // `mu` reads the TARGET tokens only (`P:724`): references never move
+        // the schedule.
+        let (mut scheduler, schedule_warning) = scheduler_for(
+            ScheduleKind::for_model(&req.model),
             req.steps as usize,
             latent_tokens,
-            QwenShiftPolicy::DynamicResolution,
         );
-        let noise = seeded_randn(
-            seed,
-            &[1, latent_tokens, QWEN_IMAGE_21_LATENT_CHANNELS],
-            device,
-            dtype,
-        )?;
-        let mut latents = (noise * scheduler.initial_sigma())?;
+        if let Some(warning) = &schedule_warning {
+            progress.info(warning);
+        }
+        let mut latents = match initial_latents {
+            Some(latents) => {
+                anyhow::ensure!(
+                    latents.dims() == [1, latent_tokens, QWEN_IMAGE_21_LATENT_CHANNELS],
+                    "Qwen Image 2.1 injected latents {:?} do not match the {latent_tokens}-token canvas",
+                    latents.dims()
+                );
+                latents.to_device(device)?.to_dtype(dtype)?
+            }
+            None => {
+                let noise = seeded_randn(
+                    seed,
+                    &[1, latent_tokens, QWEN_IMAGE_21_LATENT_CHANNELS],
+                    device,
+                    dtype,
+                )?;
+                (noise * scheduler.initial_sigma())?
+            }
+        };
 
+        let exec_path = transformer.exec_path();
+        // Upstream rounds `t` through the latent dtype (`P:770,775`) and
+        // evaluates its rotary angles in float32 (`T:673-675`); only a request
+        // with archived v0.32 bytes on a path that shipped them keeps v0.32's
+        // boundaries (`Qwen21ExecPath::rounds_timestep` / `rope_angles`).
+        let request_shape = super::exec_path::Qwen21RequestShape::of(req);
+        let rounds_timestep = exec_path.rounds_timestep(request_shape);
         let total = scheduler.num_steps();
         let label = format!("Denoising ({total} steps)");
         progress.stage_start(&label);
         let denoise_start = Instant::now();
-        let mut conditional = transformer.prepare_t2i(conditioning, latent_height, latent_width);
-        let mut negative = negative_conditioning
-            .map(|conditioning| transformer.prepare_t2i(conditioning, latent_height, latent_width));
-        if conditioning.sequence_length() > super::PREFIX_CACHE_MAX_TOKENS
-            || negative_conditioning
-                .is_some_and(|c| c.sequence_length() > super::PREFIX_CACHE_MAX_TOKENS)
-        {
-            progress.info(
-                "Long text prefixes render in full without KV caching (512-token retention limit).",
-            );
+        let branches: Vec<&QwenImage21TextConditioning> = std::iter::once(conditioning)
+            .chain(negative_conditioning)
+            .collect();
+        // Each CFG branch has its own layout (a different text length), and
+        // both share the condition latents (`P:689-696`).
+        let layouts = branches
+            .iter()
+            .map(|branch| match &condition {
+                Some(condition) => QwenImage21JointLayout::build(
+                    &branch.image_slots[0],
+                    &branch.valid_tokens,
+                    &condition.shapes,
+                    (latent_height, latent_width),
+                ),
+                None => QwenImage21JointLayout::text_to_image(
+                    &branch.valid_tokens,
+                    (latent_height, latent_width),
+                ),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let prefixes: Vec<usize> = layouts.iter().map(|layout| layout.prefix_len()).collect();
+        let budget = denoise_cache_budget(req, device, exec_path, transformer_format);
+        let decisions = super::PrefixCachePolicy::resolve_from_env(
+            &prefixes,
+            condition.is_some(),
+            conditioning.batch_size(),
+            dtype,
+            budget,
+        );
+        // Only an automatic decision is worth a request warning: `off` is the
+        // operator's own choice, and a text-to-image prompt over v0.32's 512
+        // rows on the legacy path is v0.32's behaviour, not a regression.
+        let cache_warning = (decisions.contains(&super::PrefixCacheDecision::Recompute)
+            && super::prefix_cache_mode_from_env() == super::PrefixCacheMode::Auto
+            && (condition.is_some() || budget != super::PrefixCacheBudget::RequestOnly))
+            .then(|| {
+                super::prefix_cache_recompute_warning(
+                    super::prefix_cache_total_bytes(
+                        &prefixes,
+                        conditioning.batch_size(),
+                        dtype.size_in_bytes(),
+                    ),
+                    budget,
+                )
+            });
+        if let Some(warning) = &cache_warning {
+            progress.info(warning);
+        } else if decisions.contains(&super::PrefixCacheDecision::Recompute) {
+            progress.info("Qwen Image 2.1 recomputes its prompt prefix every step.");
         }
+        let mut prepared = branches
+            .into_iter()
+            .zip(layouts)
+            .zip(&decisions)
+            .map(|((branch, layout), decision)| {
+                transformer
+                    .prepare(
+                        branch,
+                        layout,
+                        condition.as_ref().map(|c| c.latents.clone()),
+                        *decision,
+                    )
+                    .map(|prepared| prepared.for_request(request_shape))
+            })
+            .collect::<Result<Vec<_>>>()?;
         for step in 0..total {
             progress.checkpoint()?;
             let step_start = Instant::now();
-            // The diffusion transformer takes normalized `[0, 1]` time;
-            // the packaged scheduler exposes the usual `[0, 1000]` values.
-            let timestep = scheduler.current_timestep() / 1000.0;
-            let conditional_prediction = conditional.forward(&latents, timestep)?;
-            let prediction = if let Some(negative) = &mut negative {
+            // The diffusion transformer takes normalized `[0, 1]` time. The
+            // fast path rounds it through the working dtype exactly as
+            // upstream divides it; the v0.32 path keeps its f64 value.
+            let timestep = step_timestep(&scheduler, dtype, rounds_timestep);
+            let conditional_prediction = prepared[0].forward(&latents, timestep)?;
+            let prediction = if let Some(negative) = prepared.get_mut(1) {
                 progress.checkpoint()?;
                 let negative_prediction = negative.forward(&latents, timestep)?;
                 (&negative_prediction
@@ -352,6 +1017,7 @@ impl QwenImage21Engine {
             } else {
                 conditional_prediction
             };
+            transformer.ensure_finite(&prediction, step)?;
             latents = scheduler.step(&prediction, &latents)?;
             progress.emit(ProgressEvent::DenoiseStep {
                 step: step + 1,
@@ -361,10 +1027,16 @@ impl QwenImage21Engine {
         }
         progress.checkpoint()?;
         progress.stage_done(&label, denoise_start.elapsed());
-        Ok((latents, latent_height, latent_width))
+        Ok(Denoised {
+            latents,
+            latent_height,
+            latent_width,
+            warnings: denoise_request_warnings(schedule_warning, cache_warning),
+            prefix_cache: prefix_cache_outcome(&decisions),
+        })
     }
 
-    fn decode_rgb(
+    fn decode_rgba(
         progress: &ProgressReporter,
         vae: &QwenImage21Vae,
         latents: &Tensor,
@@ -377,36 +1049,62 @@ impl QwenImage21Engine {
         progress.stage_start(label);
         let start = Instant::now();
         let latents = latents.to_device(vae_device)?.to_dtype(vae_dtype)?;
-        let decoded = vae.decode_packed(&latents, latent_height, latent_width)?;
-        // The checkpoint decodes RGBA. Mold's image artifact contract is RGB,
-        // so preserve the trained RGB channels and do not pretend to publish a
-        // separate alpha-capable format.
-        let image = postprocess_image(&decoded)?.narrow(1, 0, 3)?.i(0)?;
+        // The VAE is the family's only convolution, so the FastStill conv
+        // scope wraps the decode alone (as FLUX does). The dispatch counter,
+        // not the resolved policy, is the receipt of what actually ran.
+        let cudnn_dispatches_before = crate::conv_policy::cudnn_dispatch_count();
+        let decoded = {
+            let _conv = crate::conv_policy::ConvScope::for_family("qwen-image21");
+            let decoded = vae.decode_packed(&latents, latent_height, latent_width)?;
+            vae_device.synchronize()?;
+            decoded
+        };
+        crate::conv_policy::report_vae_decode_backend("qwen-image21", cudnn_dispatches_before);
+        // The checkpoint decodes RGBA (`conv_out` has four channels, V:1137);
+        // keep all four and let the output-alpha rule decide what is
+        // published.
+        let image = postprocess_image(&decoded)?.i(0)?;
         progress.phase_done(ProgressPhase::Vae, label, start.elapsed());
         Ok(image)
     }
 
+    /// Encode the decoded `[4, H, W]` render. The alpha rule is
+    /// `image::alpha_output_for_request` — keep alpha iff transparency was
+    /// requested or a reference carries it, otherwise drop it so a plain
+    /// render's RGB bytes are exactly v0.32's — never `Infer`: an opaque
+    /// render still decodes edge alpha below 255.
     fn response(
         req: &GenerateRequest,
-        image: &Tensor,
+        rgba: &Tensor,
         seed: u64,
         started: Instant,
+        warnings: Vec<String>,
+        prefix_cache: mold_core::PrefixCacheOutcome,
     ) -> Result<GenerateResponse> {
-        let output_metadata = build_output_metadata(req, seed, None);
-        let data = encode_image(
-            image,
-            req.resolved_output_format(),
+        let format = req.resolved_output_format();
+        let alpha = alpha_output_for_request(req)?;
+        let output_metadata = build_output_metadata(req, seed, None).map(|mut metadata| {
+            metadata.prefix_cache = Some(prefix_cache);
+            metadata
+        });
+        let data = encode_image_with_alpha(
+            rgba,
+            format,
             req.width,
             req.height,
             output_metadata.as_ref(),
+            alpha,
         )?;
         Ok(GenerateResponse {
             mesh: None,
-            request_warnings: Vec::new(),
+            request_warnings: warnings
+                .into_iter()
+                .chain(alpha_warning(alpha, format).map(str::to_string))
+                .collect(),
             audio: None,
             images: vec![ImageData {
                 data,
-                format: req.resolved_output_format(),
+                format,
                 width: req.width,
                 height: req.height,
                 index: 0,
@@ -416,6 +1114,7 @@ impl QwenImage21Engine {
             seed_used: seed,
             video: None,
             gpu: None,
+            prefix_cache: Some(prefix_cache),
         })
     }
 
@@ -427,67 +1126,125 @@ impl QwenImage21Engine {
         let vae_dtype = crate::engine::gpu_dtype(&vae_device);
         let started = Instant::now();
         let seed = req.seed.unwrap_or_else(rand_seed);
+        let progress = &self.base.progress;
 
-        self.base
-            .progress
-            .info("Using sequential Qwen Image 2.1 loading (Qwen3-VL -> transformer -> VAE)");
+        progress.info("Using sequential Qwen Image 2.1 loading (Qwen3-VL -> transformer -> VAE)");
+        let lora_entries = self.lora_entries(req)?;
+        let references = Self::prepare_references(progress, req)?;
 
+        // Phase 1: the Qwen3-VL text encoder (and, with references, its vision
+        // tower) encode both branches, then leave the card.
         let text_label = format!(
             "Loading Qwen3-VL text encoder ({} shards, {})",
             text_paths.len(),
             device_label(&text_device)
         );
-        self.base.progress.stage_start(&text_label);
+        progress.stage_start(&text_label);
         let text_start = Instant::now();
         let mut text_encoder = Self::load_text_encoder(
             &text_paths,
             &tokenizer,
             &text_device,
             text_dtype,
-            &self.base.progress,
+            Self::free_vram_for(&text_device, self.base.gpu_ordinal),
+            !references.is_empty(),
+            progress,
         )?;
-        self.base
-            .progress
-            .stage_done(&text_label, text_start.elapsed());
-        let (conditioning, negative_conditioning) =
-            Self::encode_conditioning(&self.base.progress, &mut text_encoder, req, &device, dtype)?;
+        progress.stage_done(&text_label, text_start.elapsed());
+        let vision = if references.is_empty() {
+            None
+        } else {
+            let tower = Self::load_vision(
+                progress,
+                &text_paths,
+                &text_device,
+                super::reference::vision_tower_dtype(),
+            )?;
+            let features = Self::run_vision(progress, &tower, &references, &text_device)?;
+            drop(tower);
+            Some(features)
+        };
+        let (conditioning, negative_conditioning) = Self::encode_conditioning(
+            progress,
+            &mut text_encoder,
+            req,
+            vision.as_ref(),
+            (&device, dtype),
+        )?;
+        drop(vision);
         drop(text_encoder);
         text_device.synchronize()?;
 
+        // Phase 2: the VAE encoder turns the references into condition blocks.
+        let condition = if references.is_empty() {
+            None
+        } else {
+            let encoder = Self::load_vae_encoder(
+                progress,
+                &vae_path,
+                &vae_device,
+                super::reference::vae_encoder_dtype(),
+            )?;
+            let blocks = Self::encode_references(
+                progress,
+                &encoder,
+                &references,
+                (&vae_device, super::reference::vae_encoder_dtype()),
+                (&device, dtype),
+            )?;
+            drop(encoder);
+            vae_device.synchronize()?;
+            Some(blocks)
+        };
+
+        // Phase 3: denoise.
         let transformer_label = format!(
             "Loading Qwen Image 2.1 transformer ({} shards)",
             transformer_paths.len()
         );
-        self.base.progress.stage_start(&transformer_label);
+        progress.stage_start(&transformer_label);
         let transformer_start = Instant::now();
-        let transformer =
-            QwenImage21Transformer::load(&transformer_paths, &device, dtype, &self.base.progress)?;
-        self.base
-            .progress
-            .stage_done(&transformer_label, transformer_start.elapsed());
-        let (latents, latent_height, latent_width) = Self::denoise(
-            &self.base.progress,
+        let mut transformer =
+            QwenImage21Transformer::load(&transformer_paths, &device, dtype, progress)?;
+        Self::install_lora(progress, &mut transformer, &lora_entries, (&device, dtype))?;
+        progress.stage_done(&transformer_label, transformer_start.elapsed());
+        let initial_latents = self.take_initial_latents();
+        let progress = &self.base.progress;
+        let transformer_format =
+            super::text_encoder_residency::transformer_format(&self.base.paths);
+        let Denoised {
+            latents,
+            latent_height,
+            latent_width,
+            warnings,
+            prefix_cache,
+        } = Self::denoise(
+            progress,
             req,
             &transformer,
             &conditioning,
             negative_conditioning.as_ref(),
             (&device, dtype),
-            seed,
+            DenoiseStart {
+                seed,
+                initial_latents,
+                condition,
+                transformer_format,
+            },
         )?;
         drop(transformer);
         drop(conditioning);
         drop(negative_conditioning);
         device.synchronize()?;
 
+        // Phase 4: decode.
         let vae_label = format!("Loading Qwen Image 2.1 VAE ({})", device_label(&vae_device));
-        self.base.progress.stage_start(&vae_label);
+        progress.stage_start(&vae_label);
         let vae_start = Instant::now();
-        let vae = QwenImage21Vae::load(&vae_path, &vae_device, vae_dtype, &self.base.progress)?;
-        self.base
-            .progress
-            .stage_done(&vae_label, vae_start.elapsed());
-        let image = Self::decode_rgb(
-            &self.base.progress,
+        let vae = QwenImage21Vae::load(&vae_path, &vae_device, vae_dtype, progress)?;
+        progress.stage_done(&vae_label, vae_start.elapsed());
+        let image = Self::decode_rgba(
+            progress,
             &vae,
             &latents,
             latent_height,
@@ -495,7 +1252,7 @@ impl QwenImage21Engine {
             &vae_device,
             vae_dtype,
         )?;
-        Self::response(req, &image, seed, started)
+        Self::response(req, &image, seed, started, warnings, prefix_cache)
     }
 
     fn generate_eager(&mut self, req: &GenerateRequest) -> Result<GenerateResponse> {
@@ -504,45 +1261,281 @@ impl QwenImage21Engine {
         }
         let started = Instant::now();
         let seed = req.seed.unwrap_or_else(rand_seed);
+        let initial_latents = self.take_initial_latents();
+        let lora_entries = self.lora_entries(req)?;
+        let wanted_lora = lora_fingerprint(&lora_entries);
         let progress = &self.base.progress;
+        let references = Self::prepare_references(progress, req)?;
         let loaded = self
             .base
             .loaded
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Qwen Image 2.1 was not loaded"))?;
+        // The resident encoder was chosen at load, before any request: when
+        // that choice was an AUTO-selected GGUF, a reference request swaps in
+        // the BF16 shards, which it then keeps
+        // (`variant_resolution::choose_qwen3_vl_variant`).
+        if Self::reference_request_needs_bf16_encoder(
+            !references.is_empty(),
+            loaded.text_encoder.is_quantized,
+            crate::runtime_env::value("MOLD_QWEN3_VARIANT").as_deref(),
+        ) {
+            progress.info(
+                "Reloading the Qwen3-VL-8B text encoder from the BF16 shards: auto mode never \
+                 encodes a reference-conditioned prompt with a quantized language model",
+            );
+            loaded.text_encoder.drop_weights();
+            loaded.text_encoder = Self::load_text_encoder(
+                &loaded.text_paths,
+                &loaded.tokenizer,
+                &loaded.text_device,
+                loaded.text_dtype,
+                Self::free_vram_for(&loaded.text_device, self.base.gpu_ordinal),
+                true,
+                progress,
+            )?;
+        }
+        // A previous request may have parked or dropped the encoder; this
+        // restores it (a host→device copy, or a reload) and is a no-op when
+        // it stayed resident.
+        loaded.text_encoder.unpark_to_gpu(progress)?;
+        if !references.is_empty() {
+            if loaded.vision.is_none() {
+                loaded.vision = Some(Self::load_vision(
+                    progress,
+                    &loaded.text_paths,
+                    &loaded.text_device,
+                    super::reference::vision_tower_dtype(),
+                )?);
+            }
+            if loaded.vae_encoder.is_none() {
+                loaded.vae_encoder = Some(Self::load_vae_encoder(
+                    progress,
+                    &loaded.vae_path,
+                    &loaded.vae_device,
+                    super::reference::vae_encoder_dtype(),
+                )?);
+            }
+        }
+        let vision = match &loaded.vision {
+            Some(tower) if !references.is_empty() => Some(Self::run_vision(
+                progress,
+                tower,
+                &references,
+                &loaded.text_device,
+            )?),
+            _ => None,
+        };
         let (conditioning, negative_conditioning) = Self::encode_conditioning(
             progress,
             &mut loaded.text_encoder,
             req,
-            &loaded.device,
-            loaded.dtype,
+            vision.as_ref(),
+            (&loaded.device, loaded.dtype),
         )?;
-        let (latents, latent_height, latent_width) = Self::denoise(
+        drop(vision);
+        let condition = match &loaded.vae_encoder {
+            Some(encoder) if !references.is_empty() => Some(Self::encode_references(
+                progress,
+                encoder,
+                &references,
+                (&loaded.vae_device, super::reference::vae_encoder_dtype()),
+                (&loaded.device, loaded.dtype),
+            )?),
+            _ => None,
+        };
+        if self.active_lora != wanted_lora {
+            // Clear first: a failed install must not leave the previous
+            // stack answering for this request.
+            self.active_lora.clear();
+            loaded.transformer.install_lora(None)?;
+            Self::install_lora(
+                progress,
+                &mut loaded.transformer,
+                &lora_entries,
+                (&loaded.device, loaded.dtype),
+            )?;
+            self.active_lora = wanted_lora;
+        }
+        let reference_encoders_on_card = Self::reference_encoders_on_card(loaded);
+        let adapter_bytes = super::text_encoder_residency::lora_stack_bytes(
+            lora_entries.iter().map(|entry| entry.path.as_path()),
+        );
+        let residency = Self::settle_text_encoder_residency(
+            progress,
+            &self.base.paths,
+            &mut loaded.text_encoder,
+            req,
+            self.base.gpu_ordinal,
+            loaded.vae_dtype,
+            reference_encoders_on_card,
+            adapter_bytes,
+        )?;
+        if residency.release_reference_encoders
+            && (loaded.vision.is_some() || loaded.vae_encoder.is_some())
+        {
+            progress.info(&format!(
+                "Releasing the Qwen3-VL vision tower and VAE encoder: {}",
+                residency.reason
+            ));
+            loaded.vision = None;
+            loaded.vae_encoder = None;
+            loaded.device.synchronize()?;
+        }
+        let transformer_format =
+            super::text_encoder_residency::transformer_format(&self.base.paths);
+        let Denoised {
+            latents,
+            latent_height,
+            latent_width,
+            warnings,
+            prefix_cache,
+        } = Self::denoise(
             progress,
             req,
             &loaded.transformer,
             &conditioning,
             negative_conditioning.as_ref(),
             (&loaded.device, loaded.dtype),
-            seed,
+            DenoiseStart {
+                seed,
+                initial_latents,
+                condition,
+                transformer_format,
+            },
         )?;
-        let image = Self::decode_rgb(
-            progress,
-            &loaded.vae,
-            &latents,
-            latent_height,
-            latent_width,
-            &loaded.vae_device,
-            loaded.vae_dtype,
-        )?;
-        Self::response(req, &image, seed, started)
+        // The decode's peak may not fit beside the transformer (2K): park it
+        // to host RAM for the decode and restore it after, or release it and
+        // let the next request reload — the decision's second half.
+        use super::text_encoder_residency::TransformerDecode;
+        if residency.transformer_decode == TransformerDecode::Drop {
+            progress.info(&format!(
+                "Releasing Qwen Image 2.1 transformer: {}",
+                residency.reason
+            ));
+            // Nothing survives this request: the next one loads afresh.
+            self.active_lora.clear();
+            let loaded = self
+                .base
+                .loaded
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("Qwen Image 2.1 was not loaded"))?;
+            let LoadedQwenImage21 {
+                transformer,
+                vae,
+                vae_device,
+                vae_dtype,
+                device,
+                ..
+            } = loaded;
+            drop(transformer);
+            device.synchronize()?;
+            let image = Self::decode_rgba(
+                &self.base.progress,
+                &vae,
+                &latents,
+                latent_height,
+                latent_width,
+                &vae_device,
+                vae_dtype,
+            )?;
+            return Self::response(req, &image, seed, started, warnings, prefix_cache);
+        }
+        let decode = || {
+            Self::decode_rgba(
+                progress,
+                &loaded.vae,
+                &latents,
+                latent_height,
+                latent_width,
+                &loaded.vae_device,
+                loaded.vae_dtype,
+            )
+        };
+        if residency.transformer_decode != TransformerDecode::ParkHost {
+            let image = decode()?;
+            return Self::response(req, &image, seed, started, warnings, prefix_cache);
+        }
+        progress.info(&format!(
+            "Parking Qwen Image 2.1 transformer: {}",
+            residency.reason
+        ));
+        let device = loaded.device.clone();
+        let outcome = decode_with_parked_transformer(
+            &mut loaded.transformer,
+            |transformer| {
+                transformer.move_to_device(&Device::Cpu)?;
+                device.synchronize()?;
+                Ok(())
+            },
+            decode,
+            // Restore even when the decode failed, so the engine stays usable.
+            |transformer| transformer.move_to_device(&device),
+        );
+        if outcome.transformer_lost {
+            // The transformer is not where the engine's device says it is:
+            // keeping it would fail every later request with a device
+            // mismatch. Release it (and the LoRA it carried) so the next
+            // request reloads.
+            self.active_lora.clear();
+            self.base.loaded = None;
+        }
+        let image = outcome.result?;
+        Self::response(req, &image, seed, started, warnings, prefix_cache)
+    }
+}
+
+/// The result of a VAE decode bracketed by parking the transformer in host
+/// RAM and restoring it.
+struct ParkedDecode<T> {
+    /// The decode's answer, or the park's error when the park failed. A
+    /// restore failure never replaces it: a failed decode reports its own
+    /// error, and a successful one still ships its image.
+    result: Result<T>,
+    /// The transformer is not (known to be) back on the engine's device, so
+    /// the engine must release it and reload on the next request.
+    transformer_lost: bool,
+}
+
+/// Park `state` (the transformer) with `park`, run `decode`, then `restore`
+/// it — even when the decode failed. Any park or restore failure marks the
+/// transformer lost: after an OOM on either side the engine cannot vouch for
+/// where its weights are, and a split transformer fails every later request
+/// with a device mismatch until the model is reloaded.
+fn decode_with_parked_transformer<S: ?Sized, T>(
+    state: &mut S,
+    park: impl FnOnce(&mut S) -> Result<()>,
+    decode: impl FnOnce() -> Result<T>,
+    restore: impl FnOnce(&mut S) -> Result<()>,
+) -> ParkedDecode<T> {
+    if let Err(error) = park(state) {
+        return ParkedDecode {
+            result: Err(error.context("parking the Qwen Image 2.1 transformer for the VAE decode")),
+            transformer_lost: true,
+        };
+    }
+    let result = decode();
+    let transformer_lost = match restore(state) {
+        Ok(()) => false,
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "restoring the Qwen Image 2.1 transformer after the VAE decode failed; \
+                 releasing it so the next request reloads"
+            );
+            true
+        }
+    };
+    ParkedDecode {
+        result,
+        transformer_lost,
     }
 }
 
 impl InferenceEngine for QwenImage21Engine {
     fn generate(&mut self, req: &GenerateRequest) -> Result<GenerateResponse> {
         self.base.progress.checkpoint()?;
-        Self::validate_text_to_image_request(req)?;
+        Self::validate_request(req)?;
         self.pending_placement = req.placement.clone();
         let result = if self.uses_sequential_generate_path() {
             self.generate_sequential(req)
@@ -573,7 +1566,10 @@ impl InferenceEngine for QwenImage21Engine {
     }
 
     fn unload(&mut self) {
+        self.active_lora.clear();
         self.base.unload();
+        // The park went with the engine.
+        super::text_encoder_residency::record_parked_text_encoder_bytes(&self.base.paths, 0);
     }
 
     fn set_on_progress(&mut self, callback: ProgressCallback) {
@@ -622,6 +1618,21 @@ fn device_label(device: &Device) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A print records whether its prefix was retained or recomputed; one
+    /// recomputing branch makes the whole render a recompute.
+    #[test]
+    fn the_prefix_cache_outcome_is_recorded_per_render() {
+        use super::super::PrefixCacheDecision::{Recompute, Retain};
+        assert_eq!(
+            prefix_cache_outcome(&[Retain, Retain]),
+            mold_core::PrefixCacheOutcome::Retained
+        );
+        assert_eq!(
+            prefix_cache_outcome(&[Retain, Recompute]),
+            mold_core::PrefixCacheOutcome::Recomputed
+        );
+    }
+
     fn request() -> GenerateRequest {
         serde_json::from_value(serde_json::json!({
             "prompt": "a red ceramic teapot",
@@ -634,38 +1645,269 @@ mod tests {
         .unwrap()
     }
 
+    fn png(alpha: u8) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, alpha]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    /// The park/decode/restore bracket: the engine keeps its transformer only
+    /// when both moves succeeded, and a decode's own answer always wins over
+    /// a restore failure.
     #[test]
-    fn text_to_image_contract_accepts_native_canvas() {
-        QwenImage21Engine::validate_text_to_image_request(&request()).unwrap();
+    fn a_failed_park_or_restore_releases_the_transformer() {
+        use std::cell::Cell;
+        let decoded = Cell::new(false);
+
+        // Park fails (host RAM): no decode is attempted, the park error is
+        // returned, and the engine must reload.
+        let outcome = decode_with_parked_transformer(
+            &mut (),
+            |_| anyhow::bail!("park: host OOM"),
+            || {
+                decoded.set(true);
+                Ok(1)
+            },
+            |_| Ok(()),
+        );
+        assert!(outcome.transformer_lost);
+        assert!(!decoded.get());
+        assert!(outcome.result.unwrap_err().to_string().contains("park"));
+
+        // Decode fails, restore fails too: the decode's error is the answer.
+        let outcome = decode_with_parked_transformer(
+            &mut (),
+            |_| Ok(()),
+            || -> Result<i32> { anyhow::bail!("decode: device OOM") },
+            |_| anyhow::bail!("restore: device OOM"),
+        );
+        assert!(outcome.transformer_lost);
+        assert!(outcome.result.unwrap_err().to_string().contains("decode"));
+
+        // Decode succeeds, restore fails: the image still ships; the engine
+        // drops the stranded transformer and reloads next time.
+        let outcome = decode_with_parked_transformer(
+            &mut (),
+            |_| Ok(()),
+            || Ok(7),
+            |_| anyhow::bail!("restore: device OOM"),
+        );
+        assert!(outcome.transformer_lost);
+        assert_eq!(outcome.result.unwrap(), 7);
+
+        // Decode fails, restore succeeds: the engine stays loaded.
+        let outcome = decode_with_parked_transformer(
+            &mut (),
+            |_| Ok(()),
+            || -> Result<i32> { anyhow::bail!("decode: device OOM") },
+            |_| Ok(()),
+        );
+        assert!(!outcome.transformer_lost);
+        assert!(outcome.result.is_err());
+
+        // The happy path.
+        let outcome = decode_with_parked_transformer(&mut (), |_| Ok(()), || Ok(3), |_| Ok(()));
+        assert!(!outcome.transformer_lost);
+        assert_eq!(outcome.result.unwrap(), 3);
     }
 
     #[test]
-    fn text_to_image_contract_rejects_non_native_canvas() {
+    fn text_to_image_drops_alpha_and_publishes_the_v032_rgb_bytes() {
+        for format in [OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::Webp] {
+            let mut req = request();
+            req.output_format = Some(format);
+            assert_eq!(alpha_output_for_request(&req).unwrap(), AlphaOutput::Drop);
+            assert!(alpha_warning(AlphaOutput::Drop, format).is_none());
+        }
+        // v0.32 wrote the decoded batch's first three channels as RGB.
+        let rgba = Tensor::from_vec(
+            vec![10u8, 200, 20, 100, 30, 50, 255, 128],
+            (4, 1, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let legacy = crate::image::encode_image(
+            &rgba.narrow(0, 0, 3).unwrap(),
+            OutputFormat::Png,
+            2,
+            1,
+            None,
+        )
+        .unwrap();
+        let dropped =
+            encode_image_with_alpha(&rgba, OutputFormat::Png, 2, 1, None, AlphaOutput::Drop)
+                .unwrap();
+        assert_eq!(dropped, legacy);
+    }
+
+    #[test]
+    fn transparency_and_alpha_references_keep_alpha() {
+        let mut req = request();
+        req.transparent_background = Some(true);
+        assert_eq!(alpha_output_for_request(&req).unwrap(), AlphaOutput::Keep);
+        let mut req = request();
+        req.edit_images = Some(vec![png(255), png(128)]);
+        assert_eq!(alpha_output_for_request(&req).unwrap(), AlphaOutput::Keep);
+        assert!(alpha_warning(AlphaOutput::Keep, OutputFormat::Jpeg).is_some());
+        assert!(alpha_warning(AlphaOutput::Keep, OutputFormat::Png).is_none());
+        let mut req = request();
+        req.edit_images = Some(vec![png(255)]);
+        assert_eq!(alpha_output_for_request(&req).unwrap(), AlphaOutput::Drop);
+    }
+
+    #[test]
+    fn only_the_positive_prompt_takes_the_rgba_recipe() {
+        let mut req = request();
+        assert_eq!(positive_prompt(&req), "a red ceramic teapot");
+        req.transparent_background = Some(true);
+        assert_eq!(
+            positive_prompt(&req),
+            "This is an RGBA image with transparency. a red ceramic teapot. The image has alpha channel and the background is transparent."
+        );
+    }
+
+    /// A turbo tier walked at a step count it was not distilled for is an
+    /// off-recipe render; that warning is a request warning, not only a
+    /// progress line.
+    #[test]
+    fn an_off_recipe_turbo_schedule_is_a_request_warning() {
+        use super::super::scheduler::{scheduler_for, ScheduleKind};
+        let (_, schedule) = scheduler_for(
+            ScheduleKind::for_model("qwen-image-2.1-turbo:bf16"),
+            8,
+            4096,
+        );
+        assert!(schedule.is_some());
+        let warnings =
+            denoise_request_warnings(schedule.clone(), Some("cache recomputes".to_string()));
+        assert_eq!(
+            warnings,
+            vec![schedule.unwrap(), "cache recomputes".to_string()]
+        );
+        assert!(denoise_request_warnings(None, None).is_empty());
+    }
+
+    #[test]
+    fn upstream_rounding_belongs_to_the_exec_path() {
+        use crate::qwen_image21::exec_path::Qwen21ExecPath;
+        use crate::qwen_image21::exec_path::Qwen21RequestShape;
+        // The legacy path keeps the unrounded value; the CUDA fast path rounds
+        // through the working dtype (BF16: 900 -> 0.8984375); Metal rounds
+        // every request that has no v0.32 bytes to preserve.
+        let plain = Qwen21RequestShape::of(&request());
+        let mut referenced = request();
+        referenced.edit_images = Some(vec![png(255)]);
+        let referenced = Qwen21RequestShape::of(&referenced);
+        assert!(!Qwen21ExecPath::legacy().rounds_timestep(plain));
+        assert!(Qwen21ExecPath::cuda_fast().rounds_timestep(plain));
+        assert!(!Qwen21ExecPath::metal(true).rounds_timestep(plain));
+        assert!(Qwen21ExecPath::metal(true).rounds_timestep(referenced));
+        assert_eq!(
+            super::super::scheduler::transformer_timestep(0.9, DType::BF16),
+            0.8984375
+        );
+    }
+
+    /// The eager engine picks its encoder at load, before any request; a
+    /// reference request that finds an AUTO-selected GGUF there swaps in the
+    /// BF16 shards, and an explicit GGUF variant is kept.
+    #[test]
+    fn a_reference_request_replaces_an_auto_selected_gguf_encoder() {
+        let needs = QwenImage21Engine::reference_request_needs_bf16_encoder;
+        assert!(needs(true, true, None));
+        assert!(needs(true, true, Some("auto")));
+        assert!(!needs(true, true, Some("q8")), "an explicit tier wins");
+        assert!(!needs(true, false, None), "BF16 is already resident");
+        assert!(!needs(false, true, None), "text-to-image keeps the GGUF");
+    }
+
+    #[test]
+    fn injected_latents_are_consumed_by_exactly_one_render() {
+        let mut engine = QwenImage21Engine::new(
+            "qwen-image-2.1:bf16".to_string(),
+            ModelPaths {
+                low_noise_transformer: None,
+                low_noise_distilled_lora: None,
+                transformer: PathBuf::from("/nonexistent/transformer"),
+                transformer_shards: vec![],
+                vae: PathBuf::from("/nonexistent/vae"),
+                spatial_upscaler: None,
+                temporal_upscaler: None,
+                distilled_lora: None,
+                t5_encoder: None,
+                clip_encoder: None,
+                t5_tokenizer: None,
+                clip_tokenizer: None,
+                clip_encoder_2: None,
+                clip_tokenizer_2: None,
+                text_encoder_files: vec![],
+                text_tokenizer: None,
+                decoder: None,
+            },
+            LoadStrategy::Eager,
+            0,
+        );
+        assert!(engine.take_initial_latents().is_none());
+        engine.inject_initial_latents(Tensor::zeros((1, 4, 64), DType::F32, &Device::Cpu).unwrap());
+        assert_eq!(engine.take_initial_latents().unwrap().dims(), &[1, 4, 64]);
+        assert!(engine.take_initial_latents().is_none());
+    }
+
+    #[test]
+    fn contract_accepts_native_canvas_references_and_webp() {
+        QwenImage21Engine::validate_request(&request()).unwrap();
+        let mut req = request();
+        req.edit_images = Some(vec![png(255); 10]);
+        req.output_format = Some(OutputFormat::Webp);
+        req.transparent_background = Some(true);
+        QwenImage21Engine::validate_request(&req).unwrap();
+    }
+
+    #[test]
+    fn contract_rejects_non_native_canvas() {
         let mut req = request();
         req.width = 1008;
-        assert!(QwenImage21Engine::validate_text_to_image_request(&req)
+        assert!(QwenImage21Engine::validate_request(&req)
             .unwrap_err()
             .to_string()
             .contains("multiples of 32"));
     }
 
     #[test]
-    fn text_to_image_contract_refuses_reference_media() {
-        let mut req = request();
-        req.edit_images = Some(vec![vec![1, 2, 3]]);
-        assert!(QwenImage21Engine::validate_text_to_image_request(&req)
-            .unwrap_err()
-            .to_string()
-            .contains("text-to-image only"));
+    fn contract_bounds_the_reference_count() {
+        for count in [0, 11] {
+            let mut req = request();
+            req.edit_images = Some(vec![png(255); count]);
+            assert!(QwenImage21Engine::validate_request(&req)
+                .unwrap_err()
+                .to_string()
+                .contains("1 to 10 reference images"));
+        }
     }
 
     #[test]
-    fn text_to_image_contract_refuses_unsupported_delivery() {
+    fn contract_refuses_other_media() {
         let mut req = request();
-        req.output_format = Some(OutputFormat::Webp);
-        assert!(QwenImage21Engine::validate_text_to_image_request(&req)
+        req.source_image = Some(png(255));
+        assert!(QwenImage21Engine::validate_request(&req)
             .unwrap_err()
             .to_string()
-            .contains("PNG and JPEG"));
+            .contains("edit_images"));
+        let mut req = request();
+        req.mask_image = Some(png(255));
+        assert!(QwenImage21Engine::validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn contract_refuses_transparent_jpeg() {
+        let mut req = request();
+        req.output_format = Some(OutputFormat::Jpeg);
+        QwenImage21Engine::validate_request(&req).unwrap();
+        req.transparent_background = Some(true);
+        assert!(QwenImage21Engine::validate_request(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("JPEG"));
     }
 }

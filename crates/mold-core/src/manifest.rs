@@ -484,7 +484,9 @@ pub fn variant_quality_rank(model_name: &str) -> u32 {
     match tag {
         "bf16" => 0,
         "fp16" => 1,
-        "fp8" => 2,
+        // INT8 ConvRot (W8A8, per-row scales) measures closer to BF16 than
+        // FP8 does on Qwen Image 2.1 (unsloth's card: LPIPS 0.064 vs 0.112).
+        "fp8" | "int8-conv" => 2,
         "q8" => 3,
         "q6" => 4,
         "q5" => 5,
@@ -523,11 +525,19 @@ fn is_model_specific_component(component: ModelComponent) -> bool {
 /// Model names are sanitized: colons become dashes (e.g., `flux-schnell:q8` → `flux-schnell-q8`).
 /// HF filename paths (e.g., `text_encoder/model-00001-of-00003.safetensors`) are preserved as-is,
 /// creating subdirectories under the target directory.
-pub fn storage_path(manifest: &ModelManifest, file: &ModelFile) -> PathBuf {
-    // H3 Turbo tags are the base compact stack plus one shared adapter, so
-    // their model-specific files live in the base checkpoint's directory —
-    // a machine holding the base pulls only the adapter, and removal
-    // ref-counting protects the shared bytes in both directions.
+/// The directory (under the models dir) a manifest's model-specific files are
+/// stored in — its own sanitized name, except where another identity owns the
+/// bytes.
+///
+/// H3 Turbo tags are the base compact stack plus one shared adapter, so their
+/// model-specific files live in the base checkpoint's directory — a machine
+/// holding the base pulls only the adapter, and removal ref-counting protects
+/// the shared bytes in both directions. A Qwen Image 2.1 turbo tag is its base
+/// tier plus one adapter, so its transformer lives in the base tier's
+/// directory by the same rule. LTX-2.5 contract manifests have their own
+/// storage identity. The download seam's `.pulling` marker follows this too,
+/// so pulling a turbo tag never creates a directory nothing is stored in.
+pub fn storage_directory_name(manifest: &ModelManifest) -> String {
     let storage_name = if crate::ltx25_manifest::is_contract_manifest(&manifest.name) {
         crate::ltx25_manifest::storage_identity(&manifest.name)
     } else if manifest.family == crate::minimax_h3::FAMILY {
@@ -535,7 +545,13 @@ pub fn storage_path(manifest: &ModelManifest, file: &ModelFile) -> PathBuf {
     } else {
         manifest.name.as_str()
     };
-    let sanitized_name = storage_name.replace(':', "-");
+    let qwen21_turbo_base = qwen_image21_turbo_base(storage_name);
+    let storage_name = qwen21_turbo_base.as_deref().unwrap_or(storage_name);
+    storage_name.replace(':', "-")
+}
+
+pub fn storage_path(manifest: &ModelManifest, file: &ModelFile) -> PathBuf {
+    let sanitized_name = storage_directory_name(manifest);
 
     // Paint uses facebook/dinov2-giant in addition to the CLIP tower shipped
     // inside Tencent's bundle. Give the external tower an unambiguous path:
@@ -585,6 +601,16 @@ pub fn storage_path(manifest: &ModelManifest, file: &ModelFile) -> PathBuf {
                     .file_name()
                     .unwrap_or_else(|| std::ffi::OsStr::new(&file.hf_filename)),
             );
+    }
+
+    // Every 2.1 turbo tag carries the same Viggle adapter; one copy under the
+    // family's `loras/` bucket serves them all, and removal ref-counting keeps
+    // it while any turbo tag remains.
+    if manifest.family == "qwen-image21" && file.component == ModelComponent::DistilledLora {
+        return PathBuf::from("shared")
+            .join("qwen-image21")
+            .join("loras")
+            .join(&file.hf_filename);
     }
 
     if is_model_specific_component(file.component) {
@@ -3493,100 +3519,384 @@ fn shared_qwen_image_edit_files() -> Vec<ModelFile> {
     ]
 }
 
+/// The official Qwen Image 2.1 repository. Every file below is pinned by its
+/// LFS digest from revision `b3179ad355be050328e483a9dfdd9e60cd62adfa` (the
+/// weights are byte-identical at the later README-only revisions).
+pub const QWEN_IMAGE21_REPO: &str = "Qwen/Qwen-Image-2.1";
+
+/// The Viggle 6-step turbo LoRA repository, pinned at revision
+/// `bb26a0f38e5fe6c124aaccc9187a87eed5d9ed13`. Published under the Qwen
+/// Research License (its `LICENSE` is byte-identical to the base model's).
+pub const QWEN_IMAGE21_VIGGLE_TURBO_REPO: &str = "Viggle/Qwen-Image-2.1-viggle-turbo";
+
+/// The r256 v0.2.1 6-step adapter the turbo tiers carry.
+pub const QWEN_IMAGE21_VIGGLE_TURBO_LORA: &str =
+    "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors";
+
+/// Every tier's shared runtime: the Qwen3-VL conditioner (language model and
+/// vision tower in one set of BF16 shards — the vision tower is always read
+/// from these, whatever the transformer tier), the RGBA VAE, and the
+/// processor tokenizer. Non-transformer components route to
+/// `shared/qwen-image21/`, so a host downloads them once for every tier.
+pub fn shared_qwen_image21_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 1_350_989_512,
+            gated: false,
+            sha256: Some("a07a1b7c4ee2966a1b3bdc37de9b4f983d56937e46619f709a80b6e490675417"),
+        },
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "text_encoder/model-00001-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_998_056_552,
+            gated: false,
+            sha256: Some("dde00291b5f7fb92013895310a3da0ddba78674df9f10d505d375243dc01fc6f"),
+        },
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "text_encoder/model-00002-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_915_962_464,
+            gated: false,
+            sha256: Some("9047faccc0a6d98496a52d55f27be1c94a9c259d1e283fbea0128d054a948d42"),
+        },
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "text_encoder/model-00003-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_915_962_496,
+            gated: false,
+            sha256: Some("8c54187654c0176b73ae73785bf791dc9a14c9df7fb4310083a09d42048cb57e"),
+        },
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "text_encoder/model-00004-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 2_704_357_976,
+            gated: false,
+            sha256: Some("5311532aaaeae3259eb6a7b2c600636be1159adf7ded35f53579f7d0e7d43cdd"),
+        },
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "processor/tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 11_422_654,
+            gated: false,
+            sha256: Some("aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"),
+        },
+    ]
+}
+
+/// One Qwen Image 2.1 transformer tier: its tag, a one-line description, and
+/// its transformer file(s).
+struct QwenImage21Tier {
+    tag: &'static str,
+    description: &'static str,
+    transformer: Vec<ModelFile>,
+}
+
+fn qwen_image21_tiers() -> Vec<QwenImage21Tier> {
+    let gguf = |file: &str, size_bytes: u64, sha256: &'static str| ModelFile {
+        // stable-diffusion.cpp's author publishes these, so the same GGUF runs
+        // under a reference implementation on the same GPU (the Z-Image
+        // precedent). Revision `cc11433936a06e9765f7c0c0b1f0436cfd2b9856`.
+        hf_repo: "leejet/Qwen-Image-2.1-GGUF".to_string(),
+        hf_filename: file.to_string(),
+        component: ModelComponent::Transformer,
+        size_bytes,
+        gated: false,
+        sha256: Some(sha256),
+    };
+    vec![
+        QwenImage21Tier {
+            tag: "bf16",
+            description:
+                "Qwen Image 2.1 BF16 — Qwen3-VL conditioner and 32-block causal-condition transformer",
+            transformer: vec![
+                ModelFile {
+                    hf_repo: QWEN_IMAGE21_REPO.to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00001-of-00002.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 9_968_332_504,
+                    gated: false,
+                    sha256: Some(
+                        "9e6bc2d641e67bf277895ea8777141044a38f3edb7101bc469b2961dd7c36b4b",
+                    ),
+                },
+                ModelFile {
+                    hf_repo: QWEN_IMAGE21_REPO.to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00002-of-00002.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 4_261_951_904,
+                    gated: false,
+                    sha256: Some(
+                        "3aaf234dcbe128530479735854a346b5e3e66283b7c11db56f836bbd1c13ebaa",
+                    ),
+                },
+            ],
+        },
+        QwenImage21Tier {
+            tag: "int8-conv",
+            description: "Qwen Image 2.1 INT8 ConvRot — Comfy-Org's W8A8 transformer (7.3 GB)",
+            // Comfy-Org revision `9a44dbdb47cefd046be9c0a13476192f34c8db8e`.
+            // Blocks are I8 with per-row F32 scales; non-block layers stay BF16.
+            transformer: vec![ModelFile {
+                hf_repo: "Comfy-Org/Qwen-Image-2.1".to_string(),
+                hf_filename: "diffusion_models/qwen_image_2.1_int8_convrot.safetensors"
+                    .to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 7_256_783_064,
+                gated: false,
+                sha256: Some("cb74113cb03faecd79611b01fd7fd642f0aa60d6f0b95086abee214d75eaa57d"),
+            }],
+        },
+        QwenImage21Tier {
+            tag: "fp8",
+            description: "Qwen Image 2.1 FP8 — unsloth's row-scaled F8E4M3 transformer (7.1 GB)",
+            // unsloth revision `d67caebb412f98c968f9be41b3a8cea80b3e039a`:
+            // torchao `_weight_qdata` (F8E4M3) plus per-row `_weight_scale`.
+            transformer: vec![ModelFile {
+                hf_repo: "unsloth/Qwen-Image-2.1-FP8".to_string(),
+                hf_filename: "Qwen-Image-2.1-FP8.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 7_122_877_560,
+                gated: false,
+                sha256: Some("70e151cfbedd37de7f4a11bda8f58180965c85f4960584c3d10acff599fcd205"),
+            }],
+        },
+        QwenImage21Tier {
+            tag: "q8",
+            description: "Qwen Image 2.1 Q8_0 GGUF transformer (7.7 GB)",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q8_0.gguf",
+                7_687_155_744,
+                "f8b244b00937f0e444a40dbf7866460871b89b30142594973b6012d1b471dc0a",
+            )],
+        },
+        QwenImage21Tier {
+            tag: "q6",
+            description: "Qwen Image 2.1 Q6_K GGUF transformer (6.0 GB)",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q6_K.gguf",
+                5_996_851_232,
+                "1c51d1a8e6cf2b215719dea0c4f0f4cbfff9214a1c7571e57913f57d6a9c3c12",
+            )],
+        },
+        QwenImage21Tier {
+            tag: "q5",
+            description: "Qwen Image 2.1 Q5_0 GGUF transformer (5.1 GB)",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q5_0.gguf",
+                5_069_910_048,
+                "8dfeb1ee091a5d7c7d8191f69723254f031de8fe67ec219a21bf7df57590ab43",
+            )],
+        },
+        QwenImage21Tier {
+            tag: "q4",
+            description: "Qwen Image 2.1 Q4_K GGUF transformer (4.2 GB)",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q4_K.gguf",
+                4_197_494_816,
+                "29f9c83c249ff0292fb2943fceddfa2319b446601866c82a4f8be062abea72c2",
+            )],
+        },
+        QwenImage21Tier {
+            tag: "q3",
+            description: "Qwen Image 2.1 Q3_K GGUF transformer (3.3 GB) — coherent, softer fine text",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q3_K.gguf",
+                3_270_553_632,
+                "5a6352cb450d334ba17a9d18c7fd8c3e774799245b9da0f963ce0c6624deb758",
+            )],
+        },
+        QwenImage21Tier {
+            tag: "q2",
+            description: "Qwen Image 2.1 Q2_K GGUF transformer (2.6 GB) — last resort for small cards; visibly degraded, lettering illegible",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q2_K.gguf",
+                2_561_716_256,
+                "5f79e41d3424abb230ee1486e1f4adab1b07c8c0fd10601fc402fe9890443fe6",
+            )],
+        },
+    ]
+}
+
+/// Why a Metal host cannot run `qwen-image-2.1:fp8`. Shared with the engine's
+/// load-time refusal (which answers by the checkpoint's format, for a renamed
+/// or config-registered file) so both doors say the same thing.
+pub const QWEN_IMAGE21_FP8_METAL_REFUSAL: &str = "qwen-image-2.1:fp8 needs CUDA: candle's Metal \
+     backend has no F8E4M3 cast kernel to widen its weights. Use qwen-image-2.1:int8-conv or a \
+     GGUF tier on Metal.";
+
+/// Manifest tiers a GPU backend cannot execute at all, by exact canonical
+/// name. Both are FP8 checkpoints whose engines widen F8E4M3 weights through a
+/// cast kernel candle's Metal backend does not have (Qwen Image 2.1's
+/// `Q21WeightSource::open`, Wan's `ScaledFp8Checkpoint::ensure_supported`);
+/// the engines still refuse by checkpoint format at load, and this table is
+/// what lets pull and admission refuse BEFORE the download.
+const BACKEND_REFUSED_TIERS: &[(&str, crate::GpuBackend)] = &[
+    ("qwen-image-2.1:fp8", crate::GpuBackend::Metal),
+    ("wan22-t2v-a14b:fp8", crate::GpuBackend::Metal),
+    ("wan22-i2v-a14b:fp8", crate::GpuBackend::Metal),
+];
+
+/// Why `backend` cannot execute the manifest tier `model`, or `None`.
+///
+/// The one authority `mold pull` (a local pull on a Metal build), the
+/// server's download routes and generation admission ask, so a Metal host
+/// refuses an FP8 tier before fetching gigabytes it can never load.
+pub fn backend_refusal(model: &str, backend: crate::GpuBackend) -> Option<String> {
+    let resolved = resolve_model_name(model);
+    let (name, _) = BACKEND_REFUSED_TIERS
+        .iter()
+        .find(|(name, refused)| *name == resolved && *refused == backend)?;
+    Some(if *name == "qwen-image-2.1:fp8" {
+        QWEN_IMAGE21_FP8_METAL_REFUSAL.to_string()
+    } else {
+        format!(
+            "{name} is fp8-scaled, which mold does not run on Metal — candle has no Metal fp8 \
+             widening kernel. Use a GGUF tier of this model instead."
+        )
+    })
+}
+
+/// The base tiers a turbo tag is offered on. Each turbo tag is the base
+/// tier's files plus the Viggle adapter, and shares the base tier's
+/// transformer bytes on disk (`storage_path`).
+pub const QWEN_IMAGE21_TURBO_TAGS: &[&str] = &["bf16", "int8-conv", "q8"];
+
+/// The six raw sigmas of Viggle's published 6-step recipe (the model card's
+/// diffusers example; `crates/mold-inference/testdata/qwen_image21/viggle_lora_layout.json`).
+/// The flow scheduler still applies its target-token `mu` shift to them;
+/// only `shift_terminal` is dropped.
+pub const QWEN_IMAGE21_TURBO_SIGMAS: [f64; 6] = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25];
+
+/// A turbo tier's fixed sampling recipe. Like [`WanDmdLadder`], every value
+/// is a property of the distillation, not a preference: the profile pins
+/// steps and guidance to it and the engine builds its schedule from it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QwenTurboSchedule {
+    /// Raw sigmas before the scheduler's `mu` shift; `sigmas.len()` is the
+    /// step count.
+    pub sigmas: &'static [f64],
+    /// `None`: the turbo recipe runs with `shift_terminal=None`, where the
+    /// base model's scheduler stretches to 0.02.
+    pub shift_terminal: Option<f64>,
+    /// `true_cfg_scale` — 1.0, one forward per step, no negative branch.
+    pub guidance: f64,
+    /// Scale the distilled adapter is installed at (alpha/rank from its
+    /// metadata still applies on top: 256/256 = 1).
+    pub lora_scale: f64,
+}
+
+impl QwenTurboSchedule {
+    pub fn steps(&self) -> u32 {
+        self.sigmas.len() as u32
+    }
+}
+
+/// Viggle's v0.2.1 6-step recipe (model card at `bb26a0f`).
+pub const QWEN_IMAGE21_VIGGLE_TURBO: QwenTurboSchedule = QwenTurboSchedule {
+    sigmas: &QWEN_IMAGE21_TURBO_SIGMAS,
+    shift_terminal: None,
+    guidance: 1.0,
+    lora_scale: 1.0,
+};
+
+/// The fixed recipe of a Qwen Image 2.1 turbo tier, or `None` for a tier that
+/// walks the ordinary schedule. The ONE authority, modelled on
+/// [`wan_dmd_ladder`]: the generation profile pins steps and guidance from
+/// it, admission refuses anything else, and the engine reads the sigmas,
+/// terminal shift and adapter scale from it.
+pub fn qwen_image21_turbo_schedule(model_name: &str) -> Option<QwenTurboSchedule> {
+    let resolved = resolve_model_name(model_name);
+    let (base, tag) = resolved.split_once(':')?;
+    (base == "qwen-image-2.1-turbo" && QWEN_IMAGE21_TURBO_TAGS.contains(&tag))
+        .then_some(QWEN_IMAGE21_VIGGLE_TURBO)
+}
+
+/// The base tier a turbo tag stacks its adapter on (`qwen-image-2.1-turbo:q8`
+/// → `qwen-image-2.1:q8`). Turbo storage lives under this identity, so a host
+/// holding the base tier pulls only the adapter.
+pub fn qwen_image21_turbo_base(model_name: &str) -> Option<String> {
+    let (base, tag) = model_name.split_once(':')?;
+    (base == "qwen-image-2.1-turbo" && QWEN_IMAGE21_TURBO_TAGS.contains(&tag))
+        .then(|| format!("qwen-image-2.1:{tag}"))
+}
+
 /// Qwen Image 2.1 has a distinct Qwen3-VL conditioner, transformer, and VAE
 /// layout from the older Qwen Image family. Keep its artifact graph separate:
 /// sharing a similarly named tokenizer or VAE would make a complete-looking
 /// install that cannot be loaded by either runtime.
 fn qwen_image21_manifests() -> Vec<ModelManifest> {
-    const REPO: &str = "Qwen/Qwen-Image-2.1";
-    vec![ModelManifest {
-        name: "qwen-image-2.1:bf16".to_string(),
-        family: "qwen-image21".to_string(),
-        description:
-            "Qwen Image 2.1 BF16 — Qwen3-VL conditioner and 32-block causal-condition transformer"
-                .to_string(),
-        files: vec![
-            ModelFile {
-                hf_repo: REPO.to_string(),
-                hf_filename: "transformer/diffusion_pytorch_model-00001-of-00002.safetensors"
-                    .to_string(),
-                component: ModelComponent::TransformerShard,
-                size_bytes: 9_968_332_504,
-                gated: false,
-                sha256: Some("9e6bc2d641e67bf277895ea8777141044a38f3edb7101bc469b2961dd7c36b4b"),
-            },
-            ModelFile {
-                hf_repo: REPO.to_string(),
-                hf_filename: "transformer/diffusion_pytorch_model-00002-of-00002.safetensors"
-                    .to_string(),
-                component: ModelComponent::TransformerShard,
-                size_bytes: 4_261_951_904,
-                gated: false,
-                sha256: Some("3aaf234dcbe128530479735854a346b5e3e66283b7c11db56f836bbd1c13ebaa"),
-            },
-            ModelFile {
-                hf_repo: REPO.to_string(),
-                hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
-                component: ModelComponent::Vae,
-                size_bytes: 1_350_989_512,
-                gated: false,
-                sha256: Some("a07a1b7c4ee2966a1b3bdc37de9b4f983d56937e46619f709a80b6e490675417"),
-            },
-            ModelFile {
-                hf_repo: REPO.to_string(),
-                hf_filename: "text_encoder/model-00001-of-00004.safetensors".to_string(),
-                component: ModelComponent::TextEncoder,
-                size_bytes: 4_998_056_552,
-                gated: false,
-                sha256: Some("dde00291b5f7fb92013895310a3da0ddba78674df9f10d505d375243dc01fc6f"),
-            },
-            ModelFile {
-                hf_repo: REPO.to_string(),
-                hf_filename: "text_encoder/model-00002-of-00004.safetensors".to_string(),
-                component: ModelComponent::TextEncoder,
-                size_bytes: 4_915_962_464,
-                gated: false,
-                sha256: Some("9047faccc0a6d98496a52d55f27be1c94a9c259d1e283fbea0128d054a948d42"),
-            },
-            ModelFile {
-                hf_repo: REPO.to_string(),
-                hf_filename: "text_encoder/model-00003-of-00004.safetensors".to_string(),
-                component: ModelComponent::TextEncoder,
-                size_bytes: 4_915_962_496,
-                gated: false,
-                sha256: Some("8c54187654c0176b73ae73785bf791dc9a14c9df7fb4310083a09d42048cb57e"),
-            },
-            ModelFile {
-                hf_repo: REPO.to_string(),
-                hf_filename: "text_encoder/model-00004-of-00004.safetensors".to_string(),
-                component: ModelComponent::TextEncoder,
-                size_bytes: 2_704_357_976,
-                gated: false,
-                sha256: Some("5311532aaaeae3259eb6a7b2c600636be1159adf7ded35f53579f7d0e7d43cdd"),
-            },
-            ModelFile {
-                hf_repo: REPO.to_string(),
-                hf_filename: "processor/tokenizer.json".to_string(),
-                component: ModelComponent::TextTokenizer,
-                size_bytes: 11_422_654,
-                gated: false,
-                sha256: Some("aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"),
-            },
-        ],
-        defaults: ManifestDefaults {
-            steps: 40,
-            guidance: 1.0,
-            width: 1024,
-            height: 1024,
-            is_schnell: false,
-            scheduler: None,
-            negative_prompt: None,
-            frames: None,
-            fps: None,
-            source_image: Some(crate::types::SourceImageCapability::Unsupported),
-        },
-        hidden: false,
-    }]
+    let base_defaults = ManifestDefaults {
+        steps: 40,
+        guidance: 1.0,
+        width: 1024,
+        height: 1024,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        // The `None` passthrough every edit family uses: references ride
+        // `edit_images` (`capabilities.reference_images`), which refuses
+        // `source_image` by name.
+        source_image: None,
+    };
+    let turbo_defaults = ManifestDefaults {
+        steps: QWEN_IMAGE21_VIGGLE_TURBO.steps(),
+        guidance: QWEN_IMAGE21_VIGGLE_TURBO.guidance,
+        ..base_defaults.clone()
+    };
+    let turbo_lora = ModelFile {
+        hf_repo: QWEN_IMAGE21_VIGGLE_TURBO_REPO.to_string(),
+        hf_filename: QWEN_IMAGE21_VIGGLE_TURBO_LORA.to_string(),
+        component: ModelComponent::DistilledLora,
+        size_bytes: 1_359_147_904,
+        gated: false,
+        sha256: Some("2a0148f5c73abbed5f97da5ea356e439318aadb281d01fce4af39cdf43728803"),
+    };
+    let mut manifests = Vec::new();
+    let mut turbo = Vec::new();
+    for tier in qwen_image21_tiers() {
+        let mut files = tier.transformer.clone();
+        files.extend(shared_qwen_image21_files());
+        if QWEN_IMAGE21_TURBO_TAGS.contains(&tier.tag) {
+            let mut turbo_files = files.clone();
+            turbo_files.push(turbo_lora.clone());
+            turbo.push(ModelManifest {
+                name: format!("qwen-image-2.1-turbo:{}", tier.tag),
+                family: "qwen-image21".to_string(),
+                description: format!(
+                    "{} + Viggle 6-step turbo LoRA (r256, Qwen Research License, non-commercial)",
+                    tier.description
+                        .split(" — ")
+                        .next()
+                        .unwrap_or(tier.description)
+                ),
+                files: turbo_files,
+                defaults: turbo_defaults.clone(),
+                hidden: false,
+            });
+        }
+        manifests.push(ModelManifest {
+            name: format!("qwen-image-2.1:{}", tier.tag),
+            family: "qwen-image21".to_string(),
+            description: tier.description.to_string(),
+            files,
+            defaults: base_defaults.clone(),
+            hidden: false,
+        });
+    }
+    manifests.extend(turbo);
+    manifests
 }
 
 /// All known Qwen-Image model manifests.
@@ -4497,6 +4807,13 @@ pub fn resolve_model_name(input: &str) -> String {
     if input == "flux2-dev" {
         return format!("{input}:bf16");
     }
+    // Qwen Image 2.1's bare names stay on the full BF16 tier they have always
+    // meant. The tag loop tries `:q8` first, so without this pin adding the
+    // GGUF tiers would silently re-point `qwen-image-2.1` at a different
+    // download on a host that already holds the BF16 install.
+    if matches!(input, "qwen-image-2.1" | "qwen-image-2.1-turbo") {
+        return format!("{input}:bf16");
+    }
     // Legacy format: flux-dev-q4 -> flux-dev:q4 and
     // ltx-2.3-22b-dev-fp8 -> ltx-2.3-22b-dev:fp8.
     if let Some((base, suffix)) = input.rsplit_once('-') {
@@ -4895,12 +5212,15 @@ pub fn find_umt5_variant(tag: &str) -> Option<&'static Umt5Variant> {
 // ── Quantized Qwen3 variant registry ──────────────────────────────────────────
 
 /// A quantized Qwen3 text encoder variant available from HuggingFace.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen3Variant {
     pub tag: &'static str,
     pub hf_repo: &'static str,
     pub hf_filename: &'static str,
     pub size_bytes: u64,
+    /// Pinned LFS digest, verified after download when present. The
+    /// historical Qwen3 lists predate pinning and resolve unpinned.
+    pub sha256: Option<&'static str>,
 }
 
 /// A quantized Qwen2.5-VL text encoder variant available from HuggingFace.
@@ -4920,24 +5240,28 @@ pub fn known_qwen3_variants() -> &'static [Qwen3Variant] {
             hf_repo: "worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF",
             hf_filename: "Qwen_3_4b-Q8_0.gguf",
             size_bytes: 4_280_404_704,
+            sha256: None,
         },
         Qwen3Variant {
             tag: "q6",
             hf_repo: "worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF",
             hf_filename: "Qwen_3_4b-Q6_K.gguf",
             size_bytes: 3_306_260_704,
+            sha256: None,
         },
         Qwen3Variant {
             tag: "iq4",
             hf_repo: "worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF",
             hf_filename: "Qwen_3_4b-imatrix-IQ4_XS.gguf",
             size_bytes: 2_270_751_136,
+            sha256: None,
         },
         Qwen3Variant {
             tag: "q3",
             hf_repo: "worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF",
             hf_filename: "Qwen_3_4b-imatrix-Q3_K_M.gguf",
             size_bytes: 2_075_617_696,
+            sha256: None,
         },
     ];
     VARIANTS
@@ -5006,24 +5330,28 @@ pub fn known_qwen3_8b_variants() -> &'static [Qwen3Variant] {
             hf_repo: "unsloth/Qwen3-8B-GGUF",
             hf_filename: "Qwen3-8B-Q8_0.gguf",
             size_bytes: 8_709_519_168,
+            sha256: None,
         },
         Qwen3Variant {
             tag: "q6",
             hf_repo: "unsloth/Qwen3-8B-GGUF",
             hf_filename: "Qwen3-8B-Q6_K.gguf",
             size_bytes: 6_725_900_096,
+            sha256: None,
         },
         Qwen3Variant {
             tag: "iq4",
             hf_repo: "unsloth/Qwen3-8B-GGUF",
             hf_filename: "Qwen3-8B-IQ4_XS.gguf",
             size_bytes: 4_581_287_744,
+            sha256: None,
         },
         Qwen3Variant {
             tag: "q3",
             hf_repo: "unsloth/Qwen3-8B-GGUF",
             hf_filename: "Qwen3-8B-Q3_K_M.gguf",
             size_bytes: 4_124_161_856,
+            sha256: None,
         },
     ];
     VARIANTS
@@ -5032,6 +5360,59 @@ pub fn known_qwen3_8b_variants() -> &'static [Qwen3Variant] {
 /// Find a Qwen3-8B variant by tag (e.g. "q8", "q6", "iq4", "q3").
 pub fn find_qwen3_8b_variant(tag: &str) -> Option<&'static Qwen3Variant> {
     known_qwen3_8b_variants().iter().find(|v| v.tag == tag)
+}
+
+// ── Quantized Qwen3-VL-8B variant registry ──────────────────────────────────
+
+/// Pinned revision of `Qwen/Qwen3-VL-8B-Instruct-GGUF` the digests below
+/// were read from (Hub API LFS oids).
+pub const QWEN3_VL_8B_GGUF_REVISION: &str = "f982a07559d4a2f6c8744d840bf6fccab30eea96";
+
+/// Quantized language models for Qwen Image 2.1's Qwen3-VL-8B-Instruct text
+/// encoder, sorted largest → smallest.
+///
+/// The Image 2.1 text-encoder shards are stock Qwen3-VL-8B-Instruct (identical
+/// 750-tensor key set; sampled tensors hash identically), so the official
+/// GGUF conversions serve as its language half. The vision tower always comes
+/// from the BF16 shards. Deliberately NOT [`known_qwen3_8b_variants`]:
+/// `unsloth/Qwen3-8B` is a different model with a 1e6 RoPE base.
+pub fn known_qwen3_vl_8b_variants() -> &'static [Qwen3Variant] {
+    static VARIANTS: &[Qwen3Variant] = &[
+        Qwen3Variant {
+            tag: "q8",
+            hf_repo: "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+            hf_filename: "Qwen3VL-8B-Instruct-Q8_0.gguf",
+            size_bytes: 8_709_519_456,
+            sha256: Some("0d264b3941185d00a74f75c4245521dae088ff1efc90ab8d1754e83f5844adb0"),
+        },
+        Qwen3Variant {
+            tag: "q4",
+            hf_repo: "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+            hf_filename: "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+            size_bytes: 5_027_784_800,
+            sha256: Some("67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2"),
+        },
+    ];
+    VARIANTS
+}
+
+/// Whether auto-fallback may choose `variant` without an explicit
+/// `MOLD_QWEN3_VARIANT`.
+///
+/// Measured on the Qwen Image 2.1 t2i template against the BF16 checkpoint run
+/// in F32 (per-token cosine of the conditioning rows): Q8_0 mean 0.9992, worst
+/// 0.9929 — closer than the shipped BF16 tier's own worst token (0.9642).
+/// Q4_K_M mean 0.9607, worst 0.3948 — the attention-sink token collapses, and
+/// forcing an exact dequantized matmul does not recover it (0.9629), so it is
+/// the weights, not a kernel. Q4 stays selectable by name for a card that
+/// cannot hold Q8 at all, and is never chosen silently.
+pub fn qwen3_vl_8b_variant_auto_eligible(variant: &Qwen3Variant) -> bool {
+    variant.tag == "q8"
+}
+
+/// Find a Qwen3-VL-8B variant by tag (`q8`, `q4`).
+pub fn find_qwen3_vl_8b_variant(tag: &str) -> Option<&'static Qwen3Variant> {
+    known_qwen3_vl_8b_variants().iter().find(|v| v.tag == tag)
 }
 
 /// Total size of all files in the manifest in bytes.
@@ -8359,6 +8740,44 @@ fn upscaler_manifests() -> Vec<ModelManifest> {
 
 #[cfg(test)]
 mod tests {
+    /// An FP8 tier needs an F8E4M3 widening kernel Metal does not have, so a
+    /// Metal host refuses it BEFORE downloading — by every spelling of the
+    /// name — while CUDA and every other tier are untouched.
+    #[test]
+    fn fp8_tiers_are_refused_on_metal_before_download() {
+        use crate::GpuBackend;
+        let refusal = super::backend_refusal("qwen-image-2.1:fp8", GpuBackend::Metal).unwrap();
+        assert_eq!(refusal, super::QWEN_IMAGE21_FP8_METAL_REFUSAL);
+        assert!(refusal.contains("int8-conv"), "{refusal}");
+        // The legacy dash spelling resolves to the same tier.
+        assert!(super::backend_refusal("qwen-image-2.1-fp8", GpuBackend::Metal).is_some());
+        for wan in ["wan22-t2v-a14b:fp8", "wan22-i2v-a14b:fp8"] {
+            let refusal = super::backend_refusal(wan, GpuBackend::Metal).unwrap();
+            assert!(
+                refusal.contains(wan) && refusal.contains("GGUF"),
+                "{refusal}"
+            );
+            assert!(super::backend_refusal(wan, GpuBackend::Cuda).is_none());
+        }
+        assert!(super::backend_refusal("qwen-image-2.1:fp8", GpuBackend::Cuda).is_none());
+        for runnable in [
+            "qwen-image-2.1:bf16",
+            "qwen-image-2.1:int8-conv",
+            "qwen-image-2.1:q8",
+            "wan22-t2v-a14b:q8",
+        ] {
+            assert!(
+                super::backend_refusal(runnable, GpuBackend::Metal).is_none(),
+                "{runnable}"
+            );
+        }
+        // Every refused name is a real manifest entry, so a rename cannot
+        // silently drop a refusal.
+        for name in super::BACKEND_REFUSED_TIERS.iter().map(|(name, _)| *name) {
+            assert!(super::find_manifest(name).is_some(), "{name}");
+        }
+    }
+
     /// `hunyuan3d-2.1:q4` is what plato advertises after `mold quantize`;
     /// no registry serves it, and a pull of it on another host must say so
     /// rather than "unknown model" (#1672).
@@ -8958,6 +9377,143 @@ mod tests {
         assert_eq!(
             paths.vae,
             PathBuf::from("/models/vae/diffusion_pytorch_model.safetensors")
+        );
+    }
+
+    #[test]
+    fn every_qwen_image21_tier_shares_one_pinned_runtime() {
+        let tags = [
+            "bf16",
+            "int8-conv",
+            "fp8",
+            "q8",
+            "q6",
+            "q5",
+            "q4",
+            "q3",
+            "q2",
+        ];
+        let bf16 = find_manifest("qwen-image-2.1:bf16").unwrap();
+        let shared: Vec<PathBuf> = shared_qwen_image21_files()
+            .iter()
+            .map(|file| storage_path(bf16, file))
+            .collect();
+        for tag in tags {
+            let name = format!("qwen-image-2.1:{tag}");
+            let manifest = find_manifest(&name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(manifest.family, "qwen-image21");
+            assert!(!manifest.hidden, "{name}");
+            assert_eq!(manifest.defaults.steps, 40, "{name}");
+            assert_eq!(manifest.defaults.source_image, None, "{name}");
+            for file in &manifest.files {
+                let sha = file
+                    .sha256
+                    .unwrap_or_else(|| panic!("{name} {}", file.hf_filename));
+                assert_eq!(sha.len(), 64, "{name} {}", file.hf_filename);
+                assert!(file.size_bytes > 0);
+                assert_ne!(file.component, ModelComponent::DistilledLora, "{name}");
+            }
+            // The conditioner, VAE and tokenizer are ONE copy for every tier.
+            for path in &shared {
+                assert!(
+                    manifest
+                        .files
+                        .iter()
+                        .any(|file| &storage_path(manifest, file) == path),
+                    "{name} must share {}",
+                    path.display()
+                );
+                assert!(
+                    path.starts_with("shared/qwen-image21"),
+                    "{}",
+                    path.display()
+                );
+            }
+            // Every tier carries exactly one transformer — sharded or single.
+            let transformers = manifest
+                .files
+                .iter()
+                .filter(|file| {
+                    matches!(
+                        file.component,
+                        ModelComponent::Transformer | ModelComponent::TransformerShard
+                    )
+                })
+                .count();
+            assert_eq!(transformers, if tag == "bf16" { 2 } else { 1 }, "{name}");
+        }
+        let gguf = find_manifest("qwen-image-2.1:q4").unwrap();
+        assert_eq!(gguf.files[0].hf_repo, "leejet/Qwen-Image-2.1-GGUF");
+        assert_eq!(gguf.files[0].hf_filename, "qwen_image_2.1-Q4_K.gguf");
+    }
+
+    #[test]
+    fn qwen_image21_turbo_tags_stack_the_viggle_adapter_on_their_base_tier() {
+        for tag in QWEN_IMAGE21_TURBO_TAGS {
+            let name = format!("qwen-image-2.1-turbo:{tag}");
+            let turbo = find_manifest(&name).unwrap_or_else(|| panic!("{name}"));
+            let base = find_manifest(&format!("qwen-image-2.1:{tag}")).unwrap();
+            assert_eq!(turbo.family, "qwen-image21");
+            assert_eq!(turbo.defaults.steps, 6);
+            assert_eq!(turbo.defaults.guidance, 1.0);
+            assert_eq!(turbo.files.len(), base.files.len() + 1);
+            // Every base file lands at the SAME path, so a host that holds the
+            // base tier pulls only the adapter.
+            for file in &base.files {
+                assert_eq!(
+                    storage_path(turbo, file),
+                    storage_path(base, file),
+                    "{name} {}",
+                    file.hf_filename
+                );
+            }
+            let adapter = turbo
+                .files
+                .iter()
+                .find(|file| file.component == ModelComponent::DistilledLora)
+                .unwrap();
+            assert_eq!(adapter.hf_repo, QWEN_IMAGE21_VIGGLE_TURBO_REPO);
+            assert_eq!(adapter.hf_filename, QWEN_IMAGE21_VIGGLE_TURBO_LORA);
+            assert_eq!(adapter.size_bytes, 1_359_147_904);
+            assert_eq!(
+                adapter.sha256,
+                Some("2a0148f5c73abbed5f97da5ea356e439318aadb281d01fce4af39cdf43728803")
+            );
+            assert_eq!(
+                storage_path(turbo, adapter),
+                PathBuf::from("shared/qwen-image21/loras").join(QWEN_IMAGE21_VIGGLE_TURBO_LORA)
+            );
+            let schedule = qwen_image21_turbo_schedule(&name).unwrap();
+            assert_eq!(schedule, QWEN_IMAGE21_VIGGLE_TURBO);
+            assert_eq!(schedule.sigmas, &[1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]);
+            assert_eq!(schedule.steps(), 6);
+            assert_eq!(schedule.shift_terminal, None);
+            assert_eq!(schedule.guidance, 1.0);
+            assert_eq!(schedule.lora_scale, 1.0);
+            assert_eq!(qwen_image21_turbo_base(&name).unwrap(), base.name);
+        }
+        assert!(qwen_image21_turbo_schedule("qwen-image-2.1:bf16").is_none());
+        assert!(qwen_image21_turbo_schedule("qwen-image-2.1-turbo:q4").is_none());
+        assert_eq!(
+            qwen_image21_turbo_schedule("qwen-image-2.1-turbo"),
+            Some(QWEN_IMAGE21_VIGGLE_TURBO)
+        );
+    }
+
+    #[test]
+    fn bare_qwen_image21_names_stay_on_bf16() {
+        assert_eq!(resolve_model_name("qwen-image-2.1"), "qwen-image-2.1:bf16");
+        assert_eq!(
+            resolve_model_name("qwen-image-2.1-turbo"),
+            "qwen-image-2.1-turbo:bf16"
+        );
+        assert_eq!(
+            variant_quality_rank("qwen-image-2.1:int8-conv"),
+            variant_quality_rank("qwen-image-2.1:fp8")
+        );
+        assert!(
+            variant_quality_rank("qwen-image-2.1:int8-conv")
+                < variant_quality_rank("qwen-image-2.1:q8")
         );
     }
 
@@ -9868,7 +10424,11 @@ mod tests {
         // Neither is a checkpoint or a default-model candidate.
         // Qwen Image 2.1: one self-contained BF16 checkpoint with its own
         // Qwen3-VL conditioner, two transformer shards, and decoder.
-        assert_eq!(known_manifests().len(), 211);
+        // Qwen Image 2.1 tiers: +8 transformer tiers (int8-conv, fp8, q8, q6,
+        // q5, q4, q3, q2) on the shared conditioner/VAE, and +3 turbo tags
+        // (bf16, int8-conv, q8) that stack the Viggle 6-step adapter on those
+        // base files.
+        assert_eq!(known_manifests().len(), 222);
     }
 
     /// Every reviewed H3 Turbo adapter lands in the one family `loras/`
@@ -11453,6 +12013,34 @@ mod tests {
         assert_eq!(find_qwen3_8b_variant("iq4").unwrap().tag, "iq4");
         assert_eq!(find_qwen3_8b_variant("q3").unwrap().tag, "q3");
         assert!(find_qwen3_8b_variant("nonexistent").is_none());
+    }
+
+    #[test]
+    fn qwen3_vl_8b_variants_are_pinned_official_ggufs() {
+        let variants = known_qwen3_vl_8b_variants();
+        assert_eq!(
+            variants.iter().map(|v| v.tag).collect::<Vec<_>>(),
+            ["q8", "q4"]
+        );
+        for pair in variants.windows(2) {
+            assert!(pair[0].size_bytes > pair[1].size_bytes, "largest first");
+        }
+        for v in variants {
+            assert_eq!(v.hf_repo, "Qwen/Qwen3-VL-8B-Instruct-GGUF");
+            assert!(v.hf_filename.ends_with(".gguf"));
+            let sha = v.sha256.expect("the VL list is pinned");
+            assert_eq!(sha.len(), 64);
+            assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(v.size_bytes < QWEN3_8B_FP16_SIZE);
+        }
+        assert_eq!(find_qwen3_vl_8b_variant("q4").unwrap().tag, "q4");
+        assert!(find_qwen3_vl_8b_variant("iq4").is_none());
+        // The historical lists stay unpinned; the VL list shares no file with
+        // Klein-9B's (a different model).
+        assert!(known_qwen3_8b_variants().iter().all(|v| v.sha256.is_none()));
+        assert!(known_qwen3_8b_variants()
+            .iter()
+            .all(|k| variants.iter().all(|v| v.hf_repo != k.hf_repo)));
     }
 
     #[test]

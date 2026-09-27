@@ -364,6 +364,7 @@ impl DurableMediaAdmission {
                 "server is restarting; this generation was not accepted",
             ));
         }
+        let child = ChildLabel::of(body.requests.len());
         let typed_history = body
             .requests
             .iter()
@@ -379,8 +380,8 @@ impl DurableMediaAdmission {
             mold_core::minimax_h3::canonicalize_request_model(request);
             if request.batch_size != 1 {
                 return Err(ApiError::validation(format!(
-                    "requests[{}].batch_size must be 1",
-                    offset + 1
+                    "{} must be 1",
+                    child(offset).field("batch_size")
                 )));
             }
         }
@@ -406,7 +407,7 @@ impl DurableMediaAdmission {
                 state.instance_id.as_str(),
             )
             .map_err(|mut error| {
-                error.error = format!("requests[{}]: {}", offset + 1, error.error);
+                error.error = child(offset).refusal(&error.error);
                 error
             })? {
                 fingerprint.write_all(subject.as_bytes()).map_err(|error| {
@@ -473,6 +474,9 @@ impl DurableMediaAdmission {
                 .transpose()?;
             crate::routes::apply_default_metadata_setting(state, &mut request).await;
             crate::routes::normalize_generation_placement(state, &mut request).await;
+            // `transparent_background: false` and an absent field are one
+            // request; the durable row carries one spelling of "no".
+            request.normalize_transparent_background();
             let preferred_gpu =
                 crate::routes::validate_multi_gpu_placement(state, request.placement.as_ref())?;
             let private_ingress =
@@ -494,7 +498,7 @@ impl DurableMediaAdmission {
             // a caller its `strength` is wrong for a checkpoint this build
             // cannot run at all answers the wrong question.
             crate::routes::reject_client_supplied_hdr_output(&request).map_err(|mut error| {
-                error.error = format!("requests[{}]: {}", offset + 1, error.error);
+                error.error = child(offset).refusal(&error.error);
                 error
             })?;
             // The family this door resolves is the family it validates with.
@@ -510,7 +514,7 @@ impl DurableMediaAdmission {
                 family = crate::routes::require_server_model_activation(state, &request.model)
                     .await
                     .map_err(|mut error| {
-                        error.error = format!("requests[{}]: {}", offset + 1, error.error);
+                        error.error = child(offset).refusal(&error.error);
                         error
                     })?;
                 crate::routes::require_server_generation_request_activation(
@@ -520,7 +524,7 @@ impl DurableMediaAdmission {
                 )
                 .await
                 .map_err(|mut error| {
-                    error.error = format!("requests[{}]: {}", offset + 1, error.error);
+                    error.error = child(offset).refusal(&error.error);
                     error
                 })?;
                 // Same pin `prepare_generation` applies, at the same point in
@@ -541,9 +545,7 @@ impl DurableMediaAdmission {
             } else {
                 mold_core::validate_generate_request_fields(&request, family.as_deref())
             };
-            validation.map_err(|error| {
-                ApiError::validation(format!("requests[{}]: {error}", offset + 1))
-            })?;
+            validation.map_err(|error| ApiError::validation(child(offset).refusal(error)))?;
             // An output format the recipe does not advertise will never become
             // valid, so it belongs at the DOOR. Before this it was only
             // checked in preparation, which runs after durable
@@ -553,35 +555,45 @@ impl DurableMediaAdmission {
             // LAST, after ordinary field validation: a request that is wrong
             // in two ways must report the same error it always did, so this
             // adds a refusal rather than reordering the existing ones.
-            if !private_ingress {
-                if let Some(output_format) = request.output_format {
-                    if !profiles_by_model.contains_key(&request.model) {
-                        let canonical = mold_core::manifest::resolve_model_name(&request.model);
-                        let profile = crate::routes::resolved_generation_profile(
-                            state,
-                            &request.model,
-                            &canonical,
-                        )
-                        .await;
-                        profiles_by_model.insert(request.model.clone(), profile);
-                    }
-                    // The door checks the recipe the request's own `pipeline`
-                    // names (the default one when it names none); preparation
-                    // may later pick IcLora or LipDub through
-                    // `plan_builtin_ltx2_control`, whose format lists match the
-                    // default's today.
-                    if let Some(profile) = profiles_by_model
-                        .get(&request.model)
-                        .and_then(Option::as_ref)
-                    {
-                        if let Some(recipe) = profile.recipe_for_pipeline(request.pipeline) {
+            if !private_ingress
+                && (request.output_format.is_some() || request.transparent_background.is_some())
+            {
+                if !profiles_by_model.contains_key(&request.model) {
+                    let canonical = mold_core::manifest::resolve_model_name(&request.model);
+                    let profile = crate::routes::resolved_generation_profile(
+                        state,
+                        &request.model,
+                        &canonical,
+                    )
+                    .await;
+                    profiles_by_model.insert(request.model.clone(), profile);
+                }
+                // The door checks the recipe the request's own `pipeline`
+                // names (the default one when it names none); preparation
+                // may later pick IcLora or LipDub through
+                // `plan_builtin_ltx2_control`, whose format lists match the
+                // default's today.
+                if let Some(profile) = profiles_by_model
+                    .get(&request.model)
+                    .and_then(Option::as_ref)
+                {
+                    if let Some(recipe) = profile.recipe_for_pipeline(request.pipeline) {
+                        if let Some(output_format) = request.output_format {
                             mold_core::validate_output_format_against_generation_profile(
                                 recipe,
                                 output_format,
                             )
-                            .map_err(|error| {
-                                ApiError::validation(format!("requests[{}]: {error}", offset + 1))
-                            })?;
+                            .map_err(|error| ApiError::validation(child(offset).refusal(error)))?;
+                        }
+                        // The transparency contract against the SAME
+                        // delivery-qualified recipe: a build without WebP
+                        // must refuse a transparent WebP here, at the
+                        // door, not after the render.
+                        if let Some(transparency) = recipe.capabilities.transparency.as_ref() {
+                            mold_core::validate_transparency_against(transparency, &request)
+                                .map_err(|error| {
+                                    ApiError::validation(child(offset).refusal(error))
+                                })?;
                         }
                     }
                 }
@@ -595,10 +607,7 @@ impl DurableMediaAdmission {
                 if let Some(refusal) =
                     flux2_lora_tier_refusal(state, &request, family.as_deref()).await
                 {
-                    return Err(ApiError::validation(format!(
-                        "requests[{}]: {refusal}",
-                        offset + 1
-                    )));
+                    return Err(ApiError::validation(child(offset).refusal(refusal)));
                 }
             }
             validated.push((offset, request, preferred_gpu, reference_scope_sha256));
@@ -642,7 +651,7 @@ impl DurableMediaAdmission {
                 )
                 .await
                 .map_err(|mut error| {
-                    error.error = format!("requests[{}]: {}", offset + 1, error.error);
+                    error.error = child(offset).refusal(&error.error);
                     error
                 })?;
             // Authority binds the exact deterministic request persisted below
@@ -654,7 +663,7 @@ impl DurableMediaAdmission {
                 state.instance_id.as_str(),
             )
             .map_err(|mut error| {
-                error.error = format!("requests[{}]: {}", offset + 1, error.error);
+                error.error = child(offset).refusal(&error.error);
                 error
             })?;
             prepared.push(PreparedChild {
@@ -916,6 +925,7 @@ fn normalize_batch_provenance(
     direct_one_shot: bool,
 ) -> Result<(), ApiError> {
     const MAX_LOGICAL_BATCH_ID_BYTES: usize = 128;
+    let child = ChildLabel::of(requests.len());
     let supplied = requests.iter().any(|request| {
         request.batch_id.is_some() || request.batch_index.is_some() || request.batch_count.is_some()
     });
@@ -941,26 +951,23 @@ fn normalize_batch_provenance(
             request.batch_count,
         ) else {
             return Err(ApiError::validation(format!(
-                "requests[{}] must provide batch_id, batch_index, and batch_count together",
-                offset + 1
+                "{} must provide batch_id, batch_index, and batch_count together",
+                child(offset).subject()
             )));
         };
         if batch_id.trim().is_empty() {
             return Err(ApiError::validation(format!(
-                "requests[{}].batch_id must not be empty",
-                offset + 1
+                "{} must not be empty",
+                child(offset).field("batch_id")
             )));
         }
         if batch_id.len() > MAX_LOGICAL_BATCH_ID_BYTES || batch_id.chars().any(char::is_control) {
-            return Err(ApiError::validation(format!(
-                "requests[{}].batch_id must be at most {MAX_LOGICAL_BATCH_ID_BYTES} bytes and contain no control characters",
-                offset + 1
-            )));
+            return Err(ApiError::validation(format!("{} must be at most {MAX_LOGICAL_BATCH_ID_BYTES} bytes and contain no control characters", child(offset).field("batch_id"))));
         }
         if batch_index == 0 || batch_count == 0 || batch_index > batch_count {
             return Err(ApiError::validation(format!(
-                "requests[{}] has invalid batch_index/batch_count provenance",
-                offset + 1
+                "{} has invalid batch_index/batch_count provenance",
+                child(offset).subject()
             )));
         }
         if logical_id.is_some_and(|expected| expected != batch_id)
@@ -1029,9 +1036,10 @@ pub(crate) fn durable_media_preflight(
 }
 
 fn durable_media_batch_preflight(requests: &[mold_core::GenerateRequest]) -> Result<(), ApiError> {
+    let child = ChildLabel::of(requests.len());
     for (offset, request) in requests.iter().enumerate() {
         durable_media_preflight(request).map_err(|mut error| {
-            error.error = format!("requests[{}]: {}", offset + 1, error.error);
+            error.error = child(offset).refusal(&error.error);
             error
         })?;
     }
@@ -1046,6 +1054,7 @@ fn seal_batch_blocking(
     fingerprint: &QueueMediaOperationFingerprint,
     inputs: Vec<SealInput>,
 ) -> Result<BlockingSealedBatch, ApiError> {
+    let child = ChildLabel::of(inputs.len());
     let mut batch = BlockingSealedBatch {
         lifecycle,
         children: Vec::with_capacity(inputs.len()),
@@ -1068,21 +1077,21 @@ fn seal_batch_blocking(
         } = input;
         let model = request.model.clone();
         let seed_pinned = request.seed.is_some();
-        let admission_authority = admission_authority
-            .as_deref()
-            .map(|payload| {
-                batch
-                    .lifecycle
-                    .seal_admission_authority(&id, payload)
-                    .map(|authority| authority.as_str().to_owned())
-                    .map_err(|error| {
-                        ApiError::internal(format!(
-                            "requests[{}]: admission authority sealing failed: {error}",
-                            offset + 1
-                        ))
-                    })
-            })
-            .transpose()?;
+        let admission_authority =
+            admission_authority
+                .as_deref()
+                .map(|payload| {
+                    batch
+                        .lifecycle
+                        .seal_admission_authority(&id, payload)
+                        .map(|authority| authority.as_str().to_owned())
+                        .map_err(|error| {
+                            ApiError::internal(child(offset).refusal(format_args!(
+                                "admission authority sealing failed: {error}"
+                            )))
+                        })
+                })
+                .transpose()?;
         let (request_json, media_set) = if request_has_durable_media(&request) {
             let authorities = crate::queue_media::ProcessPrivateAuthorities::none()
                 .with_durable_replacement(durable_replacement);
@@ -1092,20 +1101,20 @@ fn seal_batch_blocking(
                 &authorities,
                 staged_references.as_ref(),
             )
-            .map_err(|error| extraction_error(offset, error))?;
+            .map_err(|error| extraction_error(child(offset), error))?;
             let projection = crate::queue_media::project_request_media(extracted.media())
-                .map_err(|error| extraction_error(offset, error))?;
+                .map_err(|error| extraction_error(child(offset), error))?;
             let (request_json, media) = extracted.into_parts();
             let seal_media = crate::queue_media::into_seal_media(media)
-                .map_err(|error| extraction_error(offset, error))?;
+                .map_err(|error| extraction_error(child(offset), error))?;
             let reference = batch
                 .lifecycle
                 .seal_v2(&id, fingerprint, &projection, seal_media)
                 .map_err(|error| {
-                    ApiError::internal(format!(
-                        "requests[{}]: encrypted media sealing failed: {error}",
-                        offset + 1
-                    ))
+                    ApiError::internal(
+                        child(offset)
+                            .refusal(format_args!("encrypted media sealing failed: {error}")),
+                    )
                 })?;
             // The encrypted set is now the only copy: releasing the staged
             // set returns its quota and unlinks the admission staging.
@@ -1114,10 +1123,9 @@ fn seal_batch_blocking(
             (request_json, Some(reference))
         } else {
             let request_json = serde_json::to_string(&request).map_err(|error| {
-                ApiError::internal(format!(
-                    "requests[{}]: request serialization failed: {error}",
-                    offset + 1
-                ))
+                ApiError::internal(
+                    child(offset).refusal(format_args!("request serialization failed: {error}")),
+                )
             })?;
             (request_json, None)
         };
@@ -1218,13 +1226,68 @@ fn flux2_lora_tier_refusal_for_stack(
     })
 }
 
+/// How a refusal names the child it is about. Every door admits through
+/// [`QueueMediaAdmission::admit_batch`], so `/api/generate` and
+/// `/api/generate/stream` arrive as a one-element batch; a caller that sent
+/// ONE request has no sibling to tell it apart from, and `requests[1]:` on
+/// its error is noise it never wrote. Only an operation carrying more than
+/// one request names the child it refused.
+#[derive(Clone, Copy, Debug)]
+struct ChildLabel {
+    /// One-based position in the operation, as the refusal spells it.
+    index: usize,
+    of_many: bool,
+}
+
+impl ChildLabel {
+    fn new(offset: usize, count: usize) -> Self {
+        Self {
+            index: offset + 1,
+            of_many: count > 1,
+        }
+    }
+
+    /// Returns a closure naming the child at each offset of a `count`-long
+    /// operation.
+    fn of(count: usize) -> impl Fn(usize) -> Self + Copy {
+        move |offset| Self::new(offset, count)
+    }
+
+    /// `requests[n]: <message>` in a batch, `<message>` alone otherwise.
+    fn refusal(self, message: impl std::fmt::Display) -> String {
+        if self.of_many {
+            format!("requests[{}]: {message}", self.index)
+        } else {
+            message.to_string()
+        }
+    }
+
+    /// `requests[n].<field>` in a batch, `<field>` alone otherwise.
+    fn field(self, field: &str) -> String {
+        if self.of_many {
+            format!("requests[{}].{field}", self.index)
+        } else {
+            field.to_owned()
+        }
+    }
+
+    /// `requests[n]` in a batch, `the request` otherwise.
+    fn subject(self) -> String {
+        if self.of_many {
+            format!("requests[{}]", self.index)
+        } else {
+            "the request".to_owned()
+        }
+    }
+}
+
 fn typed_refusal(code: &'static str, message: &'static str) -> ApiError {
     ApiError::with_code(message, code, StatusCode::UNPROCESSABLE_ENTITY)
 }
 
-fn extraction_error(offset: usize, error: crate::queue_media::QueueMediaError) -> ApiError {
+fn extraction_error(child: ChildLabel, error: crate::queue_media::QueueMediaError) -> ApiError {
     ApiError::with_code(
-        format!("requests[{}]: {error}", offset + 1),
+        child.refusal(error),
         "DURABLE_MEDIA_UNSUPPORTED",
         StatusCode::UNPROCESSABLE_ENTITY,
     )

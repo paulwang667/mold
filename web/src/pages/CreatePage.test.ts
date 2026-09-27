@@ -31,6 +31,7 @@ import { PROMPT_IGNORED_TRANSFORM_REASON } from "@studio/lib/promptTransform";
 import {
   flux2KleinRecipe,
   hunyuan3dRecipe,
+  qwenImage21Recipe,
   sdxlRecipe,
 } from "@studio/lib/generationProfile.testFixtures";
 import { AUTO_TARGET_ID, CAPABLE_TARGET_ID } from "../lib/hostRouting";
@@ -573,6 +574,54 @@ describe("CreatePage layout and behavior", () => {
    * that object's own badge and the pixels the form holds — it never computes
    * a size, and it is absent on a recipe that renders on no canvas at all.
    */
+  it("sizes a Qwen Image 2.1 canvas from the last reference until the user picks one", async () => {
+    const model = {
+      ...installedModelRow("qwen-image-2.1:bf16", "qwen-image21"),
+      generation_profile: {
+        schema_version: 1,
+        profile_id: "qwen-image21",
+        profile_hash: "qwen21-recipe",
+        default_recipe_id: "default",
+        recipes: [qwenImage21Recipe()],
+      },
+    } as unknown as ModelInfoExtended;
+    hostModelsMock.mockResolvedValue([model]);
+    mount(CreatePage, { global: { stubs: pageStubs() } });
+    await flushPromises();
+    const form = useGenerateForm();
+    form.state.value.model = "qwen-image-2.1:bf16";
+    form.state.value.modelFamily = "qwen-image21";
+    form.state.value.width = 1024;
+    form.state.value.height = 1024;
+    await nextTick();
+
+    form.state.value.imageAttachments = [
+      {
+        kind: "upload",
+        filename: "a.png",
+        base64: "AAAA",
+        width: 1024,
+        height: 1024,
+      },
+      {
+        kind: "upload",
+        filename: "b.png",
+        base64: "BBBB",
+        width: 1600,
+        height: 900,
+      },
+    ];
+    await nextTick();
+    await nextTick();
+    // The LAST reference's aspect at the recipe's 1 MP default, rounded
+    // half-to-even onto its 32 px grid — upstream's calculate_dimensions.
+    expect([form.state.value.width, form.state.value.height]).toEqual([
+      1376, 768,
+    ]);
+    // References are never canvas-fitted on the way out.
+    expect(form.toRequest(model).edit_images).toEqual(["AAAA", "BBBB"]);
+  });
+
   it("reads the shape chip from the same resolver the rail's pills read", async () => {
     const model = modelWithRecipe("sdxl:fp16", "sdxl");
     hostModelsMock.mockResolvedValue([model]);
@@ -3569,6 +3618,9 @@ describe("CreatePage layout and behavior", () => {
     const wrapper = mount(CreatePage, { global: { stubs: pageStubs() } });
     await flushPromises();
     const form = useGenerateForm();
+    // Add-on looks renders only for a model that takes adapters.
+    form.state.value.model = "flux-dev:q4";
+    form.state.value.modelFamily = "flux";
     form.state.value.prompt = "a portrait";
     form.state.value.originalPrompt = "an earlier generated print";
     await nextTick();
@@ -3584,6 +3636,29 @@ describe("CreatePage layout and behavior", () => {
     expect(form.state.value.prompt).toBe("a portrait, cinematic light");
     expect(form.state.value.originalPrompt).toBeNull();
     expect(form.toRequest().original_prompt).toBeUndefined();
+  });
+
+  it("offers Add-on looks only for a model whose recipe takes LoRAs", async () => {
+    const wrapper = mount(CreatePage, { global: { stubs: pageStubs() } });
+    await flushPromises();
+    const form = useGenerateForm();
+    form.state.value.model = "flux-dev:q4";
+    form.state.value.modelFamily = "flux";
+    form.state.value.loras = [{ path: "/loras/look.safetensors", scale: 1 }];
+    await nextTick();
+    expect(wrapper.find("[data-test='disclosure-loras']").exists()).toBe(true);
+    await wrapper.get("[data-test='disclosure-loras']").trigger("click");
+    expect(wrapper.findComponent({ name: "LoraPicker" }).exists()).toBe(true);
+
+    // A family with no adapter path: the row and its open sheet both go, and
+    // the request drops the stack rather than shipping what admission refuses.
+    form.state.value.model = "minimax-h3-fl2va:comfy-pruned-int8";
+    form.state.value.modelFamily = "minimax-h3";
+    await nextTick();
+    await flushPromises();
+    expect(wrapper.find("[data-test='disclosure-loras']").exists()).toBe(false);
+    expect(wrapper.findComponent({ name: "LoraPicker" }).exists()).toBe(false);
+    expect(form.toRequest().loras).toBeUndefined();
   });
 
   it("preserves the source while an active quick expansion becomes stale", async () => {
@@ -4141,6 +4216,146 @@ describe("CreatePage layout and behavior", () => {
         trainedWords: [],
       },
     ]);
+  });
+
+  it("restores the transparent-background toggle from a queued request", async () => {
+    const job = {
+      id: "rgba-print",
+      request: {
+        prompt: "a floating logo",
+        model: "flux-dev:q4",
+        width: 1024,
+        height: 1024,
+        steps: 20,
+        guidance: 3,
+        transparent_background: true,
+      },
+      startedAt: 0,
+      controller: new AbortController(),
+      progress: {
+        stage: "Queued",
+        step: null,
+        totalSteps: null,
+        queuePosition: null,
+        gpu: null,
+        elapsedMs: null,
+      },
+      result: null,
+      error: null,
+      state: "running",
+      chain: null,
+      lastProgressAt: 0,
+      workStarted: false,
+      serverId: null,
+    } as Job;
+    streamJobsRef.value = [job];
+    const form = useGenerateForm();
+    form.state.value.transparentBackground = false;
+    const wrapper = mount(CreatePage, { global: { stubs: pageStubs() } });
+    await flushPromises();
+
+    wrapper.getComponent({ name: "ActivityStrip" }).vm.$emit("open", job);
+    await nextTick();
+
+    expect(form.state.value.transparentBackground).toBe(true);
+  });
+
+  it("clears the transparent-background toggle when a selected job omits it", async () => {
+    const job = {
+      id: "opaque-print",
+      request: {
+        prompt: "a plain render",
+        model: "flux-dev:q4",
+        width: 1024,
+        height: 1024,
+        steps: 20,
+        guidance: 3,
+      },
+      startedAt: 0,
+      controller: new AbortController(),
+      progress: {
+        stage: "Queued",
+        step: null,
+        totalSteps: null,
+        queuePosition: null,
+        gpu: null,
+        elapsedMs: null,
+      },
+      result: null,
+      error: null,
+      state: "running",
+      chain: null,
+      lastProgressAt: 0,
+      workStarted: false,
+      serverId: null,
+    } as Job;
+    streamJobsRef.value = [job];
+    const form = useGenerateForm();
+    form.state.value.transparentBackground = true;
+    const wrapper = mount(CreatePage, { global: { stubs: pageStubs() } });
+    await flushPromises();
+
+    wrapper.getComponent({ name: "ActivityStrip" }).vm.$emit("open", job);
+    await nextTick();
+
+    expect(form.state.value.transparentBackground).toBe(false);
+  });
+
+  it("names restored Qwen Image 2.1 references without a false Target image label", async () => {
+    const model = {
+      ...installedModelRow("qwen-image-2.1:bf16", "qwen-image21"),
+      generation_profile: {
+        schema_version: 1,
+        profile_id: "qwen-image21",
+        profile_hash: "qwen21-recipe",
+        default_recipe_id: "default",
+        recipes: [qwenImage21Recipe()],
+      },
+    } as unknown as ModelInfoExtended;
+    hostModelsMock.mockResolvedValue([model]);
+    const job = {
+      id: "qwen21-print",
+      request: {
+        prompt: "a scene",
+        model: "qwen-image-2.1:bf16",
+        width: 1024,
+        height: 1024,
+        steps: 40,
+        guidance: 1,
+        edit_images: ["AAAA", "BBBB"],
+      },
+      startedAt: 0,
+      controller: new AbortController(),
+      progress: {
+        stage: "Queued",
+        step: null,
+        totalSteps: null,
+        queuePosition: null,
+        gpu: null,
+        elapsedMs: null,
+      },
+      result: null,
+      error: null,
+      state: "running",
+      chain: null,
+      lastProgressAt: 0,
+      workStarted: false,
+      serverId: null,
+    } as Job;
+    streamJobsRef.value = [job];
+    const wrapper = mount(CreatePage, { global: { stubs: pageStubs() } });
+    await flushPromises();
+
+    wrapper.getComponent({ name: "ActivityStrip" }).vm.$emit("open", job);
+    await nextTick();
+
+    const form = useGenerateForm();
+    // Qwen Image 2.1's `replaces` relation has no target image (#772) — a
+    // restored reference is never mislabeled "Target image" for a family
+    // whose profile does not advertise `primary_is_target`.
+    expect(
+      form.state.value.imageAttachments.map((item) => item.filename),
+    ).toEqual(["Reference 1", "Reference 2"]);
   });
 
   // ── File under (Create-time Library organization) ─────────────────────

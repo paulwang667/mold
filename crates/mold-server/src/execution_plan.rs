@@ -396,6 +396,8 @@ pub enum RuntimeSemanticVariable {
     Qwen2Variant,
     Qwen3Variant,
     QwenImage21Dtype,
+    QwenImage21QMatMul,
+    QwenImage21KvCache,
     QwenFp8Cache,
     QwenQMatMul,
     ReserveVramMb,
@@ -1092,6 +1094,13 @@ fn runtime_semantic_variable(name: &str) -> Option<RuntimeSemanticVariable> {
         "MOLD_QWEN2_VARIANT" => RuntimeSemanticVariable::Qwen2Variant,
         "MOLD_QWEN3_VARIANT" => RuntimeSemanticVariable::Qwen3Variant,
         "MOLD_QWEN_IMAGE21_DTYPE" => RuntimeSemanticVariable::QwenImage21Dtype,
+        // Swaps the Qwen Image 2.1 GGUF linear arm (per-forward dequant vs
+        // candle's QMatMul), which changes numerics, transient memory, and
+        // step latency — its own execution-equivalence and timing class.
+        "MOLD_QWEN_IMAGE21_QMATMUL" => RuntimeSemanticVariable::QwenImage21QMatMul,
+        // Retaining the prefix K/V moves pixels (upstream: cached and uncached
+        // are not bit-identical in BF16), so each resolved mode is its own class.
+        "MOLD_QWEN_IMAGE21_KV_CACHE" => RuntimeSemanticVariable::QwenImage21KvCache,
         "MOLD_QWEN_FP8_CACHE" => RuntimeSemanticVariable::QwenFp8Cache,
         "MOLD_QWEN_QMATMUL" => RuntimeSemanticVariable::QwenQMatMul,
         "MOLD_RESERVE_VRAM_MB" => RuntimeSemanticVariable::ReserveVramMb,
@@ -1134,6 +1143,12 @@ fn runtime_semantic_setting(name: &str, value: Option<&str>) -> Option<RuntimeSe
             CanonicalRuntimeValue::Text(format!(
                 "{:?}",
                 mold_inference::qwen_image21::metal_transformer_dtype(value)
+            ))
+        }
+        value if variable == RuntimeSemanticVariable::QwenImage21KvCache => {
+            CanonicalRuntimeValue::Text(format!(
+                "{:?}",
+                mold_inference::qwen_image21::parse_prefix_cache_mode(value)
             ))
         }
         None => CanonicalRuntimeValue::Unset,
@@ -1217,6 +1232,12 @@ fn runtime_semantic_setting(name: &str, value: Option<&str>) -> Option<RuntimeSe
             ))
         }
         // Mirrors the engine's `parse_zimage_qmatmul` exactly.
+        // Not a hand-mirror: the engine's own parser decides the arm.
+        Some(value) if variable == RuntimeSemanticVariable::QwenImage21QMatMul => {
+            CanonicalRuntimeValue::Boolean(mold_inference::qwen_image21::qmatmul_env_enabled(Some(
+                value,
+            )))
+        }
         Some(value) if variable == RuntimeSemanticVariable::ZimageQMatMul => {
             CanonicalRuntimeValue::Boolean(matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -1811,6 +1832,10 @@ pub enum ExecutionPlanError {
         /// The ceiling THAT rejection's peak was compared against, so a
         /// scheduler-side refusal prints the pair the decision used.
         admissible_ceiling_bytes: Option<u64>,
+        /// The usable figure that ceiling was derived from, so the scheduler
+        /// can scale the SAME ceiling rule to the card's whole capacity when
+        /// it asks whether the request could EVER be admitted.
+        usable_bytes: Option<u64>,
         /// That rejection's remediation, so a refusal the scheduler composes
         /// itself still carries the planner's reason — for FLUX.2, why the
         /// transformer could not stream.
@@ -2454,6 +2479,7 @@ pub(crate) fn insufficient_vram_error(rejections: &[DeviceInfeasibility]) -> Exe
             reason: "no request-eligible device produced a concrete execution plan".to_string(),
             required_peak_bytes: 0,
             admissible_ceiling_bytes: None,
+            usable_bytes: None,
             advice: None,
             eligible_device_ids: Vec::new(),
         };
@@ -2495,6 +2521,7 @@ pub(crate) fn insufficient_vram_error(rejections: &[DeviceInfeasibility]) -> Exe
         reason,
         required_peak_bytes: cheapest.map_or(0, |rejection| rejection.predicted_peak_bytes),
         admissible_ceiling_bytes: cheapest.map(|rejection| rejection.admissible_ceiling_bytes),
+        usable_bytes: cheapest.map(|rejection| rejection.available_bytes),
         advice: cheapest.and_then(|rejection| rejection.advice.clone()),
         eligible_device_ids: rejections
             .iter()
@@ -2709,14 +2736,27 @@ const STARTUP_WARM_MAX_ARTIFACTS: usize = 4096;
 /// bytes — so this is cheap; the limiter is what keeps it out of the way of a
 /// request that arrives while it runs.
 ///
+/// `cancelled` is polled before every directory entry; once it answers true
+/// the pass stops. The pass only fills the process-local fact cache, so
+/// abandoning it loses nothing a later preparation cannot recompute.
+///
 /// Returns how many artifacts it warmed.
-pub(crate) fn warm_installed_artifact_facts(models_dir: &Path) -> usize {
+pub(crate) fn warm_installed_artifact_facts(
+    models_dir: &Path,
+    cancelled: impl Fn() -> bool,
+) -> usize {
     let mut warmed = 0_usize;
     for entry in walkdir::WalkDir::new(models_dir)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
     {
+        // Asked per directory entry, not per artifact: on a large shared
+        // home the walk itself is part of what a shutdown must not wait for.
+        if cancelled() {
+            tracing::debug!(warmed, "startup artifact warm abandoned for shutdown");
+            break;
+        }
         if warmed >= STARTUP_WARM_MAX_ARTIFACTS {
             break;
         }
@@ -3423,10 +3463,20 @@ fn should_auto_park_text_encoder(
     pending_pushes_eager_over_budget: bool,
     backend: GpuBackend,
     family: &str,
+    qwen21_encodes_on_device: bool,
 ) -> bool {
     let is_ltx2 = matches!(family, "ltx2" | "ltx-2" | "ltx2.3");
     supports_text_encoder_cpu
         && (under_memory_pressure || pending_pushes_eager_over_budget)
+        // Qwen Image 2.1's own eager plan (`text_encoder_residency::plan`)
+        // already answered the pressure: the encoder encodes on the card and
+        // is parked or dropped before the denoise workspace and the decode
+        // peak it would share the card with. Placing it on the CPU instead
+        // turns a 0.1 s GPU encode into a 25 s CPU load-and-encode, and
+        // changes the conditioning's arithmetic (an F32 CPU encode is not
+        // the BF16 GPU one), so `MOLD_ATTN=math MOLD_CONV=im2col` would no
+        // longer reproduce v0.32's bytes.
+        && !qwen21_encodes_on_device
         // CPU and Metal allocations consume the same unified-memory pool.
         // Parking LTX-2 Gemma on the CPU therefore saves no capacity, while
         // its packed ConvRot forward is substantially slower there. The
@@ -3448,6 +3498,11 @@ fn build_plan(
         context.family,
     ));
     let request_has_lora = !context.effective_loras.is_empty();
+    let lora_paths = context
+        .effective_loras
+        .iter()
+        .map(|lora| lora.path.clone())
+        .collect::<Vec<_>>();
     let wan_block_offload_policy = mold_inference::wan::block_offload::AdmissionPolicy::from_values(
         device.backend,
         context
@@ -3494,21 +3549,21 @@ fn build_plan(
         .flatten();
     let total_peak_budget =
         device_budget.saturating_add(cuda_peak_baseline.map_or(0, |baseline| baseline.bytes));
-    let initial_memory =
-        crate::memory_preflight::estimate_generation_memory_for_request_with_projection(
-            context.request,
-            context.paths,
-            hint,
-            crate::memory_preflight::GenerationOffloadPolicy::new(
-                context.offload_requested,
-                wan_block_offload_policy,
-                device.backend == GpuBackend::Metal,
-            ),
-            Some(total_peak_budget),
-            request_has_lora,
-            gemma_competes,
-            context.projection,
-        );
+    let initial_memory = crate::memory_preflight::estimate_generation_memory_for_request_with_loras(
+        context.request,
+        context.paths,
+        hint,
+        crate::memory_preflight::GenerationOffloadPolicy::new(
+            context.offload_requested,
+            wan_block_offload_policy,
+            device.backend == GpuBackend::Metal,
+        ),
+        Some(total_peak_budget),
+        request_has_lora,
+        gemma_competes,
+        context.projection,
+        &lora_paths,
+    );
     // A process-wide offload preference is advisory for concrete formats
     // which cannot honor it (for example Flux.2 GGUF/NVFP4 or a LoRA merge).
     // The family capability gate above remains a typed error; this path-level
@@ -3525,12 +3580,20 @@ fn build_plan(
         .eager_peak_memory_bytes
         .saturating_add(pending_encoder_bytes)
         > device.available_vram_bytes.saturating_mul(9) / 10;
+    let qwen21_encodes_on_device = context.family == "qwen-image21"
+        && crate::memory_preflight::qwen_image21_eager_plan(
+            context.paths,
+            hint,
+            Some(device_budget),
+        )
+        .is_some_and(|plan| plan.choice.on_gpu());
     let auto_cpu_text = should_auto_park_text_encoder(
         context.capabilities.supports_text_encoder_cpu,
         initial_memory.under_memory_pressure,
         pending_pushes_eager_over_budget,
         device.backend,
         context.family,
+        qwen21_encodes_on_device,
     );
 
     let mut placements = context
@@ -3563,21 +3626,21 @@ fn build_plan(
         })
         .all(|(_, cpu)| *cpu);
     let gpu_paths = gpu_resident_paths(context.paths, &placements);
-    let mut memory =
-        crate::memory_preflight::estimate_generation_memory_for_request_with_projection(
-            context.request,
-            &gpu_paths,
-            hint,
-            crate::memory_preflight::GenerationOffloadPolicy::new(
-                initial_memory.block_offload && !transformer_on_cpu,
-                wan_block_offload_policy,
-                device.backend == GpuBackend::Metal,
-            ),
-            Some(total_peak_budget),
-            request_has_lora,
-            gemma_competes,
-            context.projection,
-        );
+    let mut memory = crate::memory_preflight::estimate_generation_memory_for_request_with_loras(
+        context.request,
+        &gpu_paths,
+        hint,
+        crate::memory_preflight::GenerationOffloadPolicy::new(
+            initial_memory.block_offload && !transformer_on_cpu,
+            wan_block_offload_policy,
+            device.backend == GpuBackend::Metal,
+        ),
+        Some(total_peak_budget),
+        request_has_lora,
+        gemma_competes,
+        context.projection,
+        &lora_paths,
+    );
     if memory.fits_available_memory != Some(true)
         && context.capabilities.supports_vae_cpu
         && context
@@ -3589,7 +3652,7 @@ fn build_plan(
     {
         placements.insert(ComponentRole::Vae, true);
         let gpu_paths = gpu_resident_paths(context.paths, &placements);
-        memory = crate::memory_preflight::estimate_generation_memory_for_request_with_projection(
+        memory = crate::memory_preflight::estimate_generation_memory_for_request_with_loras(
             context.request,
             &gpu_paths,
             hint,
@@ -3602,6 +3665,7 @@ fn build_plan(
             request_has_lora,
             gemma_competes,
             context.projection,
+            &lora_paths,
         );
     }
     if memory.fits_available_memory != Some(true) {
@@ -3760,6 +3824,63 @@ fn build_plan(
                 0
             }
         });
+    // Qwen Image 2.1 eager: the engine's own text-encoder plan
+    // (`qwen_image21::text_encoder_residency::plan`, asked through the same
+    // `memory_preflight` helper that chose Eager) decides what the encoder
+    // components are — Resident, or DropReload with a cold host park — and
+    // what they cost: the chosen language model's device bytes on ONE anchor
+    // (the lowest-ordered shard), never the 17.5 GB of shard files, which also
+    // carry the vision tower and `lm_head` the encoder does not load.
+    let qwen21_te_plan = (context.family == "qwen-image21"
+        && memory.load_strategy == mold_inference::LoadStrategy::Eager)
+        .then(|| {
+            crate::memory_preflight::qwen_image21_eager_plan_for_request(
+                context.paths,
+                hint,
+                Some(device_budget),
+                context.request,
+                // The scrubbed durable request carries neither its reference
+                // bytes nor its adapters: both come from the plan's own
+                // projection and frozen stack, as the memory estimate reads them.
+                context.projection,
+                crate::memory_preflight::qwen_image21_adapter_bytes(
+                    context.request,
+                    context.paths,
+                    &lora_paths,
+                ),
+            )
+        })
+        .flatten();
+    // A transformer parked to host RAM for a 2K VAE decode is a host
+    // allocation made and released on EVERY such request, charged on the
+    // first transformer component.
+    let qwen21_transformer_park = qwen21_te_plan.as_ref().and_then(|plan| {
+        use mold_inference::qwen_image21::text_encoder_residency::TransformerDecode;
+        (plan.decision.transformer_decode == TransformerDecode::ParkHost).then(|| {
+            (
+                context
+                    .artifacts
+                    .keys()
+                    .find(|role| {
+                        matches!(
+                            role,
+                            ComponentRole::Transformer | ComponentRole::TransformerShard(_)
+                        )
+                    })
+                    .cloned(),
+                mold_inference::qwen_image21::text_encoder_residency::transformer_device_bytes(
+                    context.paths,
+                ),
+            )
+        })
+    });
+    let qwen21_te_anchor = qwen21_te_plan.as_ref().and_then(|_| {
+        context
+            .artifacts
+            .keys()
+            .find(|role| role.is_text_encoder())
+            .cloned()
+    });
     for (role, path) in context.artifacts {
         let place_cpu = placements.get(role).copied().unwrap_or(false);
         let bytes = context
@@ -3835,7 +3956,13 @@ fn build_plan(
                 }
                 ComponentLoadStrategy::StreamedBlocks
             } else if role.is_text_encoder() {
-                ComponentLoadStrategy::DropReload
+                use mold_inference::qwen_image21::text_encoder_residency::Qwen21TeResidency;
+                match qwen21_te_plan.as_ref() {
+                    Some(plan) if plan.decision.residency == Qwen21TeResidency::Resident => {
+                        ComponentLoadStrategy::Resident
+                    }
+                    _ => ComponentLoadStrategy::DropReload,
+                }
             } else {
                 ComponentLoadStrategy::Resident
             };
@@ -3855,12 +3982,34 @@ fn build_plan(
                 {
                     0
                 }
-                _ => bytes,
+                _ => match qwen21_te_plan.as_ref().filter(|_| role.is_text_encoder()) {
+                    Some(plan)
+                        if qwen21_te_anchor.as_ref() == Some(role) && plan.choice.on_gpu() =>
+                    {
+                        plan.text_encoder_bytes
+                    }
+                    Some(_) => 0,
+                    None => bytes,
+                },
             };
             // The host park rides on the SAME anchor the device peak does, so
-            // a multi-shard encoder is charged once.
+            // a multi-shard encoder is charged once. A Qwen Image 2.1 park is a
+            // COLD charge like Mistral3's: a warm hit finds it already parked.
             let host = if mistral_peak_anchor.as_ref() == Some(role) {
                 mistral_host_park_bytes
+            } else if qwen21_te_anchor.as_ref() == Some(role) {
+                use mold_inference::qwen_image21::text_encoder_residency::Qwen21TeResidency;
+                qwen21_te_plan
+                    .as_ref()
+                    .filter(|plan| plan.decision.residency == Qwen21TeResidency::ParkHost)
+                    .map_or(0, |plan| plan.text_encoder_bytes)
+            } else if let Some((Some(anchor), bytes)) = qwen21_transformer_park.as_ref() {
+                if anchor == role {
+                    recurring_host_bytes_by_path.insert(path.clone(), *bytes);
+                    *bytes
+                } else {
+                    0
+                }
             } else {
                 0
             };
@@ -3952,20 +4101,11 @@ fn build_plan(
         })
         .saturating_add(mesh_host)
         .saturating_add(texture_host);
-    let fingerprint = execution_fingerprint(
+    let (fingerprint, warm_reuse_fingerprint) = engine_fingerprints(
         context.model,
         device,
         context.effective,
         &components,
-        context.engine_config,
-        context.effective_loras,
-        memory.block_offload,
-    );
-    let warm_reuse_fingerprint = execution_fingerprint(
-        context.model,
-        device,
-        context.effective,
-        &load_plan_independent_components(&components),
         context.engine_config,
         context.effective_loras,
         memory.block_offload,
@@ -5737,6 +5877,112 @@ fn load_plan_independent_components(
         .collect()
 }
 
+/// Families whose engine settles its adapter stack AND its component
+/// residency per request, on an engine that is otherwise identical.
+///
+/// Qwen Image 2.1 carries every LoRA in bypass slots (`plan.md`: "LoRA is
+/// always bypass, never merged ... every tier takes adapters without
+/// rebuilds"); `qwen_image21::pipeline` compares the wanted stack with its
+/// `active_lora` and swaps the slots in place. Its encoder park/drop and the
+/// transformer's 2K decode park are likewise decided inside each render
+/// (`settle_text_encoder_residency`), so the planner's per-request component
+/// strategies — which a LoRA, a reference or the canvas moves — describe that
+/// render's cost, not the engine that is resident. Rebuilding for either
+/// would reload the whole transformer to arrive at a state the engine reaches
+/// in place. What the engine IS (checkpoint content, dtype, quantization,
+/// encoder variant, semantic config, authored AND resolved component
+/// placement) still moves both identities, and a load-strategy or
+/// block-offload change is still caught by the separate planned-mode
+/// comparison. The adapter stack stays frozen on the plan and its device
+/// bytes are charged by the Qwen Image 2.1 memory estimate
+/// (`text_encoder_residency::lora_stack_bytes`).
+fn engine_settles_per_request(family: &str) -> bool {
+    family == "qwen-image21"
+}
+
+/// The exact and warm-reuse engine identities of one plan
+/// ([`ResolvedExecutionPlan::execution_fingerprint`] and
+/// [`ResolvedExecutionPlan::warm_reuse_fingerprint`]).
+///
+/// For a family that settles adapters and residency per request
+/// ([`engine_settles_per_request`]) BOTH are blind to the adapter stack (its
+/// `Lora` components and `effective_loras`) and to the per-request load plan,
+/// because an eager engine — which retains no residency the cache could credit
+/// — is compared by the EXACT identity: leaving either in it rebuilt the engine
+/// on every LoRA toggle (UAT, 2026-09-27). The stack itself stays frozen on the
+/// plan (`effective_loras`), is re-validated at dispatch, and its adapter
+/// bytes are charged in every phase of the residency budget. Each component's
+/// resolved placement stays in both identities. Every other family keeps both
+/// in the exact identity.
+fn engine_fingerprints(
+    model: &str,
+    device: &DeviceFact,
+    effective: &EffectivePlacement,
+    components: &BTreeMap<ComponentRole, ComponentExecutionPlan>,
+    engine_config: &mold_inference::FrozenEngineConfig,
+    effective_loras: &[PlannedLora],
+    offload: bool,
+) -> (String, String) {
+    let load_plan_independent = load_plan_independent_components(components);
+    if engine_settles_per_request(&engine_config.family) {
+        let not_an_adapter = |role: &ComponentRole| !matches!(role, ComponentRole::Lora(_));
+        // The per-request load plan (strategy, predicted bytes) is stripped,
+        // but each component's resolved PLACEMENT stays: an engine built with
+        // a host-placed encoder or VAE computes in different arithmetic than
+        // one with it on the card, so serving another placement's plan from
+        // it would make the pixels depend on which engine happened to be warm.
+        let mut engine = components
+            .iter()
+            .filter(|(role, _)| not_an_adapter(role))
+            .map(|(role, plan)| {
+                (
+                    role.clone(),
+                    ComponentExecutionPlan {
+                        load_strategy: ComponentLoadStrategy::Resident,
+                        predicted_vram_bytes: 0,
+                        predicted_host_bytes: 0,
+                        ..plan.clone()
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        engine.retain(|role, _| not_an_adapter(role));
+        // The authored constraints are derived from the same artifact set, so
+        // an adapter adds a `Lora` role there too.
+        let mut effective = effective.clone();
+        effective.components.retain(|role, _| not_an_adapter(role));
+        let identity = execution_fingerprint(
+            model,
+            device,
+            &effective,
+            &engine,
+            engine_config,
+            &[],
+            offload,
+        );
+        return (identity.clone(), identity);
+    }
+    let exact = execution_fingerprint(
+        model,
+        device,
+        effective,
+        components,
+        engine_config,
+        effective_loras,
+        offload,
+    );
+    let warm = execution_fingerprint(
+        model,
+        device,
+        effective,
+        &load_plan_independent,
+        engine_config,
+        effective_loras,
+        offload,
+    );
+    (exact, warm)
+}
+
 fn execution_fingerprint(
     model: &str,
     device: &DeviceFact,
@@ -6237,6 +6483,7 @@ mod tests {
             false,
             GpuBackend::Metal,
             "ltx2",
+            false,
         ));
         assert!(should_auto_park_text_encoder(
             true,
@@ -6244,6 +6491,7 @@ mod tests {
             false,
             GpuBackend::Cuda,
             "ltx2",
+            false,
         ));
         assert!(should_auto_park_text_encoder(
             true,
@@ -6251,6 +6499,30 @@ mod tests {
             false,
             GpuBackend::Metal,
             "flux2",
+            false,
+        ));
+    }
+
+    /// Under pressure a Qwen Image 2.1 encoder stays on the card whenever the
+    /// family's own eager plan encodes it there (and parks or drops it for
+    /// the denoise); without that plan the generic pressure rule applies.
+    #[test]
+    fn qwen21_encoder_follows_its_eager_plan_under_pressure() {
+        assert!(!should_auto_park_text_encoder(
+            true,
+            true,
+            false,
+            GpuBackend::Cuda,
+            "qwen-image21",
+            true,
+        ));
+        assert!(should_auto_park_text_encoder(
+            true,
+            true,
+            false,
+            GpuBackend::Cuda,
+            "qwen-image21",
+            false,
         ));
     }
 
@@ -9101,6 +9373,36 @@ mod tests {
     }
 
     #[test]
+    fn qwen_image21_qmatmul_identity_is_the_arm_not_the_spelling() {
+        let name = "MOLD_QWEN_IMAGE21_QMATMUL";
+        let on = runtime_semantic_setting(name, Some("1"));
+        for value in ["true", " ON ", "yes"] {
+            assert_eq!(runtime_semantic_setting(name, Some(value)), on);
+        }
+        let off = runtime_semantic_setting(name, Some("0"));
+        assert_ne!(on, off);
+        for value in ["off", "no", "banana"] {
+            assert_eq!(runtime_semantic_setting(name, Some(value)), off);
+        }
+    }
+
+    #[test]
+    fn qwen_image21_kv_cache_identity_uses_the_engine_parser() {
+        let name = "MOLD_QWEN_IMAGE21_KV_CACHE";
+        let default = runtime_semantic_setting(name, None);
+        for value in ["auto", " AUTO ", "", "invalid"] {
+            assert_eq!(runtime_semantic_setting(name, Some(value)), default);
+        }
+        let on = runtime_semantic_setting(name, Some("on"));
+        let off = runtime_semantic_setting(name, Some("off"));
+        assert_ne!(on, default);
+        assert_ne!(off, default);
+        assert_ne!(on, off);
+        assert_eq!(on, runtime_semantic_setting(name, Some("1")));
+        assert_eq!(off, runtime_semantic_setting(name, Some(" OFF ")));
+    }
+
+    #[test]
     fn unknown_variable_names_are_unclassified() {
         assert_eq!(
             runtime_semantic_variable("MOLD_NOT_A_SHAPING_VARIABLE"),
@@ -9837,6 +10139,269 @@ mod tests {
         );
     }
 
+    /// Qwen Image 2.1 installs its adapter stack per request into bypass
+    /// slots on the resident transformer (`qwen_image21::pipeline`'s
+    /// `active_lora`) and settles its encoder and decode residency per
+    /// request (`settle_text_encoder_residency`), so one engine serves a
+    /// request whose LoRA stack — or whose per-request component plan, which
+    /// a LoRA or a reference moves — differs from the one it was built under.
+    /// An eager engine is compared by the EXACT identity, so both identities
+    /// must be blind to both; adding, removing or rescaling an adapter must
+    /// not tear down and reload 28 GB of weights. Every other family keeps
+    /// rebuilding on either.
+    /// The engine identity of a Qwen Image 2.1 plan ignores what the engine
+    /// settles per request (component load strategies, predicted bytes,
+    /// adapters) but NOT where a component was placed: an engine built with a
+    /// host-placed text encoder (or VAE) encodes (or decodes) in different
+    /// arithmetic than one with it on the card, so reusing it would make the
+    /// pixels depend on which engine happened to be warm.
+    #[test]
+    fn a_qwen_image21_engine_identity_keeps_each_components_placement() {
+        let device = DeviceFact {
+            total_vram_bytes: None,
+            cuda_peak_baseline: None,
+            id: "cuda:stable-device".into(),
+            ordinal: 0,
+            backend: GpuBackend::Cuda,
+            compute_capability: Some((8, 9)),
+            available_vram_bytes: 46 * GIB,
+        };
+        let effective = EffectivePlacement {
+            components: BTreeMap::from([
+                (
+                    ComponentRole::Transformer,
+                    ResolvedComponentConstraint::Auto,
+                ),
+                (
+                    ComponentRole::QwenShard(0),
+                    ResolvedComponentConstraint::Auto,
+                ),
+            ]),
+        };
+        let component = |role: ComponentRole,
+                         placement: ResolvedComponentPlacement,
+                         load_strategy: ComponentLoadStrategy,
+                         vram: u64| ComponentExecutionPlan {
+            role: role.clone(),
+            artifact_path: PathBuf::from(format!("/models/{role:?}")),
+            content_fingerprint: ContentFingerprint(format!("{role:?}")),
+            dtype: Some(PlannedDType::Bf16),
+            quantization: None,
+            placement,
+            load_strategy,
+            predicted_vram_bytes: vram,
+            predicted_host_bytes: 0,
+        };
+        let on_card = ResolvedComponentPlacement::Device("cuda:stable-device".into());
+        let plan = |text_placement: ResolvedComponentPlacement,
+                    text_strategy: ComponentLoadStrategy,
+                    text_vram: u64| {
+            BTreeMap::from([
+                (
+                    ComponentRole::Transformer,
+                    component(
+                        ComponentRole::Transformer,
+                        on_card.clone(),
+                        ComponentLoadStrategy::Resident,
+                        15 * GIB,
+                    ),
+                ),
+                (
+                    ComponentRole::QwenShard(0),
+                    component(
+                        ComponentRole::QwenShard(0),
+                        text_placement,
+                        text_strategy,
+                        text_vram,
+                    ),
+                ),
+            ])
+        };
+        let config = frozen_config_for_family("qwen-image21");
+        let identity = |components: &BTreeMap<ComponentRole, ComponentExecutionPlan>| {
+            engine_fingerprints(
+                "qwen-image-2.1:bf16",
+                &device,
+                &effective,
+                components,
+                &config,
+                &[],
+                false,
+            )
+        };
+        let resident = identity(&plan(
+            on_card.clone(),
+            ComponentLoadStrategy::Resident,
+            15 * GIB,
+        ));
+        // A per-request park of the SAME on-card encoder is the same engine.
+        let parked = identity(&plan(on_card.clone(), ComponentLoadStrategy::ParkedCpu, 0));
+        assert_eq!(resident, parked);
+        // A host-placed encoder is a different engine, in both identities.
+        let host = identity(&plan(
+            ResolvedComponentPlacement::Cpu,
+            ComponentLoadStrategy::Resident,
+            0,
+        ));
+        assert_ne!(resident.0, host.0);
+        assert_ne!(resident.1, host.1);
+    }
+
+    #[test]
+    fn a_qwen_image21_warm_engine_serves_any_adapter_stack() {
+        let device = DeviceFact {
+            total_vram_bytes: None,
+            cuda_peak_baseline: None,
+            id: "cuda:stable-device".into(),
+            ordinal: 0,
+            backend: GpuBackend::Cuda,
+            compute_capability: Some((8, 9)),
+            available_vram_bytes: 46 * GIB,
+        };
+        let effective = EffectivePlacement {
+            components: BTreeMap::from([(
+                ComponentRole::Transformer,
+                ResolvedComponentConstraint::Auto,
+            )]),
+        };
+        let transformer = ComponentExecutionPlan {
+            role: ComponentRole::Transformer,
+            artifact_path: PathBuf::from("/models/qwen-image-2.1-bf16/transformer"),
+            content_fingerprint: ContentFingerprint("qwen21-transformer".into()),
+            dtype: Some(PlannedDType::Bf16),
+            quantization: None,
+            placement: ResolvedComponentPlacement::Device("cuda:stable-device".into()),
+            load_strategy: ComponentLoadStrategy::Resident,
+            predicted_vram_bytes: 15 * GIB,
+            predicted_host_bytes: 0,
+        };
+        let lora_component = |path: &str, content: &str| ComponentExecutionPlan {
+            role: ComponentRole::Lora(0),
+            artifact_path: PathBuf::from(path),
+            content_fingerprint: ContentFingerprint(content.into()),
+            dtype: None,
+            quantization: None,
+            placement: ResolvedComponentPlacement::Device("cuda:stable-device".into()),
+            load_strategy: ComponentLoadStrategy::Resident,
+            predicted_vram_bytes: GIB,
+            predicted_host_bytes: 0,
+        };
+        let adapter = |path: &str, content: &str, scale: f64| PlannedLora {
+            path: PathBuf::from(path),
+            scale_bits: scale.to_bits(),
+            content_fingerprint: ContentFingerprint(content.into()),
+        };
+        let bare = BTreeMap::from([(ComponentRole::Transformer, transformer.clone())]);
+        let with_style = BTreeMap::from([
+            (ComponentRole::Transformer, transformer.clone()),
+            (
+                ComponentRole::Lora(0),
+                lora_component("/loras/style.safetensors", "style"),
+            ),
+        ]);
+        let style_half = [adapter("/loras/style.safetensors", "style", 0.5)];
+        let style_full = [adapter("/loras/style.safetensors", "style", 0.8)];
+
+        for (model, family, request_scoped) in [
+            ("qwen-image-2.1:bf16", "qwen-image21", true),
+            ("flux2-dev:q8", "flux2", false),
+            ("qwen-image:q8", "qwen-image", false),
+        ] {
+            let config = frozen_config_for_family(family);
+            // The planner derives the authored constraints from the SAME
+            // artifact set (`effective_constraints`), so an adapter also adds
+            // a `Lora` role there.
+            let both = |components: &BTreeMap<ComponentRole, ComponentExecutionPlan>,
+                        loras: &[PlannedLora]| {
+                let mut effective = effective.clone();
+                for role in components.keys() {
+                    effective
+                        .components
+                        .entry(role.clone())
+                        .or_insert(ResolvedComponentConstraint::Auto);
+                }
+                engine_fingerprints(
+                    model, &device, &effective, components, &config, loras, false,
+                )
+            };
+            let warm = |c: &BTreeMap<ComponentRole, ComponentExecutionPlan>, l: &[PlannedLora]| {
+                both(c, l).1
+            };
+            let exact = |c: &BTreeMap<ComponentRole, ComponentExecutionPlan>, l: &[PlannedLora]| {
+                both(c, l).0
+            };
+            let same = |a: String, b: String| a == b;
+            // An EAGER engine (no retained residency) is compared by the exact
+            // identity, so it has to be exactly as blind to the stack.
+            assert_eq!(
+                same(exact(&bare, &[]), exact(&with_style, &style_half)),
+                request_scoped,
+                "{family}: an eager engine asked for an adapter"
+            );
+            assert_eq!(
+                same(
+                    exact(&with_style, &style_half),
+                    exact(&with_style, &style_full)
+                ),
+                request_scoped,
+                "{family}: an eager engine asked to rescale an adapter"
+            );
+            assert_eq!(
+                same(warm(&bare, &[]), warm(&with_style, &style_half)),
+                request_scoped,
+                "{family}: adding an adapter to a warm engine"
+            );
+            assert_eq!(
+                same(
+                    warm(&with_style, &style_half),
+                    warm(&with_style, &style_full)
+                ),
+                request_scoped,
+                "{family}: rescaling an adapter on a warm engine"
+            );
+            assert_eq!(
+                same(warm(&with_style, &style_full), warm(&bare, &[])),
+                request_scoped,
+                "{family}: removing an adapter from a warm engine"
+            );
+            // The exemption is exactly the adapter stack: the checkpoint
+            // under it still invalidates the warm engine for every family.
+            let replaced = BTreeMap::from([(
+                ComponentRole::Transformer,
+                ComponentExecutionPlan {
+                    content_fingerprint: ContentFingerprint("replaced".into()),
+                    ..transformer.clone()
+                },
+            )]);
+            assert_ne!(
+                warm(&bare, &[]),
+                warm(&replaced, &[]),
+                "{family}: a replaced checkpoint still rebuilds"
+            );
+            assert_ne!(
+                exact(&bare, &[]),
+                exact(&replaced, &[]),
+                "{family}: a replaced checkpoint still rebuilds an eager engine"
+            );
+            // The per-request component plan: the same transformer, planned
+            // parked for a 2K decode, with the adapter's bytes charged.
+            let replanned = BTreeMap::from([(
+                ComponentRole::Transformer,
+                ComponentExecutionPlan {
+                    load_strategy: ComponentLoadStrategy::ParkedCpu,
+                    predicted_vram_bytes: 16 * GIB,
+                    predicted_host_bytes: 15 * GIB,
+                    ..transformer.clone()
+                },
+            )]);
+            assert_eq!(
+                same(exact(&bare, &[]), exact(&replanned, &[])),
+                request_scoped,
+                "{family}: an eager engine asked for a different per-request plan"
+            );
+        }
+    }
+
     #[test]
     fn exact_execution_fingerprint_matches_rejected_candidate_contract() {
         let device = DeviceFact {
@@ -9963,7 +10528,11 @@ mod tests {
         } else {
             SemanticConvBackend::Im2Col
         };
-        for family in ["flux", "flux2"] {
+        // Qwen Image 2.1 joined the FastStill tables; its fingerprint records
+        // the convolution backend for the same reason. The factory aliases
+        // (`flux.2`, `flux2-klein`) construct the same engine and must record
+        // the same backend, not fall through to the image answer.
+        for family in ["flux", "flux2", "flux.2", "flux2-klein", "qwen-image21"] {
             let frozen = frozen_config_for_family(family);
             let semantic = ExecutionSemanticConfig::from_frozen(
                 &frozen,
@@ -9992,7 +10561,7 @@ mod tests {
             );
         }
         // And the attention side agrees with the engine's own family policy.
-        for family in ["flux", "flux2"] {
+        for family in ["flux", "flux2", "flux.2", "flux2-klein", "qwen-image21"] {
             let frozen = frozen_config_for_family(family);
             assert_eq!(
                 frozen.attention_backend,
@@ -10903,12 +11472,49 @@ mod tests {
             std::fs::write(path, b"bytes").unwrap();
         }
 
-        assert_eq!(warm_installed_artifact_facts(dir.path()), 2);
+        assert_eq!(warm_installed_artifact_facts(dir.path(), || false), 2);
         assert!(artifact_facts_are_cached(&weights));
         assert!(artifact_facts_are_cached(&encoder));
         assert!(
             !artifact_facts_are_cached(&notes),
             "a README is not a generation artifact"
         );
+    }
+
+    /// The startup warm is read-only cache filling on a blocking thread, and
+    /// the runtime waits for every blocking thread at teardown — a SIGTERM
+    /// during a 107 s warm on the shared ZFS home left the process hung after
+    /// its shutdown sequence had finished. Shutdown therefore abandons the
+    /// pass between artifacts; nothing it skipped is recorded as cached.
+    #[test]
+    fn the_startup_warm_pass_stops_between_artifacts_once_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = (0..6)
+            .map(|index| {
+                let path = dir.path().join(format!("shard-{index}.safetensors"));
+                std::fs::write(&path, b"bytes").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(warm_installed_artifact_facts(dir.path(), || true), 0);
+        assert!(
+            artifacts
+                .iter()
+                .all(|path| !artifact_facts_are_cached(path)),
+            "a pass cancelled before it starts reads nothing"
+        );
+
+        let polls = std::cell::Cell::new(0_usize);
+        let warmed = warm_installed_artifact_facts(dir.path(), || {
+            polls.set(polls.get() + 1);
+            polls.get() > 3
+        });
+        assert!(warmed < artifacts.len(), "warmed {warmed}");
+        let cached = artifacts
+            .iter()
+            .filter(|path| artifact_facts_are_cached(path))
+            .count();
+        assert_eq!(cached, warmed, "only what it warmed is cached");
     }
 }

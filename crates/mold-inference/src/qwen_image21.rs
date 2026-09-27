@@ -11,10 +11,25 @@ use candle_core::{DType, Device, Tensor};
 
 use crate::encoders::qwen3::{resolve_pad_token_id, Qwen3Encoder};
 
+pub(crate) mod attention;
+pub(crate) mod banded_conv;
+pub(crate) mod conditioning;
+pub(crate) mod exec_path;
+pub(crate) mod layout;
+pub(crate) mod linear;
+pub(crate) mod lora;
 pub(crate) mod pipeline;
+pub(crate) mod reference;
 pub(crate) mod scheduler;
+pub mod text_encoder_residency;
+#[cfg(test)]
+mod tier_renders;
 pub(crate) mod transformer;
 pub(crate) mod vae;
+pub(crate) mod vae_encoder;
+
+#[cfg(test)]
+mod parity_tests;
 
 pub use pipeline::QwenImage21Engine;
 
@@ -43,19 +58,251 @@ pub fn metal_transformer_dtype(value: Option<&str>) -> DType {
     }
 }
 
-/// Bound request-local retention without truncating the authored prompt.
-pub(crate) const PREFIX_CACHE_MAX_TOKENS: usize = 512;
+/// The `MOLD_QWEN_IMAGE21_QMATMUL` decision for a raw value — the engine's own
+/// parser, exported so mold-server's execution identity canonicalizes the
+/// spelling to the arm that will actually run.
+pub fn qmatmul_env_enabled(value: Option<&str>) -> bool {
+    linear::parse_qwen_image21_qmatmul(value)
+}
 
-/// Both CFG branches at the maximum retained length, in the widest supported
+/// v0.32's per-branch retention bound, and still the whole rule for
+/// text-to-image: a prompt of at most this many rows retains its prefix and a
+/// longer one recomputes it, exactly as v0.32 did, so no text-to-image byte
+/// moves on any card.
+pub(crate) const LEGACY_PREFIX_CACHE_TOKENS: usize = 512;
+
+/// The retained prefix of every branch of a REFERENCE-conditioned request may
+/// take at most this much together under the request-only rule
+/// ([`PrefixCacheBudget::RequestOnly`]: the legacy path, Metal and CPU). One
+/// 1024² reference with CFG in BF16 (~4.6 GB) retains; three do not. The CUDA
+/// fast path replaces this constant with the card's headroom.
+pub(crate) const PREFIX_CACHE_REFERENCE_BUDGET_BYTES: u64 = 6 << 30;
+
+/// Allocator margin the fast path keeps free beyond the denoise workspace and
+/// the retained cache, so retention never takes the last gigabyte a
+/// fragmented pool needs (the `still_transformer_residency` margin).
+pub(crate) const PREFIX_CACHE_MARGIN_BYTES: u64 = 1 << 30;
+
+/// How much memory the prefix-cache decision may consider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixCacheBudget {
+    /// The request-only rule: v0.32's 512-row rule for text-to-image and
+    /// [`PREFIX_CACHE_REFERENCE_BUDGET_BYTES`] for references. The same
+    /// request retains identically on every card. This is the legacy path
+    /// (`MOLD_ATTN=math`, byte-identical to v0.32), Metal and CPU.
+    RequestOnly,
+    /// The CUDA fast path: retain every branch whenever the summed cache fits
+    /// these bytes — what the card has left for it ([`prefix_cache_headroom`]).
+    /// Upstream always caches (`use_kv_cache=True`,
+    /// `pipeline_qwenimage21.py:528`, extracted at step 0 and reused,
+    /// `:750-764`) and simply runs out of memory where it cannot; mold
+    /// recomputes instead, so on this path retention — and with it the exact
+    /// pixels of a very long prefix (`:585-589`) — depends on available memory.
+    Headroom(u64),
+}
+
+/// Bytes a retained prefix cache may take: `free_bytes` less every weight
+/// still to be counted against it, the denoise workspace and
+/// [`PREFIX_CACHE_MARGIN_BYTES`]. The engine passes the free memory it
+/// samples at denoise (weights already resident, so `resident_bytes` is 0);
+/// admission and the text-encoder residency plan pass the usable card and the
+/// transformer plus VAE — the same fit question.
+pub fn prefix_cache_headroom(free_bytes: u64, resident_bytes: u64, workspace_bytes: u64) -> u64 {
+    free_bytes
+        .saturating_sub(resident_bytes)
+        .saturating_sub(workspace_bytes)
+        .saturating_sub(PREFIX_CACHE_MARGIN_BYTES)
+}
+
+/// Whether this process's renders take the fast path's memory-following cache
+/// rule: a CUDA (non-Metal) build whose `MOLD_ATTN` does not select the legacy
+/// path. Admission asks this; the engine asks its own transformer's resolved
+/// [`exec_path::Qwen21ExecPath`] and device.
+pub fn prefix_cache_follows_memory() -> bool {
+    cfg!(feature = "cuda")
+        && !cfg!(feature = "metal")
+        && !exec_path::Qwen21ExecPath::resolve_for(
+            exec_path::ExecDevice::Cuda,
+            crate::attention::requested_backend(),
+        )
+        .is_legacy()
+}
+
+/// Both CFG branches at the legacy retained length, in the widest supported
 /// working dtype (F32 on Metal/CPU). Added outside the activation area estimate.
 pub(crate) fn prefix_cache_budget_bytes(batch: u32) -> u64 {
+    2 * prefix_cache_bytes(LEGACY_PREFIX_CACHE_TOKENS, batch as usize, 4)
+}
+
+/// Bytes one branch's retained prefix K/V takes: key and value, every layer,
+/// every head, per prefix token (`transformer_qwenimage21.py:56-85` stores
+/// post-RoPE `(B, prefix, heads, head_dim)` per layer).
+pub(crate) fn prefix_cache_bytes(prefix_tokens: usize, batch: usize, dtype_bytes: usize) -> u64 {
     let cfg = transformer::QwenImage21TransformerConfig::official();
-    2 * 2
-        * PREFIX_CACHE_MAX_TOKENS as u64
-        * cfg.num_layers as u64
+    2 * cfg.num_layers as u64
         * (cfg.num_attention_heads * cfg.attention_head_dim) as u64
-        * 4
-        * u64::from(batch.max(1))
+        * prefix_tokens as u64
+        * dtype_bytes as u64
+        * batch.max(1) as u64
+}
+
+/// `MOLD_QWEN_IMAGE21_KV_CACHE`: whether a request retains its prefix K/V.
+///
+/// Upstream always caches (`use_kv_cache=True`, `pipeline_qwenimage21.py:528`)
+/// and warns that cached and uncached renders are not bit-identical in BF16
+/// (`:585-589`), so the answer MOVES PIXELS and is engine-shaping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixCacheMode {
+    /// [`PrefixCachePolicy::resolve`]'s default rule: the request-only rule
+    /// on the legacy path, the card's headroom on the CUDA fast path.
+    Auto,
+    /// Always retain.
+    On,
+    /// Always recompute the prefix every step.
+    Off,
+}
+
+/// The one parser for `MOLD_QWEN_IMAGE21_KV_CACHE`, shared by the engine and
+/// mold-server's execution-equivalence classifier. Unset, empty, `auto` and
+/// any unrecognized spelling are `Auto`.
+pub fn parse_prefix_cache_mode(value: Option<&str>) -> PrefixCacheMode {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("on" | "1" | "true" | "yes") => PrefixCacheMode::On,
+        Some("off" | "0" | "false" | "no") => PrefixCacheMode::Off,
+        None | Some("" | "auto") => PrefixCacheMode::Auto,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "MOLD_QWEN_IMAGE21_KV_CACHE must be auto/on/off; using auto"
+            );
+            PrefixCacheMode::Auto
+        }
+    }
+}
+
+/// The process's `MOLD_QWEN_IMAGE21_KV_CACHE`.
+pub fn prefix_cache_mode_from_env() -> PrefixCacheMode {
+    parse_prefix_cache_mode(crate::runtime_env::value("MOLD_QWEN_IMAGE21_KV_CACHE").as_deref())
+}
+
+/// What one conditioning branch does with its prefix K/V.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixCacheDecision {
+    /// Prefill once, then run only the target block on later steps.
+    Retain,
+    /// Recompute the whole joint sequence every step.
+    Recompute,
+}
+
+/// The one decision for prefix K/V retention, read by the engine and by
+/// admission ([`crate::device::qwen_image21_prefix_cache_bytes`]).
+pub(crate) struct PrefixCachePolicy;
+
+impl PrefixCachePolicy {
+    /// Decide for every branch of one request.
+    ///
+    /// `branch_prefix_tokens` holds each branch's prefix length (text plus
+    /// condition-image tokens) and `has_condition` whether the request carries
+    /// reference images. Under `Auto`:
+    ///
+    /// - [`PrefixCacheBudget::Headroom`] (CUDA fast path): EVERY branch
+    ///   retains iff their summed cache fits the headroom, else every branch
+    ///   recomputes (upstream always caches; a card that cannot hold it
+    ///   recomputes rather than running out of memory);
+    /// - [`PrefixCacheBudget::RequestOnly`]: text-to-image keeps v0.32's
+    ///   per-branch 512-token rule, and a reference-conditioned request
+    ///   retains every branch iff their summed cache fits
+    ///   [`PREFIX_CACHE_REFERENCE_BUDGET_BYTES`].
+    ///
+    /// `On` / `Off` override both.
+    pub(crate) fn resolve(
+        branch_prefix_tokens: &[usize],
+        has_condition: bool,
+        batch: usize,
+        dtype_bytes: usize,
+        mode: PrefixCacheMode,
+        budget: PrefixCacheBudget,
+    ) -> Vec<PrefixCacheDecision> {
+        let all = |decision| vec![decision; branch_prefix_tokens.len()];
+        let summed = prefix_cache_total_bytes(branch_prefix_tokens, batch, dtype_bytes);
+        let retain_if = |fits: bool| {
+            all(if fits {
+                PrefixCacheDecision::Retain
+            } else {
+                PrefixCacheDecision::Recompute
+            })
+        };
+        match (mode, budget) {
+            (PrefixCacheMode::On, _) => all(PrefixCacheDecision::Retain),
+            (PrefixCacheMode::Off, _) => all(PrefixCacheDecision::Recompute),
+            (PrefixCacheMode::Auto, PrefixCacheBudget::Headroom(bytes)) => {
+                retain_if(summed <= bytes)
+            }
+            (PrefixCacheMode::Auto, PrefixCacheBudget::RequestOnly) if has_condition => {
+                retain_if(summed <= PREFIX_CACHE_REFERENCE_BUDGET_BYTES)
+            }
+            (PrefixCacheMode::Auto, PrefixCacheBudget::RequestOnly) => branch_prefix_tokens
+                .iter()
+                .map(|&tokens| {
+                    if tokens <= LEGACY_PREFIX_CACHE_TOKENS {
+                        PrefixCacheDecision::Retain
+                    } else {
+                        PrefixCacheDecision::Recompute
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// [`Self::resolve`] under the process's override.
+    pub(crate) fn resolve_from_env(
+        branch_prefix_tokens: &[usize],
+        has_condition: bool,
+        batch: usize,
+        dtype: DType,
+        budget: PrefixCacheBudget,
+    ) -> Vec<PrefixCacheDecision> {
+        Self::resolve(
+            branch_prefix_tokens,
+            has_condition,
+            batch,
+            dtype.size_in_bytes(),
+            prefix_cache_mode_from_env(),
+            budget,
+        )
+    }
+}
+
+/// Every branch's retained cache together.
+pub(crate) fn prefix_cache_total_bytes(
+    branch_prefix_tokens: &[usize],
+    batch: usize,
+    dtype_bytes: usize,
+) -> u64 {
+    branch_prefix_tokens
+        .iter()
+        .map(|&tokens| prefix_cache_bytes(tokens, batch, dtype_bytes))
+        .sum()
+}
+
+/// The request warning a render carries when the automatic rule made it
+/// recompute its prefix every step (never for an explicit `off`).
+pub(crate) fn prefix_cache_recompute_warning(
+    cache_bytes: u64,
+    budget: PrefixCacheBudget,
+) -> String {
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    match budget {
+        PrefixCacheBudget::Headroom(headroom) => format!(
+            "Qwen Image 2.1 recomputed its {:.1} GiB prefix cache every step because it did not fit the {:.1} GiB this card had left (slower, and pixels can differ slightly from a cached render); MOLD_QWEN_IMAGE21_KV_CACHE=on forces the cache.",
+            gib(cache_bytes),
+            gib(headroom)
+        ),
+        PrefixCacheBudget::RequestOnly => format!(
+            "Qwen Image 2.1 recomputed its {:.1} GiB prefix cache every step (over the request-only retention budget of the math/legacy path); MOLD_QWEN_IMAGE21_KV_CACHE=on forces the cache.",
+            gib(cache_bytes)
+        ),
+    }
 }
 
 /// The fixed system message from the upstream `QwenImage21Pipeline`.
@@ -89,7 +336,7 @@ pub(crate) fn t2i_prompt_template(prompt: &str) -> String {
 /// It is intentionally derived through the loaded tokenizer at runtime rather
 /// than kept as a magic token count.  This is the same invariant as the
 /// reference's `processor.apply_chat_template(system_message, tokenize=True)`.
-fn system_message_prefix() -> String {
+pub(crate) fn system_message_prefix() -> String {
     format!("<|im_start|>system\n{QWEN_IMAGE_21_SYSTEM_PROMPT}<|im_end|>\n")
 }
 
@@ -289,6 +536,202 @@ mod tests {
         }
         assert_eq!(metal_transformer_dtype(Some("unsupported")), DType::BF16);
         assert_eq!(transformer_dtype(&Device::Cpu), DType::F32);
+    }
+
+    #[test]
+    fn prefix_cache_mode_parser_accepts_the_documented_spellings() {
+        for value in [None, Some(""), Some("auto"), Some(" AUTO "), Some("bogus")] {
+            assert_eq!(parse_prefix_cache_mode(value), PrefixCacheMode::Auto);
+        }
+        for value in ["on", "1", "true", " ON "] {
+            assert_eq!(parse_prefix_cache_mode(Some(value)), PrefixCacheMode::On);
+        }
+        for value in ["off", "0", "false", "Off"] {
+            assert_eq!(parse_prefix_cache_mode(Some(value)), PrefixCacheMode::Off);
+        }
+    }
+
+    #[test]
+    fn prefix_cache_policy_is_a_property_of_the_request() {
+        use PrefixCacheDecision::{Recompute, Retain};
+        // 512 KiB per BF16 prefix token per branch.
+        assert_eq!(prefix_cache_bytes(1, 1, 2), 512 * 1024);
+        let auto = PrefixCacheMode::Auto;
+        // Text-to-image keeps v0.32's per-branch 512-token rule exactly.
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &[512, 513],
+                false,
+                1,
+                2,
+                auto,
+                PrefixCacheBudget::RequestOnly
+            ),
+            vec![Retain, Recompute]
+        );
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &[27, 30],
+                false,
+                1,
+                4,
+                auto,
+                PrefixCacheBudget::RequestOnly
+            ),
+            vec![Retain, Retain]
+        );
+        // One 1024² reference + prompt ≈ 4.2k prefix tokens ≈ 2.1 GiB per
+        // BF16 branch: both CFG branches retain under the 6 GiB budget.
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &[4200, 4150],
+                true,
+                1,
+                2,
+                auto,
+                PrefixCacheBudget::RequestOnly
+            ),
+            vec![Retain, Retain]
+        );
+        // The same request at F32 (8.3 GiB) recomputes, and so do three
+        // references; the decision is shared so both branches agree.
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &[4200, 4150],
+                true,
+                1,
+                4,
+                auto,
+                PrefixCacheBudget::RequestOnly
+            ),
+            vec![Recompute, Recompute]
+        );
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &[12_500, 12_450],
+                true,
+                1,
+                2,
+                auto,
+                PrefixCacheBudget::RequestOnly
+            ),
+            vec![Recompute, Recompute]
+        );
+        // Overrides win in both directions.
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &[40_000],
+                true,
+                1,
+                2,
+                PrefixCacheMode::On,
+                PrefixCacheBudget::RequestOnly
+            ),
+            vec![Retain]
+        );
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &[3],
+                false,
+                1,
+                2,
+                PrefixCacheMode::Off,
+                PrefixCacheBudget::RequestOnly
+            ),
+            vec![Recompute]
+        );
+    }
+
+    /// On the CUDA fast path the cache follows the memory the render has
+    /// left, as upstream's always-on cache does (`P:528`, `:750-764`): every
+    /// branch retains when their summed cache fits the headroom, and all
+    /// recompute together when it does not. The legacy rule is untouched.
+    #[test]
+    fn fast_path_retention_follows_the_memory_headroom() {
+        use PrefixCacheDecision::{Recompute, Retain};
+        let auto = PrefixCacheMode::Auto;
+        // Three 1024² references with CFG: ~16.8k prefix tokens per branch,
+        // 8.2 GiB each in BF16 — over the request-only 6 GiB budget.
+        let three = [16_800, 16_790];
+        let cache: u64 = three
+            .iter()
+            .map(|&tokens| prefix_cache_bytes(tokens, 1, 2))
+            .sum();
+        assert_eq!(
+            PrefixCachePolicy::resolve(&three, true, 1, 2, auto, PrefixCacheBudget::RequestOnly),
+            vec![Recompute, Recompute]
+        );
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &three,
+                true,
+                1,
+                2,
+                auto,
+                PrefixCacheBudget::Headroom(cache)
+            ),
+            vec![Retain, Retain]
+        );
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &three,
+                true,
+                1,
+                2,
+                auto,
+                PrefixCacheBudget::Headroom(cache - 1)
+            ),
+            vec![Recompute, Recompute]
+        );
+        // A long text-to-image prompt retains on the fast path when it fits,
+        // where v0.32's 512-row rule recomputed it.
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &[900],
+                false,
+                1,
+                2,
+                auto,
+                PrefixCacheBudget::Headroom(u64::MAX)
+            ),
+            vec![Retain]
+        );
+        // Overrides still win over the headroom in both directions.
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &three,
+                true,
+                1,
+                2,
+                PrefixCacheMode::On,
+                PrefixCacheBudget::Headroom(0)
+            ),
+            vec![Retain, Retain]
+        );
+        assert_eq!(
+            PrefixCachePolicy::resolve(
+                &[3],
+                false,
+                1,
+                2,
+                PrefixCacheMode::Off,
+                PrefixCacheBudget::Headroom(u64::MAX)
+            ),
+            vec![Recompute]
+        );
+    }
+
+    /// The headroom is what the card has left beyond the resident weights,
+    /// the denoise workspace and one allocator margin — one formula for the
+    /// engine and for admission.
+    #[test]
+    fn prefix_cache_headroom_subtracts_workspace_and_margin() {
+        let gib = 1u64 << 30;
+        assert_eq!(
+            prefix_cache_headroom(40 * gib, 15 * gib, 4 * gib),
+            40 * gib - 15 * gib - 4 * gib - PREFIX_CACHE_MARGIN_BYTES
+        );
+        assert_eq!(prefix_cache_headroom(10 * gib, 15 * gib, 4 * gib), 0);
     }
 
     #[test]

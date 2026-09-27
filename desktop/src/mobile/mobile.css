@@ -1678,75 +1678,6 @@ textarea.control {
   font-size: var(--text-caption);
 }
 
-.mobile-attachment-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.mobile-attachment-card {
-  min-width: 0;
-  overflow: hidden;
-  border: 1px solid var(--mold-border);
-  border-radius: var(--mold-radius-2);
-  background: var(--mold-bg);
-}
-
-.mobile-attachment-card > img {
-  display: block;
-  width: 100%;
-  aspect-ratio: 1;
-  object-fit: cover;
-  background: var(--color-print-surface);
-}
-
-.mobile-attachment-copy {
-  min-width: 0;
-  padding: 7px 8px;
-}
-
-.mobile-attachment-copy strong,
-.mobile-attachment-copy span {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.mobile-attachment-copy strong {
-  color: var(--mold-sapphire);
-  font-family: var(--font-utility);
-  font-size: var(--text-edge-code);
-  text-transform: uppercase;
-}
-
-.mobile-attachment-copy span {
-  margin-top: 2px;
-  font-size: var(--text-caption);
-}
-
-.mobile-attachment-actions {
-  display: grid;
-  grid-template-columns: 44px 44px minmax(0, 1fr);
-  border-top: 1px solid var(--mold-border);
-}
-
-.mobile-media-tile-action {
-  min-width: 44px;
-  min-height: 44px;
-  border: 0;
-  border-right: 1px solid var(--mold-border);
-  background: transparent;
-  color: var(--mold-text-2);
-}
-
-.mobile-media-tile-action.is-danger {
-  border-right: 0;
-  color: var(--mold-error);
-  font-size: var(--text-caption);
-}
-
 .mobile-generate-parameters {
   display: grid;
   gap: 14px;
@@ -3269,8 +3200,28 @@ button:disabled {
 }
 
 .gallery-viewer-image-transform {
+  position: relative;
   transform-origin: center;
   will-change: transform;
+  /* The alpha bed below sizes itself against this plane. */
+  container-type: size;
+}
+
+/* The checkerboard behind a transparent print (`showsAlphaBed`), sized to the
+   picture `object-fit: contain` draws — the smaller of the plane's width and
+   its height scaled by the print's own aspect — and centred, so the bars
+   beside a letterboxed picture stay the plain stage. */
+.gallery-viewer-alpha-bed {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: min(100cqw, calc(100cqh * var(--alpha-w) / var(--alpha-h)));
+  height: min(100cqh, calc(100cqw * var(--alpha-h) / var(--alpha-w)));
+  pointer-events: none;
+}
+
+.gallery-viewer-media--over-bed {
+  position: relative;
 }
 
 .gallery-viewer-stage.is-image-zoomed .gallery-viewer-nav {

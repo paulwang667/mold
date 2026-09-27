@@ -60,6 +60,7 @@ fn save_tensors(path: &Path, tensors: &[OwnedF32]) -> Result<()> {
 
 /// Opt-in, real-checkpoint Metal qualification harness. It writes benchmark
 /// artifacts only beneath QWEN_IMAGE21_BENCH_OUTPUT and never downloads data.
+#[cfg(feature = "metal")]
 #[test]
 #[ignore = "requires installed Qwen Image 2.1 weights and an idle Metal GPU"]
 fn official_metal_mode_benchmark() -> Result<()> {
@@ -135,11 +136,16 @@ fn official_metal_mode_benchmark() -> Result<()> {
     let phase = Instant::now();
     let mut transformer =
         QwenImage21Transformer::load(&transformer_paths, &device, dtype, &progress)?;
-    transformer.compact_modulation = fused_ops;
-    for block in &mut transformer.blocks {
-        block.attn.fused_target = fused_target;
-        block.attn.fused_ops = fused_ops;
-    }
+    transformer.set_exec_path(crate::qwen_image21::exec_path::Qwen21ExecPath {
+        attention: if fused_target {
+            crate::qwen_image21::exec_path::TargetAttention::MetalSdpa
+        } else {
+            crate::qwen_image21::exec_path::TargetAttention::Legacy
+        },
+        fused_projection: fused_ops,
+        compact_modulation: fused_ops,
+        ..crate::qwen_image21::exec_path::Qwen21ExecPath::metal(false)
+    });
     device.synchronize()?;
     let seconds = phase.elapsed().as_secs_f64();
     eprintln!("mode={mode} phase=transformer_load seconds={seconds:.4}");
@@ -155,7 +161,14 @@ fn official_metal_mode_benchmark() -> Result<()> {
     let mut latents = (noise * scheduler.initial_sigma())?;
     let total_steps = scheduler.num_steps();
     let executed_steps = limit.min(total_steps);
-    let mut prepared = transformer.prepare_t2i(&conditioning, 64, 64);
+    let decision = super::super::PrefixCachePolicy::resolve_from_env(
+        &[conditioning.sequence_length()],
+        false,
+        1,
+        dtype,
+        super::super::PrefixCacheBudget::RequestOnly,
+    )[0];
+    let mut prepared = transformer.prepare_t2i(&conditioning, 64, 64, decision)?;
     let mut predictions = Vec::new();
     let mut step_receipts = Vec::with_capacity(executed_steps);
     device.synchronize()?;
@@ -267,3 +280,8 @@ fn official_metal_mode_benchmark() -> Result<()> {
     )?;
     Ok(())
 }
+
+#[cfg(feature = "cuda")]
+mod cuda;
+#[cfg(feature = "cuda")]
+mod cuda_adaln;

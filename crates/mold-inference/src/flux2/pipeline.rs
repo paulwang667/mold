@@ -2598,6 +2598,7 @@ impl Flux2Engine {
             seed_used: seed,
             video: None,
             gpu: None,
+            prefix_cache: None,
         })
     }
 }
@@ -3110,6 +3111,7 @@ impl Flux2Engine {
             seed_used: seed,
             video: None,
             gpu: None,
+            prefix_cache: None,
         })
     }
 }
@@ -4306,6 +4308,7 @@ mod tests {
             true_cfg: None,
             cfg_start_step: None,
             save_to_gallery: None,
+            transparent_background: None,
         };
 
         let err = engine.generate_sequential(&req).unwrap_err().to_string();

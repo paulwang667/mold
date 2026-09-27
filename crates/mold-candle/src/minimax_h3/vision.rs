@@ -11,8 +11,10 @@ use candle_nn::{
 use super::config::H3ConditionerConfig;
 use super::model::ConditionerCheckpoint;
 
+/// Qwen3-VL vision-tower geometry. H3 derives it from its conditioner config;
+/// Qwen Image 2.1 uses [`Qwen3VlVisionDimensions::qwen_image_21`].
 #[derive(Clone, Debug)]
-pub(super) struct Qwen3VlVisionDimensions {
+pub struct Qwen3VlVisionDimensions {
     depth: usize,
     hidden_size: usize,
     intermediate_size: usize,
@@ -25,6 +27,12 @@ pub(super) struct Qwen3VlVisionDimensions {
     num_position_embeddings: usize,
     deepstack_visual_indexes: Vec<usize>,
     activation: Activation,
+    /// The mergers' `act_fn`, which is NOT `hidden_act`: transformers'
+    /// `Qwen3VLVisionPatchMerger.act_fn = nn.GELU()` (exact erf,
+    /// `modeling_qwen3_vl.py:181` at transformers 5.17.0) for the main and
+    /// every DeepStack merger, while `hidden_act` (`gelu_pytorch_tanh`)
+    /// reaches only the blocks' MLP. Both released towers use erf here.
+    merger_activation: Activation,
 }
 
 impl Qwen3VlVisionDimensions {
@@ -43,7 +51,60 @@ impl Qwen3VlVisionDimensions {
             num_position_embeddings: vision.num_position_embeddings,
             deepstack_visual_indexes: vision.deepstack_visual_indexes.clone(),
             activation: Activation::GeluPytorchTanh,
+            // Every H3 upstream runs the mergers on exact erf GELU: diffusers'
+            // H3 pipeline loads transformers' `Qwen3VLForConditionalGeneration`
+            // (`modular_pipelines/minimax_h3/encoders.py:17`), whose merger is
+            // `nn.GELU()` (`modeling_qwen3_vl.py:181`), and ComfyUI's H3
+            // conditioner (`comfy/text_encoders/minimax.py:27`) calls bare
+            // `F.gelu` in both the main merger (`qwen35.py:560`) and the
+            // DeepStack mergers (`qwen3vl.py:36`); only the block MLP takes
+            // `approximate="tanh"` (`qwen35.py:483`). The port used tanh
+            // here until 2026-09-27.
+            merger_activation: Activation::Gelu,
         }
+    }
+
+    /// Qwen Image 2.1's tower (`text_encoder/config.json` `vision_config` at
+    /// `b3179ad`): depth 27, width 1152, MLP 4304, 16 heads, patch 16,
+    /// temporal patch 2, merge 2, output 4096, 48x48 learned positions,
+    /// DeepStack taps after blocks 8/16/24, `gelu_pytorch_tanh`.
+    pub fn qwen_image_21() -> Self {
+        Self {
+            depth: 27,
+            hidden_size: 1152,
+            intermediate_size: 4304,
+            num_heads: 16,
+            in_channels: 3,
+            patch_size: 16,
+            temporal_patch_size: 2,
+            spatial_merge_size: 2,
+            output_hidden_size: 4096,
+            num_position_embeddings: 2304,
+            deepstack_visual_indexes: vec![8, 16, 24],
+            activation: Activation::GeluPytorchTanh,
+            // `modeling_qwen3_vl.py` `Qwen3VLVisionPatchMerger.act_fn = nn.GELU()`.
+            merger_activation: Activation::Gelu,
+        }
+    }
+
+    /// Output width of the merger and every DeepStack merger.
+    pub fn output_hidden_size(&self) -> usize {
+        self.output_hidden_size
+    }
+
+    /// Patches folded into one merged token per side.
+    pub fn spatial_merge_size(&self) -> usize {
+        self.spatial_merge_size
+    }
+
+    /// Transformer depth of the tower.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Blocks after which a DeepStack map is taken, in tap order.
+    pub fn deepstack_visual_indexes(&self) -> &[usize] {
+        &self.deepstack_visual_indexes
     }
 
     fn validate(&self) -> Result<()> {
@@ -86,6 +147,7 @@ impl Qwen3VlVisionDimensions {
             num_position_embeddings: 4,
             deepstack_visual_indexes: vec![0, 1, 2],
             activation: Activation::GeluPytorchTanh,
+            merger_activation: Activation::GeluPytorchTanh,
         }
     }
 }
@@ -441,6 +503,7 @@ struct PatchMerger {
     merged_hidden_size: usize,
     first: Linear,
     second: Linear,
+    activation: Activation,
 }
 
 impl PatchMerger {
@@ -474,6 +537,7 @@ impl PatchMerger {
                 config.output_hidden_size,
                 vb.pp("linear_fc2"),
             )?,
+            activation: config.merger_activation,
         })
     }
 
@@ -499,7 +563,9 @@ impl PatchMerger {
         };
         linear_with_cpu_bf16_fallback(
             &self.second,
-            &linear_with_cpu_bf16_fallback(&self.first, &merged)?.gelu()?,
+            &self
+                .activation
+                .forward(&linear_with_cpu_bf16_fallback(&self.first, &merged)?)?,
         )
     }
 }
@@ -527,7 +593,9 @@ impl VisionRotaryEmbedding {
     }
 }
 
-pub(super) struct Qwen3VlVisionModel {
+/// The Qwen3-VL vision tower: patch embedding, learned interpolated
+/// positions, 2-D rotary blocks, the output merger and the DeepStack mergers.
+pub struct Qwen3VlVisionModel {
     patch_embed: PatchEmbed,
     position_embedding: Embedding,
     blocks: Vec<VisionBlock>,
@@ -542,7 +610,8 @@ pub(super) struct Qwen3VlVisionModel {
 }
 
 impl Qwen3VlVisionModel {
-    pub(super) fn new(config: &Qwen3VlVisionDimensions, vb: VarBuilder) -> Result<Self> {
+    /// Build the tower rooted at `vb` (`model.visual` in a Qwen3-VL checkpoint).
+    pub fn new(config: &Qwen3VlVisionDimensions, vb: VarBuilder) -> Result<Self> {
         config.validate()?;
         let patch_embed = PatchEmbed::new(config, vb.pp("patch_embed"))?;
         let position_embedding = embedding(
@@ -584,7 +653,10 @@ impl Qwen3VlVisionModel {
         })
     }
 
-    pub(super) fn forward(
+    /// Run packed patches `[N, 3*2*16*16]` with their `[images, 3]` grid.
+    /// Returns the merger output `[N/4, out]` and one `[N/4, out]` DeepStack
+    /// map per tap, in tap order.
+    pub fn forward(
         &self,
         pixels: &Tensor,
         grid_thw: &Tensor,
@@ -803,6 +875,103 @@ fn cumulative_sequence_lengths(grid: &[[usize; 3]]) -> Vec<usize> {
 mod tests {
     use super::*;
     use candle_nn::VarMap;
+
+    /// Every released Qwen3-VL tower runs its blocks on the configured
+    /// `gelu_pytorch_tanh` but its mergers on exact erf GELU: transformers'
+    /// `Qwen3VLVisionPatchMerger.act_fn = nn.GELU()` ignores `hidden_act`, and
+    /// ComfyUI's H3 conditioner (`qwen35.py:560`, `qwen3vl.py:36`) calls
+    /// `F.gelu` with no `approximate`. H3 and Qwen Image 2.1 agree.
+    #[test]
+    fn released_towers_use_tanh_blocks_and_erf_mergers() {
+        let h3 = super::super::config::H3ConditionerConfig::from_json(
+            super::super::config::tests::released_config().as_bytes(),
+        )
+        .unwrap();
+        for dimensions in [
+            Qwen3VlVisionDimensions::from_h3(&h3),
+            Qwen3VlVisionDimensions::qwen_image_21(),
+        ] {
+            assert_eq!(dimensions.activation, Activation::GeluPytorchTanh);
+            assert_eq!(dimensions.merger_activation, Activation::Gelu);
+        }
+    }
+
+    /// The released H3 tower against the fp32 transformers oracle
+    /// (`testdata/minimax_h3/vision/capture.py`), on the installed
+    /// conditioner's own `visual.*` weights. Gated on
+    /// `MOLD_TEST_H3_VISION_CAPTURE` (the capture) and
+    /// `MOLD_TEST_H3_SHARED_DIR` (`$MOLD_HOME/models/shared/minimax-h3`).
+    /// It also runs the tower with the old tanh mergers and requires erf
+    /// to be strictly closer, so the evidence for the activation choice is
+    /// re-derived on every run rather than recorded once.
+    ///
+    /// Ignored by default; run with `--ignored` it PANICS naming whichever
+    /// variable is missing rather than passing without comparing anything.
+    #[test]
+    #[ignore = "requires MOLD_TEST_H3_VISION_CAPTURE and MOLD_TEST_H3_SHARED_DIR"]
+    fn released_h3_tower_matches_the_fp32_transformers_capture() {
+        let var = |name: &str| {
+            std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set to run this test"))
+        };
+        let capture = var("MOLD_TEST_H3_VISION_CAPTURE");
+        let shared = var("MOLD_TEST_H3_SHARED_DIR");
+        let shared = std::path::Path::new(&shared);
+        let config = super::super::config::H3ConditionerConfig::from_json(
+            &std::fs::read(shared.join("text_encoder/config.json")).unwrap(),
+        )
+        .unwrap();
+        let weights = std::fs::read_dir(shared.join("text_encoders"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+            .unwrap();
+        let captured = candle::safetensors::load(&capture, &Device::Cpu).unwrap();
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &Device::Cpu).unwrap()
+        };
+        let relative = |actual: &Tensor, expected: &Tensor| -> (f32, f32) {
+            let diff = (actual - expected).unwrap().abs().unwrap();
+            let expected = expected.abs().unwrap();
+            let scalar = |t: Tensor| t.to_scalar::<f32>().unwrap();
+            (
+                scalar(diff.flatten_all().unwrap().max(0).unwrap())
+                    / scalar(expected.flatten_all().unwrap().max(0).unwrap()),
+                scalar(diff.mean_all().unwrap()) / scalar(expected.mean_all().unwrap()),
+            )
+        };
+        let run = |dimensions: &Qwen3VlVisionDimensions| -> Vec<(f32, f32)> {
+            let model = Qwen3VlVisionModel::new(dimensions, vb.pp("visual")).unwrap();
+            let (merged, deepstack) = model
+                .forward(
+                    &captured["pixel_values"],
+                    &captured["image_grid_thw"],
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+            std::iter::once(relative(&merged, &captured["vision_merger"]))
+                .chain(deepstack.iter().enumerate().map(|(index, map)| {
+                    relative(map, &captured[&format!("vision_deepstack_{index}")])
+                }))
+                .collect()
+        };
+        let released = Qwen3VlVisionDimensions::from_h3(&config);
+        let erf = run(&released);
+        let tanh = run(&Qwen3VlVisionDimensions {
+            merger_activation: Activation::GeluPytorchTanh,
+            ..released
+        });
+        for (label, (erf, tanh)) in ["merger", "deepstack 0", "deepstack 1", "deepstack 2"]
+            .iter()
+            .zip(erf.iter().zip(&tanh))
+        {
+            eprintln!(
+                "{label}: erf max {:.3e} mean {:.3e} | tanh max {:.3e} mean {:.3e}",
+                erf.0, erf.1, tanh.0, tanh.1
+            );
+            assert!(erf.0 <= 5e-5, "{label}: erf max {}", erf.0);
+            assert!(erf.1 < tanh.1, "{label}: erf {} vs tanh {}", erf.1, tanh.1);
+        }
+    }
 
     #[test]
     fn interpolation_points_match_the_released_fp32_operation_order() {

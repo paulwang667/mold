@@ -140,16 +140,18 @@ pub use wan::pipeline::distill_is_active as wan_distill_is_active;
 /// source-image classification `/api/models` advertises (#772).
 pub use wan::pipeline::source_image_capability as wan_source_image_capability;
 pub use wan::step_cache::requested_threshold as wan_requested_step_cache_threshold;
+pub(crate) mod webp_still;
 pub(crate) mod weight_loader;
 pub mod wuerstchen;
 pub mod zimage;
 
 pub use batch::{
-    batch_execution_capability_for_family, production_batch_capabilities,
-    production_family_capabilities, production_family_capability_for_family,
-    validate_runtime_batch_capability, BackendApplicability, BackendQualification,
-    ComponentPlacementCapability, DeterminismGuarantee, FamilyBatchCapability, MediaKind,
-    QualificationReference, SeedContract, TiledVaeCapability, WorkflowCapabilities,
+    batch_execution_capability_for_family, canonical_production_family,
+    production_batch_capabilities, production_family_capabilities,
+    production_family_capability_for_family, validate_runtime_batch_capability,
+    BackendApplicability, BackendQualification, ComponentPlacementCapability, DeterminismGuarantee,
+    FamilyBatchCapability, MediaKind, QualificationReference, SeedContract, TiledVaeCapability,
+    WorkflowCapabilities,
 };
 pub use engine::{
     with_inference_cancellation, BatchExecutionCapability, GenerationReferenceBinding,
@@ -187,6 +189,9 @@ pub use h3_factory::{
     H3FactoryRawCheckpointInput, H3FactoryTargetBudgetInput, H3FactoryTargetDenoiseCopyPolicy,
     H3FactoryTargetLoadDropPolicy,
 };
+/// The engine's decision about an RGBA render's alpha channel (Qwen Image 2.1),
+/// and the request rule that makes it.
+pub use image::{alpha_output_for_request, encoded_image_has_alpha, AlphaOutput};
 pub use ltx2::Ltx2Engine;
 pub use ltx_video::LtxVideoEngine;
 pub use model_registry::known_models;
@@ -231,6 +236,19 @@ pub fn compiled_backend_label() -> &'static str {
         "metal"
     } else {
         "cpu"
+    }
+}
+
+/// The GPU backend this build executes on, or `None` for a CPU-only build.
+/// Pull and admission ask [`mold_core::manifest::backend_refusal`] with it, so
+/// a tier this build cannot run is refused before its download.
+pub fn compiled_gpu_backend() -> Option<mold_core::GpuBackend> {
+    if cfg!(feature = "cuda") {
+        Some(mold_core::GpuBackend::Cuda)
+    } else if cfg!(feature = "metal") {
+        Some(mold_core::GpuBackend::Metal)
+    } else {
+        None
     }
 }
 

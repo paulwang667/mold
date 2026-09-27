@@ -2637,6 +2637,7 @@ impl FluxEngine {
             seed_used: seed,
             video: None,
             gpu: None,
+            prefix_cache: None,
         })
     }
 }
@@ -3650,6 +3651,7 @@ impl FluxEngine {
             seed_used: seed,
             video: None,
             gpu: None,
+            prefix_cache: None,
         })
     }
 }
@@ -4201,6 +4203,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         }
     }
 

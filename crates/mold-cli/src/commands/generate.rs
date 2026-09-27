@@ -233,6 +233,77 @@ async fn require_remote_identity_capabilities(
     )
 }
 
+/// Refuse `--transparent` (and MCP's `transparent_background`) against the
+/// SERVER's recipe, not this binary's.
+///
+/// `transparent_background` is an additive field: a server that predates it
+/// (v0.32) deserializes the request, drops the field, and renders opaque RGB
+/// without a word. The server's model listing is the only authority on what
+/// it will honour, so it is asked before submitting, with the same rule
+/// Discord's `transparency_contract` applies: a listed model answers with ITS
+/// `capabilities.transparency` block, and a listed model whose profile carries
+/// none is an OLDER SERVER — refused with "update the server", never guessed
+/// from the local core decision. A model the server does not list falls back
+/// to the shared core decision (admission will answer for it). An
+/// unreachable server is left to the local fallback, where the local recipe
+/// decides; a reachable server that cannot list its models is read as older.
+pub(crate) async fn require_remote_transparency_contract(
+    client: &MoldClient,
+    request: &GenerateRequest,
+) -> Result<()> {
+    if request.transparent_background != Some(true) {
+        return Ok(());
+    }
+    let models = match client.list_models_extended().await {
+        Ok(models) => Some(models),
+        Err(error) if MoldClient::is_connection_error(&error) => return Ok(()),
+        Err(_) => None,
+    };
+    remote_transparency_decision(models.as_deref(), request, client.host())
+        .map_err(anyhow::Error::msg)
+}
+
+/// The pure half of [`require_remote_transparency_contract`]: `models` is the
+/// server's listing, `None` when a reachable server could not provide one.
+pub(crate) fn remote_transparency_decision(
+    models: Option<&[mold_core::ModelInfoExtended]>,
+    request: &GenerateRequest,
+    host: &str,
+) -> std::result::Result<(), String> {
+    if request.transparent_background != Some(true) {
+        return Ok(());
+    }
+    let wanted = mold_core::manifest::resolve_model_name(&request.model);
+    let older_server = || {
+        format!(
+            "{} The server at {host} does not advertise capabilities.transparency for \
+             '{}', so it would render an opaque image; update the server.",
+            mold_core::TRANSPARENCY_UNSUPPORTED_REASON,
+            request.model
+        )
+    };
+    let Some(models) = models else {
+        return Err(older_server());
+    };
+    let entry = models.iter().find(|entry| {
+        entry.info.name == request.model
+            || mold_core::manifest::resolve_model_name(&entry.info.name) == wanted
+    });
+    let contract = match entry {
+        Some(entry) => entry
+            .generation_profile
+            .as_ref()
+            .and_then(|profile| profile.default_recipe())
+            .and_then(|recipe| recipe.capabilities.transparency.clone())
+            .ok_or_else(older_server)?,
+        None => match mold_core::validation::resolved_family_for(&request.model) {
+            Some(family) => mold_core::transparency_for_recipe(family, &request.model),
+            None => return Ok(()),
+        },
+    };
+    mold_core::validate_transparency_against(&contract, request)
+}
+
 fn local_generation_delivery_capabilities() -> mold_core::GenerationDeliveryCapabilities {
     mold_core::GenerationDeliveryCapabilities::new(cfg!(feature = "mp4"), cfg!(feature = "webp"))
 }
@@ -335,6 +406,11 @@ fn effective_dimensions(
     if family == Some(mold_core::manifest::HUNYUAN3D_FAMILY) {
         return Ok((0, 0));
     }
+    if width.is_none() && height.is_none() {
+        if let Some(canvas) = last_reference_canvas(family, model, edit_images)? {
+            return Ok(canvas);
+        }
+    }
     match (width, height, source_image) {
         (Some(width), Some(height), _) => Ok((width, height)),
         (Some(width), None, _) => Ok((width, model_cfg.effective_height(config))),
@@ -359,6 +435,73 @@ fn effective_dimensions(
             model_cfg.effective_height(config),
         )),
     }
+}
+
+/// Refuse `--transparent` where the recipe cannot honour it — a model with no
+/// transparency contract, or a container without an alpha channel (JPEG) —
+/// with the server's own sentence (`validate_transparency_choice`), so the
+/// CLI and admission say the same thing about the same request.
+///
+/// The contract read is the local recipe's when this run renders locally
+/// (already narrowed to what this binary can encode), else the shared core
+/// decision. An unresolved family enforces nothing: the server's recipe is
+/// the authority for a model this side cannot classify.
+fn refuse_unrenderable_transparency(
+    family: Option<&str>,
+    model: &str,
+    local_profile: Option<&mold_core::GenerationProfileSet>,
+    transparent_background: Option<bool>,
+    format: OutputFormat,
+) -> Result<()> {
+    if transparent_background != Some(true) {
+        return Ok(());
+    }
+    let advertised = local_profile
+        .and_then(|profile| profile.default_recipe())
+        .and_then(|recipe| recipe.capabilities.transparency.clone());
+    let contract = match (advertised, family) {
+        (Some(contract), _) => contract,
+        (None, Some(family)) => mold_core::transparency_for_recipe(family, model),
+        (None, None) => return Ok(()),
+    };
+    mold_core::validate_transparency_choice(&contract, transparent_background, format)
+        .map_err(anyhow::Error::msg)
+}
+
+/// The default canvas for a recipe whose references size it
+/// (`capabilities.reference_images.canvas == last-reference`, Qwen Image
+/// 2.1): `mold_core::last_reference_canvas` — the LAST reference's aspect at
+/// upstream's fixed 1024x1024 area (never this host's configured default, so
+/// the server derives the same canvas), rounded halves-to-even as upstream's
+/// `calculate_dimensions` (`pipeline_qwenimage21.py:149-156`) and clamped
+/// into the recipe's bounds. `None` when the recipe has no such rule or the
+/// request carries no reference, leaving the ordinary default in force.
+fn last_reference_canvas(
+    family: Option<&str>,
+    model: &str,
+    edit_images: Option<&[Vec<u8>]>,
+) -> Result<Option<(u32, u32)>> {
+    let Some(family) = family else {
+        return Ok(None);
+    };
+    let profile = mold_core::generation_profile::reference_images_for_recipe(family, model);
+    if profile.canvas != Some(mold_core::ReferenceCanvasRule::LastReference) {
+        return Ok(None);
+    }
+    let Some(last) = edit_images.and_then(|images| images.last()) else {
+        return Ok(None);
+    };
+    // The engine decodes the reference upright (EXIF orientation applied), so
+    // the canvas is read from the same oriented size.
+    let (width, height) =
+        mold_core::reference_image::oriented_dimensions(last).map_err(|error| {
+            anyhow::anyhow!("failed to read the last reference image's size: {error}")
+        })?;
+    Ok(Some(mold_core::last_reference_canvas(
+        width,
+        height,
+        mold_core::CanvasLimits::for_model(model, Some(family)),
+    )))
 }
 
 /// What `--fit` leaves the request carrying.
@@ -638,8 +781,9 @@ fn save_durable_batch_download(
     }
     // `bytes` is the artifact, and only a raster artifact can be previewed in
     // a terminal. A mesh and an audio print each have a sidecar tile, which
-    // their own save paths preview instead.
-    if preview && !format.is_video() && !format.is_audio() && !format.is_mesh() {
+    // their own save paths preview instead. The media kind is read off the
+    // bytes: a WebP still previews, an animated WebP is a video.
+    if preview && !format.is_video_artifact(bytes) && !format.is_audio() && !format.is_mesh() {
         preview_image(bytes);
     }
     Ok(())
@@ -994,6 +1138,10 @@ pub struct Ltx2Options {
     /// Local files corresponding one-for-one with `references`. They are
     /// streamed only after an authenticated request-bound session is created.
     pub reference_uploads: Vec<ReferenceUpload>,
+    /// `--transparent`: `Some(true)` or absent, never `Some(false)` — an
+    /// ordinary render must stay byte-identical to one sent before the field
+    /// existed.
+    pub transparent_background: Option<bool>,
 }
 
 fn require_local_hdr_exr_dir(hdr_exr_dir: Option<String>, local: bool) -> Result<Option<String>> {
@@ -1149,6 +1297,7 @@ pub async fn run(
         source_fit,
         references,
         reference_uploads,
+        transparent_background,
     } = ltx2;
     // Keep the filesystem path out of every remote request shape. Local
     // generation retains the exact user path so export metadata remains
@@ -1288,18 +1437,39 @@ pub async fn run(
     // The container above is a family/recipe decision that never saw the
     // filename. Reconcile the two here — above the family policy, so wan,
     // ltx-video and LTX-2 all get it, and before any weight is read (#1050).
-    let output_format = reconcile_video_format_with_output_extension(
-        output_format,
-        output.as_deref(),
-        format != OutputFormat::Png,
-        delivery_capabilities_for_run(local),
-    )
+    // A still render (no frames, or wan's single frame, #798) reconciles
+    // against still containers: `png` names a PNG there, never an APNG, and
+    // WebP is a still format, not the animated container `is_video` reports.
+    let renders_still = effective_frames.is_none_or(|frames| frames <= 1) && !is_h3;
+    let output_format = if renders_still {
+        reconcile_still_format_with_output_extension(
+            output_format,
+            output.as_deref(),
+            format != OutputFormat::Png,
+        )
+    } else {
+        reconcile_video_format_with_output_extension(
+            output_format,
+            output.as_deref(),
+            format != OutputFormat::Png,
+            delivery_capabilities_for_run(local),
+        )
+    }
     .map_err(anyhow::Error::msg)?;
     // The mesh half of the same rule. A 3-D render has one container, so this
     // only ever agrees or refuses — and it refuses before a weight is read.
     let output_format =
         reconcile_mesh_format_with_output_extension(output_format, output.as_deref())
             .map_err(anyhow::Error::msg)?;
+    // `--transparent` against the recipe's transparency contract, once the
+    // container is final and before anything is read or queued.
+    refuse_unrenderable_transparency(
+        family.as_deref(),
+        model,
+        local_profile.as_ref(),
+        transparent_background,
+        output_format,
+    )?;
 
     // ── Chain routing ─────────────────────────────────────────────────────
     // When --frames exceeds the per-clip cap, auto-build a ChainRequest and
@@ -1531,6 +1701,7 @@ pub async fn run(
                         id_image_names: None,
                         true_cfg: None,
                         cfg_start_step: None,
+                        transparent_background: None,
                     };
                     materialize_local_builtin_control(&mut probe_req, &config).await?;
                     let control_loras = probe_req.loras.take().unwrap_or_default();
@@ -1721,6 +1892,7 @@ pub async fn run(
         true_cfg: identity.true_cfg,
         cfg_start_step: identity.cfg_start_step,
         save_to_gallery: filing.save_to_gallery(),
+        transparent_background,
     };
     // A continuation that named no overlap renders with its family's own
     // carryover, and the metadata `record_local_save` builds resolves the
@@ -1750,6 +1922,9 @@ pub async fn run(
         // predates the capability block and every identity-capable server
         // understands it.
         require_remote_identity_capabilities(ctx.client(), &req).await?;
+        // `--transparent` is additive too: an older server renders opaque
+        // RGB. Its model listing decides, not this binary's recipe.
+        require_remote_transparency_contract(ctx.client(), &req).await?;
 
         if !reference_uploads.is_empty() {
             // Upload sessions bind the complete request. Freeze a random seed
@@ -2647,6 +2822,53 @@ pub(crate) fn reconcile_video_format_with_output_extension(
         ));
     }
     Ok(named)
+}
+
+/// The still container an `--output` extension names.
+fn still_container_named_by_extension(extension: &str) -> Option<OutputFormat> {
+    match extension {
+        "png" => Some(OutputFormat::Png),
+        "jpg" | "jpeg" => Some(OutputFormat::Jpeg),
+        "webp" => Some(OutputFormat::Webp),
+        _ => None,
+    }
+}
+
+/// The still-render half of [`reconcile_video_format_with_output_extension`].
+///
+/// A still's container is `--format`'s alone (PNG when omitted), so the only
+/// thing to reconcile is an explicit `--format` that disagrees with the name a
+/// caller typed. The video rule read a `.png` name as APNG and WebP as an
+/// animated container, which on a WebP still refused `-o x.png` for naming
+/// "APNG"; here both sides are named as the stills they are.
+pub(crate) fn reconcile_still_format_with_output_extension(
+    resolved: OutputFormat,
+    output: Option<&str>,
+    format_is_explicit: bool,
+) -> Result<OutputFormat, String> {
+    if !format_is_explicit {
+        return Ok(resolved);
+    }
+    let Some(path) = output.filter(|path| *path != "-") else {
+        return Ok(resolved);
+    };
+    let Some(named) = std::path::Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .and_then(|extension| still_container_named_by_extension(&extension))
+    else {
+        return Ok(resolved);
+    };
+    if named == resolved || still_container_named_by_extension(resolved.extension()).is_none() {
+        return Ok(resolved);
+    }
+    Err(format!(
+        "--output '{path}' names {}, but --format selected {} — rename the output or drop \
+         --format so the saved bytes match the extension",
+        container_label(named),
+        container_label(resolved)
+    ))
 }
 
 /// The line a 3-D run prints instead of `Generating {w}x{h}`.
@@ -3720,6 +3942,7 @@ impl BatchOutputs {
             model: self.last_model,
             seed_used: self.last_seed_used,
             gpu: None,
+            prefix_cache: None,
         }
     }
 }
@@ -4639,6 +4862,40 @@ mod tests {
     }
 
     #[test]
+    fn a_webp_still_named_png_is_refused_as_png_not_apng() {
+        let error = reconcile_still_format_with_output_extension(
+            OutputFormat::Webp,
+            Some("still.png"),
+            true,
+        )
+        .expect_err("--format webp -o still.png disagrees");
+        assert!(
+            error.contains("names PNG, but --format selected WebP"),
+            "got: {error}"
+        );
+        assert!(!error.contains("APNG"), "got: {error}");
+    }
+
+    #[test]
+    fn still_names_that_agree_or_carry_no_claim_pass_through() {
+        for (resolved, path, explicit) in [
+            (OutputFormat::Webp, Some("still.webp"), true),
+            (OutputFormat::Jpeg, Some("still.JPG"), true),
+            (OutputFormat::Png, Some("still.png"), true),
+            (OutputFormat::Webp, Some("-"), true),
+            (OutputFormat::Webp, None, true),
+            (OutputFormat::Webp, Some("still.bin"), true),
+            (OutputFormat::Png, Some("still.webp"), false),
+        ] {
+            assert_eq!(
+                reconcile_still_format_with_output_extension(resolved, path, explicit),
+                Ok(resolved),
+                "{path:?} should keep {resolved}"
+            );
+        }
+    }
+
+    #[test]
     fn matching_extensions_pass_through_untouched() {
         for (resolved, path) in [
             (OutputFormat::Mp4, "clip.mp4"),
@@ -5008,6 +5265,108 @@ mod tests {
         .expect("the minimal generate-request wire shape");
         request.id_images = Some(vec![vec![0x89, 0x50, 0x4e, 0x47], vec![0xff, 0xd8, 0xff]]);
         request
+    }
+
+    fn transparent_qwen_request() -> GenerateRequest {
+        let mut request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "a glass lantern",
+            "model": "qwen-image-2.1:bf16",
+            "width": 1024,
+            "height": 1024,
+            "steps": 40,
+            "guidance": 1.0,
+        }))
+        .expect("the minimal generate-request wire shape");
+        request.transparent_background = Some(true);
+        request.output_format = Some(OutputFormat::Png);
+        request
+    }
+
+    fn listed_qwen(with_transparency: bool) -> mold_core::ModelInfoExtended {
+        let manifest = mold_core::manifest::find_manifest("qwen-image-2.1:bf16").unwrap();
+        let mut profile = mold_core::generation_profile_for_manifest(manifest);
+        if !with_transparency {
+            for recipe in &mut profile.recipes {
+                recipe.capabilities.transparency = None;
+            }
+        }
+        let mut entry: mold_core::ModelInfoExtended = serde_json::from_value(serde_json::json!({
+            "name": "qwen-image-2.1:bf16",
+            "family": "qwen-image21",
+            "size_gb": 1.0,
+            "is_loaded": false,
+            "hf_repo": "Qwen/Qwen-Image-2.1",
+            "default_steps": 40,
+            "default_guidance": 1.0,
+            "default_width": 1024,
+            "default_height": 1024,
+            "description": "test",
+        }))
+        .expect("a minimal model listing row");
+        entry.generation_profile = Some(profile);
+        entry
+    }
+
+    /// An older server lists the model but its profile carries no
+    /// `capabilities.transparency`: it would drop the field and render
+    /// opaque RGB, so the CLI refuses and says to update the server rather
+    /// than trusting its own recipe.
+    #[test]
+    fn an_older_server_without_the_transparency_block_is_refused() {
+        let request = transparent_qwen_request();
+        let error = remote_transparency_decision(
+            Some(&[listed_qwen(false)]),
+            &request,
+            "http://old-host:7680",
+        )
+        .unwrap_err();
+        assert!(error.contains("update the server"), "{error}");
+        assert!(error.contains("http://old-host:7680"), "{error}");
+        // A reachable server that could not list its models is older too.
+        let error =
+            remote_transparency_decision(None, &request, "http://old-host:7680").unwrap_err();
+        assert!(error.contains("update the server"), "{error}");
+        // A current server's block admits it, and still refuses JPEG in
+        // admission's own words.
+        remote_transparency_decision(Some(&[listed_qwen(true)]), &request, "h").unwrap();
+        let mut jpeg = request.clone();
+        jpeg.output_format = Some(OutputFormat::Jpeg);
+        let error =
+            remote_transparency_decision(Some(&[listed_qwen(true)]), &jpeg, "h").unwrap_err();
+        assert!(!error.contains("update the server"), "{error}");
+        // No toggle, no question.
+        let mut plain = request;
+        plain.transparent_background = None;
+        remote_transparency_decision(None, &plain, "h").unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_remote_transparency_probe_reads_the_servers_listing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![listed_qwen(false)]))
+            .mount(&server)
+            .await;
+        let error = require_remote_transparency_contract(
+            &MoldClient::new(&server.uri()),
+            &transparent_qwen_request(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("update the server"), "{error}");
+
+        // An unreachable host is left to the local fallback.
+        require_remote_transparency_contract(
+            &MoldClient::new("http://127.0.0.1:1"),
+            &transparent_qwen_request(),
+        )
+        .await
+        .expect("an unreachable host must not be turned into a hard refusal");
     }
 
     /// A REACHABLE server that cannot answer the probe is the dangerous case,
@@ -5436,6 +5795,7 @@ mod tests {
                 source_fit: None,
                 references: None,
                 reference_uploads: Vec::new(),
+                transparent_background: None,
             },
             Some(server.uri()),
             OutputFormat::Png,
@@ -5944,6 +6304,7 @@ mod tests {
             model: "ltx-video:bf16".to_string(),
             seed_used: 91,
             gpu: Some(0),
+            prefix_cache: None,
         };
 
         let error = finalize_local_batch_outputs(
@@ -6337,6 +6698,166 @@ mod tests {
             .unwrap(),
             (1344, 768)
         );
+    }
+
+    /// The derived canvas is upstream's 1024x1024 area whatever this host's
+    /// configured default size is (the server advisory and every other
+    /// client derive it the same way), and a panorama past the recipe's axis
+    /// ceiling is clamped inside it rather than refused at admission.
+    #[test]
+    fn last_reference_canvas_ignores_the_local_default_and_clamps_panoramas() {
+        let config = Config::default();
+        let model_cfg = ModelConfig {
+            default_width: Some(1536),
+            default_height: Some(1536),
+            ..ModelConfig::default()
+        };
+        let dims = |images: &[Vec<u8>]| {
+            effective_dimensions(
+                &config,
+                &model_cfg,
+                "qwen-image-2.1:bf16",
+                Some("qwen-image21"),
+                None,
+                None,
+                None,
+                Some(images),
+            )
+            .unwrap()
+        };
+        assert_eq!(dims(&[png_with_dimensions(1920, 1080)]), (1376, 768));
+        assert_eq!(dims(&[png_with_dimensions(8000, 1000)]), (2752, 320));
+    }
+
+    /// Qwen Image 2.1 advertises `canvas: last-reference`: with neither
+    /// `--width` nor `--height`, the canvas is the LAST reference's aspect at
+    /// the model's default area on its 32 px grid, rounded halves-to-even
+    /// exactly as upstream's `calculate_dimensions`. Any explicit dimension
+    /// wins, and a recipe without the rule keeps its ordinary default.
+    #[test]
+    fn effective_dimensions_follow_the_last_reference_when_the_recipe_says_so() {
+        let config = Config::default();
+        let model_cfg = ModelConfig {
+            default_width: Some(1024),
+            default_height: Some(1024),
+            ..ModelConfig::default()
+        };
+        let square = png_with_dimensions(640, 640);
+        let wide = png_with_dimensions(1920, 1080);
+        let refs = vec![square.clone(), wide.clone()];
+        let dims = |width, height, images: &[Vec<u8>]| {
+            effective_dimensions(
+                &config,
+                &model_cfg,
+                "qwen-image-2.1:bf16",
+                Some("qwen-image21"),
+                width,
+                height,
+                None,
+                Some(images),
+            )
+            .unwrap()
+        };
+        let expected =
+            mold_core::validation::fit_to_target_area_ties_even(1920, 1080, 1024 * 1024, 32);
+        assert_eq!(dims(None, None, &refs), expected);
+        assert_eq!(expected, (1376, 768));
+        // Order matters: the LAST reference decides, not the first.
+        assert_eq!(
+            dims(None, None, &[wide.clone(), square.clone()]),
+            (1024, 1024)
+        );
+        // The tie case upstream rounds to even (4225x4096 -> 1024x1024, where
+        // halves-away-from-zero would give 1056x1024).
+        assert_eq!(
+            dims(None, None, &[png_with_dimensions(4225, 4096)]),
+            (1024, 1024)
+        );
+        // Explicit dimensions always win.
+        assert_eq!(dims(Some(1344), Some(768), &refs), (1344, 768));
+        assert_eq!(dims(Some(512), None, &refs), (512, 1024));
+        // No reference: the model default.
+        assert_eq!(dims(None, None, &[]), (1024, 1024));
+        // A landscape-stored photo with EXIF Orientation 6 is portrait: the
+        // engine decodes it upright, so the canvas is portrait too.
+        let rotated =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../mold-core/testdata/reference_orientation/landscape_96x48_orientation6.jpg",
+            ))
+            .unwrap();
+        assert_eq!(
+            dims(None, None, &[rotated]),
+            mold_core::validation::fit_to_target_area_ties_even(48, 96, 1024 * 1024, 32)
+        );
+
+        // FLUX.2 [dev] takes references but advertises no canvas rule.
+        assert_eq!(
+            effective_dimensions(
+                &config,
+                &model_cfg,
+                "flux2-dev:q8",
+                Some("flux2"),
+                None,
+                None,
+                None,
+                Some(&refs),
+            )
+            .unwrap(),
+            (1024, 1024)
+        );
+    }
+
+    /// `--transparent` is refused with the server's own sentences: a
+    /// container without alpha, and a recipe without the contract. An
+    /// unresolved family is left to the server.
+    #[test]
+    fn transparency_preflight_speaks_with_admissions_voice() {
+        let jpeg = refuse_unrenderable_transparency(
+            Some("qwen-image21"),
+            "qwen-image-2.1:bf16",
+            None,
+            Some(true),
+            OutputFormat::Jpeg,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            jpeg,
+            "transparent_background needs a format with an alpha channel; use png or webp instead of jpeg"
+        );
+        for format in [OutputFormat::Png, OutputFormat::Webp] {
+            refuse_unrenderable_transparency(
+                Some("qwen-image21"),
+                "qwen-image-2.1-turbo:bf16",
+                None,
+                Some(true),
+                format,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            refuse_unrenderable_transparency(
+                Some("flux"),
+                "flux-dev:q8",
+                None,
+                Some(true),
+                OutputFormat::Png
+            )
+            .unwrap_err()
+            .to_string(),
+            mold_core::TRANSPARENCY_UNSUPPORTED_REASON
+        );
+        // Off asks for nothing; an unknown family is the server's call.
+        refuse_unrenderable_transparency(
+            Some("flux"),
+            "flux-dev:q8",
+            None,
+            None,
+            OutputFormat::Jpeg,
+        )
+        .unwrap();
+        refuse_unrenderable_transparency(None, "cv:1", None, Some(true), OutputFormat::Jpeg)
+            .unwrap();
     }
 
     /// A mesh render has no canvas: the engine letterboxes the source to the
@@ -7429,6 +7950,7 @@ mod audio_batch_passthrough_tests {
             model: "ltx-2-19b-dev:fp8".to_string(),
             seed_used: seed,
             gpu: None,
+            prefix_cache: None,
         }
     }
 

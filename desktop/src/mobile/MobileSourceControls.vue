@@ -7,7 +7,12 @@ import type { ApiTarget } from "../lib/api/client";
 import type { CatalogEntry, ModelEntry } from "../lib/api/types";
 import { generationCapabilitiesForFamily } from "../lib/capabilities";
 import { buildControlNetOptions } from "../lib/controlNetOptions";
-import { attachmentRoleLabel, attachmentTitleLabel, moveAttachment } from "../lib/editAttachments";
+import ReferenceImageStrip from "@studio/components/ReferenceImageStrip.vue";
+import {
+  referenceOrdinalBase,
+  reorderReference,
+  stripSetsCanvas,
+} from "@studio/lib/referenceStrip";
 import type { GenerateForm } from "../lib/generateForm";
 import {
   inlineGenerationMediaBytes,
@@ -17,7 +22,7 @@ import {
   sourceConditioningValidationError,
   type InlineGenerationMediaField,
 } from "../lib/generateValidation";
-import { base64ToDataUrl, fileToBase64, isStillImageFile } from "../lib/image";
+import { base64ToDataUrl, fileToBase64 } from "../lib/image";
 import {
   coerceSourceFitForMaskless,
   defaultSourceFitPolicy,
@@ -40,6 +45,13 @@ import SourceMediaWells, { type SourceMediaSlot } from "@studio/components/Sourc
 import MinimaxH3AuthoringPanel from "@studio/components/MinimaxH3AuthoringPanel.vue";
 import NamedViewsPanel from "@studio/components/NamedViewsPanel.vue";
 import { imageDimensionsFromBase64 } from "@studio/lib/imageDimensions";
+import {
+  fileMatchesImageInputFormats,
+  imageInputFormatsSentence,
+  LEGACY_REFERENCE_IMAGE_FORMATS,
+  referenceImageMimeTypes,
+  type ImageInputFormat,
+} from "@studio/lib/referenceImagesProfile";
 import {
   activeNamedViewsProfile,
   namedViewValidationError,
@@ -217,6 +229,14 @@ const referenceMax = computed(() =>
     : plan.value.kind === "single-or-references" || plan.value.kind === "single-and-references"
       ? plan.value.references.max
       : null,
+);
+// Only the `attachments` plan (Qwen edit, FLUX.2 [dev]) carries a
+// requiredness the strip itself answers for — the two-well plans' reference
+// well is never required on its own (the source well covers `single.required`
+// for Klein; IP-Adapter's reference is purely additive), matching web's
+// `plan.required` gate on the same `attachments`-only branch.
+const stripRequired = computed(() =>
+  plan.value.kind === "attachments" ? plan.value.required : false,
 );
 /**
  * The adapter's injection strength, from the recipe alone. `null` — no
@@ -418,18 +438,26 @@ watch(
   { immediate: true },
 );
 
-function isAcceptedImage(file: File): boolean {
-  return (
-    file.type === "image/png" ||
-    file.type === "image/jpeg" ||
-    (!file.type && isStillImageFile(file.name))
-  );
+function isAcceptedImage(
+  file: File,
+  formats: readonly ImageInputFormat[] = LEGACY_REFERENCE_IMAGE_FORMATS,
+): boolean {
+  return fileMatchesImageInputFormats(file, formats);
 }
+
+/** The containers the edit/reference strip takes: the recipe's advertised
+ * `reference_images.formats` (Qwen Image 2.1 adds WebP), PNG/JPEG otherwise.
+ * Picked bytes are kept exactly as chosen — never flattened. */
+const referenceFormats = computed(
+  () => caps.value.referenceImages?.formats ?? LEGACY_REFERENCE_IMAGE_FORMATS.slice(),
+);
+const referenceAccept = computed(() => referenceImageMimeTypes(referenceFormats.value).join(","));
 
 async function readImages(
   event: Event,
   multiple: boolean,
   replacing: InlineGenerationMediaField | null = null,
+  formats: readonly ImageInputFormat[] = LEGACY_REFERENCE_IMAGE_FORMATS,
 ): Promise<Array<{ file: File; b64: string }>> {
   const input = event.target as HTMLInputElement;
   const files = Array.from(input.files ?? []);
@@ -447,8 +475,8 @@ async function readImages(
     error.value = "Combined generation media must be 45 MiB or smaller on this phone.";
     return [];
   }
-  if (files.some((file) => !isAcceptedImage(file))) {
-    error.value = "Only PNG or JPEG photos can be used here.";
+  if (files.some((file) => !isAcceptedImage(file, formats))) {
+    error.value = `Only ${imageInputFormatsSentence(formats)} photos can be used here.`;
     return [];
   }
 
@@ -555,7 +583,7 @@ function removeEndFrame(): void {
 }
 
 async function pickEditImages(event: Event): Promise<void> {
-  const picked = await readImages(event, true);
+  const picked = await readImages(event, true, null, referenceFormats.value);
   if (picked.length === 0) return;
   const establishesTarget =
     plan.value.kind === "attachments" &&
@@ -597,9 +625,20 @@ function removeEditImage(index: number): void {
   props.form.imageAttachments = next;
 }
 
-function moveEditImage(index: number, delta: -1 | 1): void {
-  props.form.imageAttachments = moveAttachment(props.form.imageAttachments, index, delta);
+function moveEditImage(from: number, to: number): void {
+  props.form.imageAttachments = reorderReference(props.form.imageAttachments, from, to);
 }
+
+/** The shared ordered strip: thumbnails numbered the way the prompt names
+ * them, the canvas mark on a `canvas: last-reference` recipe, and an additive
+ * reference numbered after the source it ships beside. */
+const stripImages = computed(() => props.form.imageAttachments.map((data) => ({ data })));
+const stripCanvas = computed(() =>
+  stripSetsCanvas(caps.value.sourceImageMode, caps.value.referenceImages?.canvas),
+);
+const stripOrdinalBase = computed(() =>
+  referenceOrdinalBase(caps.value.sourceImageMode, Boolean(props.form.sourceImage)),
+);
 
 function setSourceFit(event: Event): void {
   props.form.sourceFit = sourceFitPolicyForMode(
@@ -808,78 +847,31 @@ function applyMask(mask: string): void {
         ref="editInput"
         hidden
         type="file"
-        accept="image/png,image/jpeg"
+        :accept="referenceAccept"
         multiple
         data-test="mobile-edit-input"
         tabindex="-1"
         @change="pickEditImages"
       />
-      <button
-        type="button"
-        class="secondary-button mobile-source-pick"
-        data-test="mobile-edit-add"
-        @click="editInput?.click()"
-      >
-        Add photos
-      </button>
-
-      <div
-        v-if="form.imageAttachments.length"
-        class="mobile-attachment-grid"
-        data-test="mobile-edit-grid"
-      >
-        <article
-          v-for="(image, index) in form.imageAttachments"
-          :key="`${index}-${image.slice(0, 16)}`"
-          class="mobile-attachment-card"
-          :data-test="`mobile-edit-card-${index}`"
-        >
-          <img
-            :src="base64ToDataUrl(image)"
-            :alt="`${attachmentRoleLabel(index)} ${attachmentTitleLabel(index)}`"
-          />
-          <div class="mobile-attachment-copy">
-            <strong :data-test="`mobile-edit-role-${index}`">{{
-              referencesOnly ? `Reference ${index + 1}` : attachmentRoleLabel(index)
-            }}</strong>
-            <span :data-test="`mobile-edit-title-${index}`">{{ attachmentTitleLabel(index) }}</span>
-          </div>
-          <div
-            class="mobile-attachment-actions"
-            :aria-label="`${attachmentTitleLabel(index)} actions`"
-          >
-            <button
-              type="button"
-              class="mobile-media-tile-action"
-              :disabled="index === 0"
-              :aria-label="`Move ${attachmentTitleLabel(index)} earlier`"
-              :data-test="`mobile-edit-earlier-${index}`"
-              @click="moveEditImage(index, -1)"
-            >
-              ‹
-            </button>
-            <button
-              type="button"
-              class="mobile-media-tile-action"
-              :disabled="index === form.imageAttachments.length - 1"
-              :aria-label="`Move ${attachmentTitleLabel(index)} later`"
-              :data-test="`mobile-edit-later-${index}`"
-              @click="moveEditImage(index, 1)"
-            >
-              ›
-            </button>
-            <button
-              type="button"
-              class="mobile-media-tile-action is-danger"
-              :aria-label="`Remove ${attachmentTitleLabel(index)}`"
-              :data-test="`mobile-edit-remove-${index}`"
-              @click="removeEditImage(index)"
-            >
-              Remove
-            </button>
-          </div>
-        </article>
-      </div>
+      <!-- One numbered thumbnail per photo, in request order: the shared
+           strip in its touch form (44pt controls, no dragging). Its add tile
+           opens the multi-select photo input above. -->
+      <ReferenceImageStrip
+        :images="stripImages"
+        :first-is-target="plan.kind === 'attachments' && plan.primary === 'target'"
+        :sets-canvas="stripCanvas"
+        :ordinal-base="stripOrdinalBase"
+        :max="referenceMax"
+        :required="stripRequired"
+        touch-friendly
+        add-label="Add photos"
+        empty-label="Add photos"
+        strip-test-id="mobile-reference-strip"
+        test-id-prefix="mobile-"
+        @move="moveEditImage"
+        @remove="removeEditImage"
+        @add="editInput?.click()"
+      />
     </fieldset>
 
     <fieldset

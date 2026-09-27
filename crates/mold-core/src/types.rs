@@ -465,6 +465,12 @@ pub struct ExpandContext {
     /// clients, and then the family alone decides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_mode: Option<crate::generation_profile::PromptRequirement>,
+    /// Whether the render asks for a transparent background
+    /// (`GenerateRequest.transparent_background`). The expander is told to
+    /// describe the subject only; it never sees the engine's RGBA prompt
+    /// wrapper, which is applied after expansion. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_background: Option<bool>,
 }
 
 impl ExpandContext {
@@ -620,6 +626,7 @@ impl ExpandContext {
             references,
             loras,
             prompt_mode,
+            transparent_background: (req.transparent_background == Some(true)).then_some(true),
         }
     }
 
@@ -1940,6 +1947,15 @@ pub struct GenerateRequest {
     /// same falsification case `id_weight` has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_weight: Option<f64>,
+    /// Ask a transparency-capable recipe for a cut-out subject on a
+    /// transparent background (`capabilities.transparency`). Only
+    /// `Some(true)` is meaningful: admission normalizes `Some(false)` to
+    /// `None` ([`Self::normalize_transparent_background`]) and clients send
+    /// nothing otherwise, so an ordinary render is byte-identical. The prompt
+    /// the user wrote is never rewritten; the engine applies the model's
+    /// RGBA prompt recipe (`crate::transparency`) at encode time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_background: Option<bool>,
     /// Ordered heterogeneous MiniMax H3 Ref2VA inputs. Other families retain
     /// their existing source/edit fields and must reject this additive field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2340,6 +2356,16 @@ impl GenerateRequest {
     ///
     /// Every other family is untouched: an unavailable format there is a real
     /// client mistake and stays a 422 from the recipe's own delivery list.
+    /// `transparent_background: false` is the same request as an absent
+    /// field; admission normalizes it away so provenance, fingerprints and
+    /// the queue row carry one spelling of "no".
+    pub fn normalize_transparent_background(&mut self) -> &mut Self {
+        if self.transparent_background != Some(true) {
+            self.transparent_background = None;
+        }
+        self
+    }
+
     pub fn pin_output_format_for_family(&mut self, family: Option<&str>) -> &mut Self {
         if family == Some(crate::manifest::HUNYUAN3D_FAMILY) {
             self.output_format = Some(OutputFormat::Glb);
@@ -2543,6 +2569,12 @@ impl GuidanceCapabilities {
                 if crate::manifest::wan_dmd_ladder(&crate::manifest::resolve_model_name(model))
                     .is_some() =>
             {
+                Self::FIXED_ONE
+            }
+            // A Qwen Image 2.1 turbo tier runs Viggle's 6-step distill at
+            // `true_cfg_scale = 1.0`: one forward per step, no negative
+            // branch (`manifest::qwen_image21_turbo_schedule`).
+            "qwen-image21" if crate::manifest::qwen_image21_turbo_schedule(model).is_some() => {
                 Self::FIXED_ONE
             }
             // The undistilled FLUX.2 [klein] base checkpoints are the one
@@ -2792,6 +2824,11 @@ pub struct GenerateResponse {
     /// Additive; empty on every response that carried no advisory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_warnings: Vec<String>,
+    /// What the render did with its prompt prefix's K/V (Qwen Image 2.1
+    /// only), carried to the print's [`OutputMetadata::prefix_cache`].
+    /// Additive; absent for every other family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_cache: Option<PrefixCacheOutcome>,
 }
 
 /// LTX-2 still-image conditioning preprocessing as actually executed —
@@ -3123,6 +3160,17 @@ pub enum GenerationOutputMode {
     Sequence,
 }
 
+/// What a Qwen Image 2.1 render did with its prompt prefix's K/V
+/// ([`OutputMetadata::prefix_cache`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixCacheOutcome {
+    /// Every CFG branch prefilled once and reused its prefix K/V.
+    Retained,
+    /// At least one branch recomputed its prefix every step.
+    Recomputed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OutputMetadata {
     #[serde(deserialize_with = "crate::prompt_text::deserialize_prompt")]
@@ -3403,6 +3451,27 @@ pub struct OutputMetadata {
     /// print was not made by a workflow — or the host predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh_workflow: Option<crate::mesh_workflow::MeshWorkflowProvenance>,
+    /// A fact about the stored artifact, not the request: `Some(true)` when
+    /// the saved still's container carries an alpha channel (an RGBA PNG, a
+    /// WebP with alpha). Set by the still encoder before the bytes are
+    /// written, so an embedded PNG chunk carries it, and re-derived from the
+    /// container header at publication (`apply_still_output`). Absent means
+    /// no alpha channel, or a print from before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_alpha: Option<bool>,
+    /// Whether a Qwen Image 2.1 render RETAINED its prompt prefix's K/V across
+    /// steps or RECOMPUTED it every step. On the CUDA fast path that is
+    /// decided by the card's free memory, and the two are not bit-identical
+    /// (`pipeline_qwenimage21.py:585-589`), so a print records which one made
+    /// it. Absent for every other family and for older prints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_cache: Option<PrefixCacheOutcome>,
+    /// The request asked for a transparent background
+    /// (`GenerateRequest.transparent_background`). Recorded only when
+    /// `Some(true)`, so an ordinary print's metadata is unchanged; Reuse
+    /// restores the toggle from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_background: Option<bool>,
     pub version: String,
 }
 
@@ -3626,6 +3695,11 @@ impl OutputMetadata {
             fps: req.fps,
             chain_job_id: None,
             chain: None,
+            // A fact about the stored file; the encoder or the publication
+            // path (`apply_still_output`) records it.
+            has_alpha: None,
+            prefix_cache: None,
+            transparent_background: (req.transparent_background == Some(true)).then_some(true),
             version: version.into(),
         }
     }
@@ -3636,6 +3710,20 @@ impl OutputMetadata {
     pub fn apply_output_dimensions(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
+    }
+
+    /// Record the still that was actually produced: its raster size and
+    /// whether its container carries alpha (`has_alpha`), read from the
+    /// encoded header so the gallery row describes the file that exists.
+    /// Record what the engine reported about HOW it rendered — facts the
+    /// request cannot predict (today: Qwen Image 2.1's prefix-cache outcome).
+    pub fn apply_render_facts(&mut self, response: &GenerateResponse) {
+        self.prefix_cache = response.prefix_cache;
+    }
+
+    pub fn apply_still_output(&mut self, image: &ImageData) {
+        self.apply_output_dimensions(image.width, image.height);
+        self.has_alpha = crate::still_image::encoded_still_has_alpha(&image.data).then_some(true);
     }
 
     /// Record the video shape and runtime pipeline that actually completed.
@@ -3720,12 +3808,28 @@ impl OutputFormat {
         }
     }
 
-    /// Whether this format is a video/animation format.
+    /// Whether this format can carry a video/animation.
+    ///
+    /// This answers the REQUEST-side question — "may a video render be
+    /// delivered in this container" — so WebP is included. WebP is also a
+    /// still format (every still recipe advertises it), so a question about
+    /// an existing artifact must ask [`Self::is_video_artifact`] instead.
     pub fn is_video(&self) -> bool {
         matches!(
             self,
             OutputFormat::Gif | OutputFormat::Apng | OutputFormat::Webp | OutputFormat::Mp4
         )
+    }
+
+    /// Whether these encoded bytes, stored in this format, are a
+    /// video/animation. A WebP is decided by its container (an `ANIM` chunk
+    /// or the `VP8X` animation flag); every other format by
+    /// [`Self::is_video`].
+    pub fn is_video_artifact(&self, bytes: &[u8]) -> bool {
+        match self {
+            OutputFormat::Webp => crate::still_image::webp_is_animated(bytes),
+            other => other.is_video(),
+        }
     }
 
     /// Whether this format carries audio samples and no raster frames.
@@ -6669,6 +6773,124 @@ mod tests {
     }
 
     #[test]
+    fn a_webp_artifact_is_a_video_only_when_its_container_animates() {
+        let still = b"RIFF\x0e\x00\x00\x00WEBPVP8 \x02\x00\x00\x00\x00\x00";
+        assert!(
+            OutputFormat::Webp.is_video(),
+            "a video may be delivered as WebP"
+        );
+        assert!(!OutputFormat::Webp.is_video_artifact(still));
+        let animated = b"RIFF\x16\x00\x00\x00WEBPANIM\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        assert!(OutputFormat::Webp.is_video_artifact(animated));
+        assert!(OutputFormat::Mp4.is_video_artifact(b""));
+        assert!(!OutputFormat::Png.is_video_artifact(b""));
+    }
+
+    #[test]
+    fn the_transparency_toggle_is_additive_and_recorded_only_when_on() {
+        let mut req: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "a lantern", "model": "qwen-image-2.1:bf16", "width": 1024,
+            "height": 1024, "steps": 40, "guidance": 4.0, "batch_size": 1
+        }))
+        .unwrap();
+        assert_eq!(req.transparent_background, None);
+        assert!(serde_json::to_value(&req)
+            .unwrap()
+            .get("transparent_background")
+            .is_none());
+        let off = OutputMetadata::from_generate_request(&req, 1, None, "t");
+        assert_eq!(off.transparent_background, None);
+        assert!(serde_json::to_value(&off)
+            .unwrap()
+            .get("transparent_background")
+            .is_none());
+        let context = ExpandContext::for_generation("qwen-image21", &req, None);
+        assert_eq!(context.transparent_background, None);
+
+        req.transparent_background = Some(false);
+        let recorded = OutputMetadata::from_generate_request(&req, 1, None, "t");
+        assert_eq!(recorded.transparent_background, None);
+
+        req.transparent_background = Some(true);
+        let on = OutputMetadata::from_generate_request(&req, 1, None, "t");
+        assert_eq!(on.transparent_background, Some(true));
+        // The user's prompt is stored as written; only the engine wraps it.
+        assert_eq!(on.prompt, "a lantern");
+        let round: OutputMetadata =
+            serde_json::from_value(serde_json::to_value(&on).unwrap()).unwrap();
+        assert_eq!(round.transparent_background, Some(true));
+        let context = ExpandContext::for_generation("qwen-image21", &req, None);
+        assert_eq!(context.transparent_background, Some(true));
+    }
+
+    #[test]
+    fn render_facts_record_the_prefix_cache_outcome_and_round_trip() {
+        let request = serde_json::from_value::<GenerateRequest>(serde_json::json!({
+            "prompt": "p", "model": "qwen-image-2.1:bf16", "width": 8, "height": 8,
+            "steps": 4, "guidance": 1.0, "batch_size": 1
+        }))
+        .unwrap();
+        let mut metadata = OutputMetadata::from_generate_request(&request, 1, None, "v");
+        assert_eq!(metadata.prefix_cache, None);
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert!(json.get("prefix_cache").is_none(), "absent stays absent");
+        let response: GenerateResponse = serde_json::from_value(serde_json::json!({
+            "images": [], "generation_time_ms": 1, "model": "qwen-image-2.1:bf16",
+            "seed_used": 1, "prefix_cache": "recomputed"
+        }))
+        .unwrap();
+        metadata.apply_render_facts(&response);
+        assert_eq!(metadata.prefix_cache, Some(PrefixCacheOutcome::Recomputed));
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(json["prefix_cache"], "recomputed");
+        let back: OutputMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(back.prefix_cache, Some(PrefixCacheOutcome::Recomputed));
+    }
+
+    #[test]
+    fn apply_still_output_records_the_container_alpha() {
+        let mut metadata = OutputMetadata::from_generate_request(
+            &serde_json::from_value::<GenerateRequest>(serde_json::json!({
+                "prompt": "p", "model": "flux-dev:q8", "width": 8, "height": 8,
+                "steps": 4, "guidance": 1.0, "batch_size": 1
+            }))
+            .unwrap(),
+            1,
+            None,
+            "test",
+        );
+        assert_eq!(metadata.has_alpha, None);
+        let mut rgba_png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        rgba_png.extend_from_slice(&13u32.to_be_bytes());
+        rgba_png.extend_from_slice(b"IHDR");
+        rgba_png.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 2, 8, 6, 0, 0, 0]);
+        let image = ImageData {
+            data: rgba_png,
+            format: OutputFormat::Png,
+            width: 4,
+            height: 2,
+            index: 0,
+        };
+        metadata.apply_still_output(&image);
+        assert_eq!((metadata.width, metadata.height), (4, 2));
+        assert_eq!(metadata.has_alpha, Some(true));
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(json["has_alpha"], true);
+
+        let opaque = ImageData {
+            data: vec![0xFF, 0xD8, 0xFF],
+            format: OutputFormat::Jpeg,
+            ..image
+        };
+        metadata.apply_still_output(&opaque);
+        assert_eq!(metadata.has_alpha, None);
+        assert!(serde_json::to_value(&metadata)
+            .unwrap()
+            .get("has_alpha")
+            .is_none());
+    }
+
+    #[test]
     fn output_format_display() {
         assert_eq!(OutputFormat::Png.to_string(), "png");
         assert_eq!(OutputFormat::Jpeg.to_string(), "jpeg");
@@ -7299,6 +7521,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: GenerateRequest = serde_json::from_str(&json).unwrap();
@@ -7555,6 +7778,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("negative_prompt"));
@@ -7639,6 +7863,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("negative_prompt"));
@@ -7926,6 +8151,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         }
     }
 
@@ -8261,6 +8487,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
 
         let metadata = OutputMetadata::from_generate_request(&req, 7, None, "0.1.0");
@@ -8512,6 +8739,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
         let metadata = OutputMetadata::from_generate_request(&req, 1, None, "0.1.0");
         assert_eq!(metadata.negative_prompt.as_deref(), Some("blurry, ugly"));
@@ -8593,6 +8821,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
 
         let metadata =
@@ -8684,6 +8913,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
 
         let metadata = OutputMetadata::from_generate_request(&req, 9, None, "0.1.0");
@@ -9479,6 +9709,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         // Verify base64 encoding is in the JSON
@@ -9566,6 +9797,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("edit_images"));
@@ -9666,6 +9898,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("source_image"));
@@ -9751,6 +9984,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("control_image"));
@@ -9857,6 +10091,7 @@ mod tests {
             id_image_names: None,
             true_cfg: None,
             cfg_start_step: None,
+            transparent_background: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("mask_image"));

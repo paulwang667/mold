@@ -1,7 +1,11 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { reactive } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { flux2KleinRecipe, hunyuan3dRecipe } from "@studio/lib/generationProfile.testFixtures";
+import {
+  flux2KleinRecipe,
+  hunyuan3dRecipe,
+  qwenImage21Recipe,
+} from "@studio/lib/generationProfile.testFixtures";
 import type { ModelEntry } from "../lib/api/types";
 import { MAX_MOBILE_GENERATION_REQUEST_MEDIA_BYTES } from "../lib/generateValidation";
 import { newGenerateForm, type GenerateForm } from "../lib/generateForm";
@@ -323,20 +327,26 @@ describe("MobileSourceControls", () => {
     expect(wrapper.get("[data-test='mobile-source-fit-help']").text()).toContain(
       "conditioning limit: 1 MP from this model",
     );
-    expect(wrapper.get("[data-test='mobile-edit-role-0']").text()).toBe("Target");
-    expect(wrapper.get("[data-test='mobile-edit-role-1']").text()).toBe("Reference");
-    expect(wrapper.get("[data-test='mobile-edit-title-2']").text()).toBe("Picture 3");
+    expect(wrapper.get("[data-test='mobile-reference-role-0']").text()).toBe("Target");
+    expect(wrapper.get("[data-test='mobile-reference-role-1']").text()).toBe("Reference");
+    expect(wrapper.get("[data-test='mobile-reference-label-2']").text()).toBe("Image 3");
 
-    const moveEarlier = wrapper.get("[data-test='mobile-edit-earlier-1']");
-    const remove = wrapper.get("[data-test='mobile-edit-remove-1']");
-    expect(moveEarlier.classes()).toContain("mobile-media-tile-action");
-    expect(remove.classes()).toContain("mobile-media-tile-action");
+    const moveEarlier = wrapper.get("[data-test='mobile-reference-earlier-1']");
+    const remove = wrapper.get("[data-test='mobile-reference-remove-1']");
+    // The shared strip in its touch form: 44pt controls, no dragging.
+    const strip = wrapper.get("[data-test='mobile-reference-strip']");
+    expect(strip.classes()).toContain("ris--touch");
+    expect(strip.element.contains(moveEarlier.element)).toBe(true);
+    expect(strip.element.contains(remove.element)).toBe(true);
+    expect(
+      wrapper.get("[data-test='mobile-reference-tile-0']").attributes("data-reorderable"),
+    ).toBeUndefined();
 
     await moveEarlier.trigger("click");
     expect(form.imageAttachments).toEqual(["REFERENCE-1", "TARGET", "REFERENCE-2"]);
-    await wrapper.get("[data-test='mobile-edit-later-1']").trigger("click");
+    await wrapper.get("[data-test='mobile-reference-later-1']").trigger("click");
     expect(form.imageAttachments).toEqual(["REFERENCE-1", "REFERENCE-2", "TARGET"]);
-    await wrapper.get("[data-test='mobile-edit-remove-1']").trigger("click");
+    await wrapper.get("[data-test='mobile-reference-remove-1']").trigger("click");
     expect(form.imageAttachments).toEqual(["REFERENCE-1", "TARGET"]);
   });
 
@@ -840,5 +850,91 @@ describe("MobileSourceControls - the References strip names its ceiling", () => 
       props: { form: formFor("qwen-image-edit") },
     });
     expect(wrapper.text()).not.toContain("Add up to");
+  });
+
+  // Web passes `:required="plan.required"` to the shared strip; the phone's
+  // add tile must advertise the same aria-required on a required-reference
+  // recipe (Qwen Image Edit) rather than rendering a silently optional one.
+  it("marks the strip required for a required-reference recipe", () => {
+    const wrapper = mount(MobileSourceControls, {
+      props: { form: formFor("qwen-image-edit") },
+    });
+    expect(wrapper.get("[data-test='mobile-reference-add']").attributes("aria-required")).toBe(
+      "true",
+    );
+  });
+});
+
+describe("MobileSourceControls - Qwen Image 2.1 references", () => {
+  function qwen21Model(): ModelEntry {
+    return {
+      ...model("qwen-image-2.1:bf16", "qwen-image21"),
+      generation_profile: {
+        schema_version: 1,
+        profile_id: "qwen-image21",
+        profile_hash: "test",
+        default_recipe_id: "default",
+        recipes: [qwenImage21Recipe()],
+      },
+    } as ModelEntry;
+  }
+
+  it("takes WebP references the recipe advertises and draws them on the alpha bed", async () => {
+    const form = reactive({
+      ...newGenerateForm(),
+      family: "qwen-image21",
+      model: "qwen-image-2.1:bf16",
+    }) as GenerateForm;
+    const wrapper = mount(MobileSourceControls, { props: { form, model: qwen21Model() } });
+
+    const input = wrapper.get("[data-test='mobile-edit-input']");
+    expect(input.attributes("accept")).toBe("image/png,image/jpeg,image/webp");
+    await chooseFiles(wrapper, "[data-test='mobile-edit-input']", [
+      new File(["w"], "cutout.webp", { type: "image/webp" }),
+    ]);
+    // The bytes go out as picked: no re-encode, no flattening.
+    await vi.waitFor(() => expect(form.imageAttachments).toEqual(["dw=="]));
+    expect(wrapper.get("[data-test='mobile-reference-thumb-0']").classes()).toContain(
+      "ms-alpha-bed",
+    );
+  });
+
+  it("numbers Qwen Image 2.1 references and marks the one that sets the canvas", async () => {
+    const form = reactive({
+      ...newGenerateForm(),
+      family: "qwen-image21",
+      model: "qwen-image-2.1:bf16",
+    }) as GenerateForm;
+    form.imageAttachments = ["iVBORA", "iVBORB", "iVBORC"];
+    const wrapper = mount(MobileSourceControls, { props: { form, model: qwen21Model() } });
+
+    expect(
+      [0, 1, 2].map((i) => wrapper.get(`[data-test='mobile-reference-label-${i}']`).text()),
+    ).toEqual(["Image 1", "Image 2", "Image 3"]);
+    expect(wrapper.findAll("[data-test='reference-sets-canvas']")).toHaveLength(1);
+    expect(
+      wrapper
+        .get("[data-test='mobile-reference-tile-2']")
+        .find("[data-test='reference-sets-canvas']")
+        .exists(),
+    ).toBe(true);
+    expect(wrapper.text()).not.toMatch(/\+\d+ more/);
+
+    // The strip's add tile opens the same multi-select photo input.
+    const input = wrapper.get("[data-test='mobile-edit-input']").element as HTMLInputElement;
+    const click = vi.spyOn(input, "click");
+    await wrapper.get("[data-test='mobile-reference-add']").trigger("click");
+    expect(click).toHaveBeenCalledOnce();
+  });
+
+  it("still refuses WebP where the recipe keeps PNG/JPEG", async () => {
+    const form = formFor("qwen-image-edit");
+    const wrapper = mount(MobileSourceControls, { props: { form } });
+    await chooseFiles(wrapper, "[data-test='mobile-edit-input']", [
+      new File(["w"], "cutout.webp", { type: "image/webp" }),
+    ]);
+    await flushPromises();
+    expect(form.imageAttachments).toEqual([]);
+    expect(wrapper.text()).toContain("Only PNG or JPEG photos can be used here.");
   });
 });

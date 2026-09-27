@@ -52,7 +52,8 @@ The expander budget is 700 words per route. Word limits below are the corpus def
 | `qwen-image-distill` | `qwen-image` | `shared.md`, `families/qwen-image.md`, `models/qwen-image-flash.md` | 180 | 567 |
 | `qwen-image-edit-2511` | `qwen-image-edit` | `shared.md`, `families/qwen-image-edit.md` | 100 | 513 |
 | `qwen-image-edit-lightning` | `qwen-image-edit` | `shared.md`, `families/qwen-image-edit.md`, `models/qwen-image-edit-lightning.md` | 100 | 594 |
-| `qwen-image-2.1` | `qwen-image21` | `shared.md`, `families/qwen-image21.md` | 180 | 417 |
+| `qwen-image-2.1` | `qwen-image21` | `shared.md`, `families/qwen-image21.md` | 180 | 528 |
+| `qwen-image-2.1-turbo` | `qwen-image21` | `shared.md`, `families/qwen-image21.md`, `models/qwen-image-2.1-turbo.md` | 180 | 632 |
 | `wuerstchen-v2` | `wuerstchen` | `shared.md`, `families/wuerstchen.md` | 50 | 325 |
 | `hunyuan3d-mini-turbo` | `hunyuan3d` | `shared.md`, `families/hunyuan3d.md` | 40 | 616 |
 | `hunyuan3d-turbo` | `hunyuan3d` | `shared.md`, `families/hunyuan3d.md` | 40 | 616 |
@@ -1054,10 +1055,18 @@ explicitly enables classifier-free guidance with a value greater than one.
 
 #### Generation context
 
-Mold currently exposes this checkpoint as text-to-image only. Use a canvas
-whose width and height are multiples of 32; the native 1024x1024 recipe is the
-default. The model's standard quality recipe uses forty denoising steps and
-guidance 1, so no negative prompt is needed for normal generation.
+One model covers text-to-image, editing and multi-reference composition: up
+to ten ordered reference images ride the request, and none of them is a
+special "source". With references attached, write the change or the new
+scene and refer to the pictures by position ("the woman in image 1", "the
+jacket from image 2"). An edit instruction can be short, such as "Change the
+background to a sunset beach". Canvases are multiples of 32; 1024x1024 is the
+default and the native 2K sizes are 2048x2048, 2400x1792, 2528x1696 and
+2752x1536 (and their portrait turns). The standard recipe uses forty steps.
+
+For a transparent background, describe only the subject: no scenery,
+backdrop or floor. Mold adds the model card's transparency wording itself,
+so the prompt never needs to mention transparency, alpha or a background.
 
 #### Examples
 
@@ -1080,25 +1089,40 @@ photography, low eye-level composition, finely detailed natural light.
 
 - A vague request for lettering does not specify the characters to render;
   write the exact string in quotation marks.
-- Do not rely on image-reference, source-image, mask, ControlNet, or LoRA
-  wording in a prompt: those inputs are not exposed for this first Mold
-  integration.
+- References are addressed by their order, not by describing their pixels;
+  never invent what an attached image shows.
+- A transparent render wants an isolated subject. Scenery words ("in a
+  forest", "on a table") fight the transparent background.
+- There is no mask or ControlNet input; describe a local edit in words.
 - Very crowded compositions and many independent text blocks compete for the
   same canvas. Give the principal subject and the important lettering clear
   spatial priority.
 
 #### CLI
 
+With `--transparent`, the engine wraps the positive prompt in the model card's
+RGBA recipe, putting
+"This is an RGBA image with transparency." before it and
+"The image has alpha channel and the background is transparent." after it.
+The stored prompt, Reuse and Expand keep the unwrapped words, so never write
+either sentence into a prompt yourself: it would be wrapped twice.
+
 ```bash
 mold run qwen-image-2.1:bf16 \
   'Straight-on editorial photograph of a tiny artisan bakery named "MOLD & FLOUR" on a quiet European corner, deep teal facade, three arched windows, striped awning, sunny spring morning, crisp realistic detail, balanced composition' \
   --seed 210001
+mold run qwen-image-2.1:bf16 "Put the jacket from image 1 on the person in image 2" \
+  --image jacket.png --image person.jpg
+mold run qwen-image-2.1:bf16 "A red paper lantern with a gold tassel" \
+  --transparent --format webp --output lantern.webp
+mold run qwen-image-2.1-turbo "A lighthouse on a basalt cliff at dusk, oil painting" --seed 7
 ```
 
 #### Sources
 
 - https://huggingface.co/Qwen/Qwen-Image-2.1
 - https://github.com/QwenLM/Qwen-Image
+- https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo
 
 <!-- families/qwen-image-edit.md -->
 
@@ -2167,6 +2191,44 @@ mold run qwen-image-lightning:fp8-8step "A snowy mountain village at blue hour, 
 
 - https://raw.githubusercontent.com/QwenLM/Qwen-Image/main/src/examples/tools/prompt_utils.py
 - https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning
+
+<!-- models/qwen-image-2.1-turbo.md -->
+
+Models: `qwen-image-2.1-turbo`.
+
+### Qwen Image 2.1 turbo prompting
+
+Covers `qwen-image-2.1-turbo`: the base weights plus Viggle's 6-step distilled
+adapter.
+
+#### Prompt style
+
+Write the same direct, complete description as for the base model, under
+180 words. The student was distilled against prompt-enhanced
+targets, so describing subject, setting, composition and lighting helps.
+
+#### Syntax
+
+Guidance is fixed at 1.0, so there is no negative prompt. Quoted text,
+ordinal references ("image 1") and transparency behave as on the base model.
+
+#### Pitfalls
+
+Small or long lettering garbles more often than with the 40-step base; keep
+it short and large. Complicated edits (several references, face swaps,
+identity-preserving changes) can ghost subjects; ask for one clear change.
+
+#### CLI
+
+```bash
+mold run qwen-image-2.1-turbo "A studio portrait of an old fisherman mending a net, warm rim light, 85mm" --seed 0
+mold run qwen-image-2.1-turbo:int8-conv "Replace the background with a sunset beach, keep the subject unchanged" --image portrait.png
+```
+
+#### Sources
+
+- https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo
+- https://huggingface.co/Qwen/Qwen-Image-2.1
 
 <!-- models/qwen-image-edit-lightning.md -->
 

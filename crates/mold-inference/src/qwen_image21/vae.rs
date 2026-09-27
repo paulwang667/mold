@@ -12,17 +12,18 @@ use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{conv2d, Conv2d, Conv2dConfig, VarBuilder};
 use std::path::Path;
 
+use super::banded_conv::{banded_conv2d, BandedConv2d};
 use super::QWEN_IMAGE_21_LATENT_CHANNELS;
 
 const DECODER_BASE_DIM: usize = 144;
-const DIM_MULT: [usize; 5] = [1, 2, 4, 8, 8];
-const NUM_RES_BLOCKS: usize = 2;
+pub(super) const DIM_MULT: [usize; 5] = [1, 2, 4, 8, 8];
+pub(super) const NUM_RES_BLOCKS: usize = 2;
 const VAE_ATTN_CHUNK_ROWS: usize = 1024;
 
 // These are checkpoint parameters, not approximations of mathematical
 // constants (one happens to be close to `FRAC_PI_6`).
 #[allow(clippy::approx_constant)]
-const LATENTS_MEAN: [f64; QWEN_IMAGE_21_LATENT_CHANNELS] = [
+pub(super) const LATENTS_MEAN: [f64; QWEN_IMAGE_21_LATENT_CHANNELS] = [
     0.5126, 0.7721, -0.0631, 1.3506, -0.7855, -2.1025, -0.3458, 1.3722, 1.8873, -1.7177, -0.6510,
     0.2732, 0.7562, -0.6163, -1.0277, 3.8363, 2.0210, 0.0472, 0.9320, 2.0087, 2.4954, -0.1391,
     -1.4249, 1.8464, -0.5236, 1.2826, 3.7046, -1.3035, 2.7286, -1.4518, -1.9036, -1.9955, -0.0342,
@@ -31,7 +32,7 @@ const LATENTS_MEAN: [f64; QWEN_IMAGE_21_LATENT_CHANNELS] = [
     1.8505, 0.3026, 1.9373, 1.4937, 0.2632, 0.5547, -1.7121, -0.1562, 0.0304,
 ];
 
-const LATENTS_STD: [f64; QWEN_IMAGE_21_LATENT_CHANNELS] = [
+pub(super) const LATENTS_STD: [f64; QWEN_IMAGE_21_LATENT_CHANNELS] = [
     3.2001, 3.2936, 3.4321, 3.0091, 3.1061, 4.0379, 4.0705, 3.7910, 3.0785, 3.6500, 3.9308, 3.0904,
     2.8778, 3.7675, 3.7320, 5.0756, 3.2864, 4.0397, 3.1317, 4.0443, 2.9249, 3.9454, 3.0988, 4.2489,
     3.4896, 3.8513, 3.9323, 3.4719, 3.7498, 4.2830, 3.5694, 4.2467, 3.9037, 3.2947, 5.0770, 3.5075,
@@ -45,7 +46,7 @@ const LATENTS_STD: [f64; QWEN_IMAGE_21_LATENT_CHANNELS] = [
 /// `F.normalize(x, dim=1) * sqrt(channels) * gamma` simplifies to
 /// `x / RMS_channel(x) * gamma`; `gamma` is stored as `[C, 1, 1]` for image
 /// attention and `[C, 1, 1, 1]` for residual/decoder feature tensors.
-struct RmsNorm2d {
+pub(super) struct RmsNorm2d {
     gamma: Tensor,
 }
 
@@ -56,7 +57,7 @@ impl RmsNorm2d {
         })
     }
 
-    fn feature(channels: usize, vb: VarBuilder<'_>) -> Result<Self> {
+    pub(super) fn feature(channels: usize, vb: VarBuilder<'_>) -> Result<Self> {
         Ok(Self {
             gamma: vb
                 .get((channels, 1, 1, 1), "gamma")?
@@ -64,7 +65,7 @@ impl RmsNorm2d {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let dtype = xs.dtype();
         let f32_x = xs.to_dtype(DType::F32)?;
         let channels = xs.dim(1)?;
@@ -129,25 +130,25 @@ impl AttentionBlock2d {
     }
 }
 
-struct ResidualBlock2d {
+pub(super) struct ResidualBlock2d {
     norm1: RmsNorm2d,
-    conv1: Conv2d,
+    conv1: BandedConv2d,
     norm2: RmsNorm2d,
-    conv2: Conv2d,
+    conv2: BandedConv2d,
     shortcut: Option<Conv2d>,
 }
 
 impl ResidualBlock2d {
-    fn new(in_dim: usize, out_dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
+    pub(super) fn new(in_dim: usize, out_dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
         let conv_cfg = Conv2dConfig {
             padding: 1,
             ..Default::default()
         };
         Ok(Self {
             norm1: RmsNorm2d::feature(in_dim, vb.pp("norm1"))?,
-            conv1: conv2d(in_dim, out_dim, 3, conv_cfg, vb.pp("conv1"))?,
+            conv1: banded_conv2d(in_dim, out_dim, 3, conv_cfg, vb.pp("conv1"))?,
             norm2: RmsNorm2d::feature(out_dim, vb.pp("norm2"))?,
-            conv2: conv2d(out_dim, out_dim, 3, conv_cfg, vb.pp("conv2"))?,
+            conv2: banded_conv2d(out_dim, out_dim, 3, conv_cfg, vb.pp("conv2"))?,
             shortcut: (in_dim != out_dim)
                 .then(|| {
                     conv2d(
@@ -162,7 +163,7 @@ impl ResidualBlock2d {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let shortcut = match &self.shortcut {
             Some(conv) => conv.forward(xs)?,
             None => xs.clone(),
@@ -177,14 +178,14 @@ impl ResidualBlock2d {
     }
 }
 
-struct MidBlock2d {
+pub(super) struct MidBlock2d {
     resnet0: ResidualBlock2d,
     attention: AttentionBlock2d,
     resnet1: ResidualBlock2d,
 }
 
 impl MidBlock2d {
-    fn new(dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
+    pub(super) fn new(dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
         Ok(Self {
             resnet0: ResidualBlock2d::new(dim, dim, vb.pp("resnets").pp("0"))?,
             attention: AttentionBlock2d::new(dim, vb.pp("attentions").pp("0"))?,
@@ -192,7 +193,7 @@ impl MidBlock2d {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         self.resnet1
             .forward(&self.attention.forward(&self.resnet0.forward(xs)?)?)
     }
@@ -257,7 +258,7 @@ fn duplicate_upsample_shortcut(
 
 struct ResidualUpBlock2d {
     resnets: Vec<ResidualBlock2d>,
-    upsampler: Option<Conv2d>,
+    upsampler: Option<BandedConv2d>,
     out_dim: usize,
     temporal_upsample: bool,
 }
@@ -281,7 +282,7 @@ impl ResidualUpBlock2d {
             current_dim = out_dim;
         }
         let upsampler = if upsample {
-            Some(conv2d(
+            Some(banded_conv2d(
                 out_dim,
                 out_dim,
                 3,
@@ -324,11 +325,11 @@ impl ResidualUpBlock2d {
 }
 
 struct Decoder2d {
-    conv_in: Conv2d,
+    conv_in: BandedConv2d,
     mid_block: MidBlock2d,
     up_blocks: Vec<ResidualUpBlock2d>,
     norm_out: RmsNorm2d,
-    conv_out: Conv2d,
+    conv_out: BandedConv2d,
 }
 
 impl Decoder2d {
@@ -355,7 +356,7 @@ impl Decoder2d {
         }
         let final_dim = *dimensions.last().expect("decoder dimensions are non-empty");
         Ok(Self {
-            conv_in: conv2d(
+            conv_in: banded_conv2d(
                 QWEN_IMAGE_21_LATENT_CHANNELS,
                 dimensions[0],
                 3,
@@ -368,7 +369,7 @@ impl Decoder2d {
             mid_block: MidBlock2d::new(dimensions[0], vb.pp("mid_block"))?,
             up_blocks,
             norm_out: RmsNorm2d::feature(final_dim, vb.pp("norm_out"))?,
-            conv_out: conv2d(
+            conv_out: banded_conv2d(
                 final_dim,
                 4,
                 3,
@@ -480,6 +481,11 @@ impl QwenImage21Vae {
         let latents = latents
             .broadcast_mul(&self.latents_std)?
             .broadcast_add(&self.latents_mean)?;
+        // Every canvas v0.32 could render decodes unbanded (its exact bytes);
+        // a 2K canvas bands its im2col column buffers at 2 GiB.
+        let scale = super::QWEN_IMAGE_21_VAE_SCALE_FACTOR;
+        let pixels = (latent_height * scale * latent_width * scale) as u64;
+        let _band = super::banded_conv::BandScope::for_canvas(pixels);
         self.decoder
             .forward(&self.post_quant_conv.forward(&latents)?)?
             .clamp(-1.0f32, 1.0f32)
