@@ -148,6 +148,7 @@ gate.
 | [vLLM-Omni](https://github.com/vllm-project/vllm-omni/tree/3d7fc3b9ba3cac88d579d4dc35b78b0b641675fc)                                | `3d7fc3b9ba3cac88d579d4dc35b78b0b641675fc` | Loader, offload, and CUDA-kernel reference only                   |
 | [Abiray pruned NVFP4 checkpoints](https://huggingface.co/Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot/tree/908eccad7e68751190d04c171956f163bfeed741) | `908eccad7e68751190d04c171956f163bfeed741` | Pruned NVFP4 transformer identities (download-only, no runtime arm) |
 | [lightx2v Turbo LoRA adapters](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/05ef678438e84933c406131b59abbf86919b3aac)      | `05ef678438e84933c406131b59abbf86919b3aac` | Turbo LoRA adapter identities (v1.1 4-step 768p, v1.0 8-step 768p) |
+| [lightx2v Ref2V 8-step 768p Turbo LoRA adapter](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/0eebcc7e79f9cb200927c80b8e7595265b770e34) | `0eebcc7e79f9cb200927c80b8e7595265b770e34` | Turbo LoRA adapter identity (Ref2V v1.0 8-step 768p; first published at this revision) |
 | [drbaph SVD-resized rank-21 Turbo LoRA adapters](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/tree/be8eb3ea3466cbb7def202ffec0d2fdc054256ac) | `be8eb3ea3466cbb7def202ffec0d2fdc054256ac` | Turbo LoRA adapter identities (three lossy rank-21 resizes) |
 
 Only Diffusers' official BF16/FP32 mixed execution is the current numerical
@@ -1579,6 +1580,71 @@ enumeration.
 - `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-r21` — Decision: SHIP
   (maintainer call, 2026-09-02, PR #1555; measured band 16.15 dB at 768x768 /
   17.00 dB at 1344x768).
+
+### The Ref2VA 8-step 768p and draft-strength tiers (2026-09-28)
+
+Two more Ref2VA Turbo tags, both on the Ref2VA compact stack.
+
+**`minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p`** takes lightx2v's
+`minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors` — 1,956,193,000
+bytes, LFS SHA-256
+`6a56f41ab4229c9dd845b9501bbd475ee57e112d846cf2e819d534a1ae928c5a`, header
+length 73,632, header identity
+`a00789bea7db0e9488317a55cd97e04a786eef79a687167cdae75c2178112a39`. The file
+does not exist at the repository's original pin `05ef6784…`; it was first
+published by lightx2v commit `0eebcc7e79f9cb200927c80b8e7595265b770e34`
+("Upload folder using huggingface_hub", 2026-09-03), which is pinned for THIS
+file only (`file_revision` keys on the exact `(repo, path)` pair). The two FL2V
+adapters keep `05ef6784…`: their LFS digests are identical at both revisions,
+so moving them would change recorded provenance for no content change. The
+golden header was captured with `scripts/fetch-minimax-h3-turbo-header.py`
+and is the rank-uniform PEFT shape exactly: 624 tensors (416 BF16
+`lora_A`/`lora_B` + 208 F32 `alpha`) over the same 208 modules — 50 blocks and
+2 token refiners x `attn.qkv_proj` / `attn.out_proj` / `mlp.fc1` / `mlp.fc2` —
+with the same key set, shapes and dtypes as the Ref2V 4-step v0.1 adapter,
+`training_rank "128"`, `training_alpha "8.0"`, `training_scale "0.0625"`, and
+`base_model "Comfy-Org/MiniMax-H3 minimax_h3_fl2va_bf16.safetensors"`. It
+carries **no** `final_layer` / `adaln_proj` tensor: a community report of
+ComfyUI logging an unexpected `diffusion_model.final_layer.adaln_proj.linear.weight`
+(discussion #51) does not reproduce against this file, nor against the
+Diffusers export beside it (624 tensors, `transformer_blocks` + token
+refiners only). The contract would refuse such a key by name rather than skip
+it.
+
+**Its schedule is 8 forwards (9 terminal-inclusive points) with Euler at video
+shift 12 / audio shift 3.** That is TRANSCRIBED from the publisher's own
+release note (lightx2v, discussion #51, 2026-09-03: "Steps: 8 / Video shift:
+12 / Audio shift: 3 / Sampler: Euler / Resolution: Up to 768p"). ModelTC's
+spec table (`02e26d59`) and the model card have no row for this adapter. Two
+third-party pages say 6 — vllm-omni's MiniMax-H3 recipe, which states that it
+reads the shift from the FILENAME, and a comfyui-wiki news post citing a
+spec-table row that does not exist — i.e. they infer "768p means 6" from the
+FL2V 768p tiers. Mold follows the publisher and records the disagreement on
+`H3_TURBO_768P_VIDEO_SHIFT`. The sigma construction is the FL2V 8-step tier's
+(the Comfy simple grid, as for every Turbo tier). **No mold render of this
+tier has been made yet**; a shift 12 vs 6 A/B on a GPU host is the obvious
+first measurement, and a one-row change follows if it prefers 6.
+
+**`minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050`** is a DRAFT tier:
+the Ref2VA 4-step v0.1 adapter (`-turbo-4step`'s exact file — same repository,
+revision, path, size and digest) applied at `adapter_strength` 0.5, so every
+module's delta is `(alpha / rank) x 0.5` = 0.03125. It keeps the 5-point
+schedule and shift 12. The strength is a first-class tier fact on both tables
+(`TurboManifestTier::adapter_strength`, `H3TurboLoraTier::adapter_strength`,
+`1.0` for every other tier), is folded into the adapter identity whenever it
+is not `1.0` (so no frozen plan, cache or admission record can confuse the
+two), and the draft tag shares the 4-step tag's on-disk adapter, so a host
+that holds `-turbo-4step` pulls nothing new for it.
+
+Why it exists (measured 2026-09-28 on the deployer's server; the evidence
+lives with the deployer, not in this repository): the v0.1 Ref2V 4-step
+adapter at strength 1.0 systematically places the subject left of centre.
+Mirroring every reference image does not move it, and the same prompt on the
+undistilled 21-step checkpoint is centred. Strength 0.75 half-corrects the
+placement, 0.5 corrects both probe shots, and 0.25 is close to the
+undistilled render; 384x672 draft frames at 0.5 show no obvious softening.
+The tier is labelled a draft/preview tier everywhere it is named; a
+full-resolution quality comparison against `-turbo-4step` has not been run.
 
 ### What is derived, and how
 

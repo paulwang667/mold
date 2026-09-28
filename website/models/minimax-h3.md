@@ -122,6 +122,8 @@ throughput claim.
 | `minimax-h3-fl2va:comfy-pruned-int8-turbo-8step-r21`       | FL2VA + reviewed Turbo 8-step LoRA, rank 21 (9 steps)      |  42.809 GB | CUDA/Metal generation; first-frame profile |
 | `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step`          | Ref2VA + reviewed Turbo 4-step LoRA (5 steps)              |  44.438 GB | CUDA/Metal generation; reference profile   |
 | `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-r21`      | Ref2VA + reviewed Turbo 4-step LoRA, rank 21 (5 steps)     |  42.809 GB | CUDA/Metal generation; reference profile   |
+| `minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p`     | Ref2VA + reviewed Turbo 8-step 768p LoRA (9 steps)         |  44.438 GB | CUDA/Metal generation; reference profile   |
+| `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050`     | Ref2VA + Turbo 4-step LoRA at strength 0.5, draft (5 steps) |  44.438 GB | CUDA/Metal generation; reference profile   |
 | `minimax-h3-ref2va:comfy-pruned-int8`                      | Reference media to video with audio                        |  42.482 GB | CUDA/Metal generation; ordered references  |
 | `minimax-h3-fl2va:comfy-pruned-nvfp4`                      | First/last-frame conditioning with audio                   |  34.040 GB | Downloadable; execution unavailable        |
 | `minimax-h3-ref2va:comfy-pruned-nvfp4`                     | Reference media to video with audio                        |  34.040 GB | Downloadable; execution unavailable        |
@@ -193,6 +195,8 @@ mold pull minimax-h3-fl2va:comfy-pruned-int8-turbo-4step-768p-r21
 mold pull minimax-h3-fl2va:comfy-pruned-int8-turbo-8step-r21
 mold pull minimax-h3-ref2va:comfy-pruned-int8
 mold pull minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-r21
+mold pull minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p
+mold pull minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050
 ```
 
 The files are revision-pinned and SHA-256 verified before Mold marks the model
@@ -240,6 +244,18 @@ for the three lossy SVD-resized rank-21 tiers below — 298,177,224 bytes,
   1.60-1.70 GB less resident VRAM on an L40S (2026-09-02), matching the about
   1.63 GB (Ref2VA) derived from the adapter payload; 98.33% average Frobenius
   retention against the full-rank `-turbo-4step` adapter it was resized from
+- `minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p`: 9 terminal-inclusive
+  sampler grid points (8 model evaluations) with Euler at video shift 12 /
+  audio shift 3, the settings lightx2v's release note recommends for this
+  768p-trained Ref2V adapter (the FL2V 768p tiers use shift 6) — the
+  full-quality Ref2VA Turbo tier
+- `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050`: a **draft/preview**
+  tier — the `-turbo-4step` adapter applied at strength 0.5 (every LoRA delta
+  halved), 5 terminal-inclusive sampler grid points. At full strength the
+  v0.1 Ref2V 4-step adapter tends to place the subject left of centre; half
+  strength corrected it in the maintainers' probes (2026-09-28) with no
+  obvious softening at draft resolution. It shares the `-turbo-4step` tag's
+  adapter file, so if `-turbo-4step` is installed it downloads nothing new
 
 An adapter is reviewed for exactly one task partition, so a `ref2v` adapter
 can never mint an FL2VA qualification and vice versa. Each `-r21` tier
@@ -316,6 +332,18 @@ the base checkpoint each tag executes on. Every adapter, whichever source it
 comes from, lands at the same `shared/minimax-h3/loras/` path keyed by its own
 basename.
 
+The Ref2VA `-turbo-8step-768p` tag pulls
+`minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors`
+(1,956,193,000 bytes, SHA-256 `6a56f41a…a1ae928c5a`) from the same lightx2v
+repository root, but at the later pinned revision
+[`0eebcc7e79f9cb200927c80b8e7595265b770e34`](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/0eebcc7e79f9cb200927c80b8e7595265b770e34)
+— the first revision that publishes it — bringing that variant to
+44,438,283,318 bytes (44.438 GB). The Ref2VA `-turbo-4step-s050` draft tag
+pins exactly the `-turbo-4step` adapter file (same repository, revision, path,
+size, and digest) and stores it at the same path, so the two tags share one
+copy: pulling either one after the other downloads nothing new, and removing
+one keeps the adapter while the other is installed.
+
 The `-turbo-4step-768p-r21`, `-turbo-8step-r21`, and Ref2VA `-turbo-4step-r21`
 tags pull a third, smaller adapter from a THIRD third-party source:
 [`drbaph/MiniMax-H3-Turbo-Lora-ComfyUI`](https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI/tree/be8eb3ea3466cbb7def202ffec0d2fdc054256ac)
@@ -364,7 +392,9 @@ The current compact implementation supports this request profile:
   the default and the floor: below it the print flashes once per latent
   frame); a reviewed Turbo tag instead requires exactly its tier's own count
   (9 for `-turbo-8step`, `-turbo-8step-768p`, and `-turbo-8step-r21`, 5 for
-  `-turbo-4step-768p`, `-turbo-4step-768p-v1.1`, and `-turbo-4step-768p-r21`),
+  `-turbo-4step-768p`, `-turbo-4step-768p-v1.1`, and `-turbo-4step-768p-r21`;
+  on Ref2VA, 9 for `-turbo-8step-768p` and 5 for `-turbo-4step`,
+  `-turbo-4step-r21`, and `-turbo-4step-s050`),
   because that count is the distilled adapter's own schedule length
 - one required first-frame image; the current compact runtime refuses a
   closing endpoint
