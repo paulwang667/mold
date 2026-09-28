@@ -1063,6 +1063,15 @@ where
         self.components.sampler_kind()
     }
 
+    /// Forwarded with the integrator, never left to the trait default: the
+    /// default is the family's 12, and a wrapped face whose frozen authority
+    /// declares another shift (the 768p-trained Turbo tiers' 6) would
+    /// otherwise build its sigma grid at 12 while every other layer reported
+    /// the tier's own value.
+    fn sampler_video_shift(&self) -> f32 {
+        self.components.sampler_video_shift()
+    }
+
     fn encode_text(
         &mut self,
         prompt: &str,
@@ -1174,6 +1183,13 @@ where
 
     fn sampler_kind(&self) -> H3SamplerKind {
         self.components.sampler_kind()
+    }
+
+    /// Forwarded for the same reason as the FL2VA wrapper's: the trait
+    /// default is the family's 12, which is only right for a Ref2VA tier
+    /// whose declared shift happens to be 12.
+    fn sampler_video_shift(&self) -> f32 {
+        self.components.sampler_video_shift()
     }
 
     fn maximum_packed_rows(&self) -> usize {
@@ -2451,6 +2467,8 @@ mod tests {
         device: Device,
         identity: H3PipelineBackendIdentity,
         trace: Arc<Mutex<Vec<&'static str>>>,
+        sampler_kind: H3SamplerKind,
+        sampler_video_shift: f32,
     }
 
     impl H3Ref2VaBackend for StructuralRefComponents {
@@ -2460,6 +2478,14 @@ mod tests {
 
         fn device(&self) -> &Device {
             &self.device
+        }
+
+        fn sampler_kind(&self) -> H3SamplerKind {
+            self.sampler_kind
+        }
+
+        fn sampler_video_shift(&self) -> f32 {
+            self.sampler_video_shift
         }
 
         fn maximum_packed_rows(&self) -> usize {
@@ -2623,6 +2649,69 @@ mod tests {
         }
     }
 
+    /// The composed Ref2VA backend answers the WRAPPED face's integrator and
+    /// video shift. Before this forwarded, the wrapper fell back to the trait
+    /// default of 12 for every tier, so a Ref2VA tier declaring any other
+    /// shift would have sampled a different sigma grid than its frozen
+    /// authority named.
+    #[test]
+    fn the_streamed_ref2va_wrapper_forwards_the_declared_sampler_and_shift() {
+        let identity = H3PipelineBackendIdentity {
+            kind: crate::minimax_h3::pipeline::H3PipelineBackendKind::SyntheticCpu,
+            device_id: "gpu-0".into(),
+            execution_fingerprint: EXECUTION.into(),
+        };
+        for (kind, shift) in [
+            (H3SamplerKind::ComfyEuler, 6.0f32),
+            (
+                H3SamplerKind::ComfyEuler,
+                crate::minimax_h3::sampler::H3_VIDEO_SHIFT,
+            ),
+            (
+                H3SamplerKind::ComfyResMultistep,
+                crate::minimax_h3::sampler::H3_VIDEO_SHIFT,
+            ),
+        ] {
+            let composed = H3StreamedRef2VaPipelineBackend::new(
+                StructuralRefComponents {
+                    device: Device::Cpu,
+                    identity: identity.clone(),
+                    trace: Arc::new(Mutex::new(Vec::new())),
+                    sampler_kind: kind,
+                    sampler_video_shift: shift,
+                },
+                StructuralDenoiser {
+                    identity: identity.clone(),
+                    trace: Arc::new(Mutex::new(Vec::new())),
+                },
+                sha('c'),
+            )
+            .unwrap();
+            assert_eq!(composed.sampler_kind(), kind);
+            assert_eq!(composed.sampler_video_shift().to_bits(), shift.to_bits());
+        }
+    }
+
+    /// Source-level pin for BOTH streamed wrappers: every impl block in this
+    /// file that forwards `sampler_kind` to its components must forward
+    /// `sampler_video_shift` beside it. The FL2VA wrapper has no synthetic
+    /// component double to exercise it behaviourally, and the two must never
+    /// drift apart again.
+    #[test]
+    fn every_streamed_wrapper_forwards_the_video_shift_with_the_integrator() {
+        let source = include_str!("engine.rs");
+        let body = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let integrator =
+            "fn sampler_kind(&self) -> H3SamplerKind {\n        self.components.sampler_kind()";
+        let shift =
+            "fn sampler_video_shift(&self) -> f32 {\n        self.components.sampler_video_shift()";
+        assert_eq!(body.matches(integrator).count(), 2);
+        assert_eq!(
+            body.matches(shift).count(),
+            body.matches(integrator).count()
+        );
+    }
+
     #[cfg(feature = "mp4")]
     #[test]
     fn ref2va_runtime_executes_exact_composed_streamed_backend_authority() {
@@ -2638,6 +2727,8 @@ mod tests {
                 device: Device::Cpu,
                 identity: identity.clone(),
                 trace: Arc::clone(&trace),
+                sampler_kind: H3SamplerKind::OfficialEuler,
+                sampler_video_shift: crate::minimax_h3::sampler::H3_VIDEO_SHIFT,
             },
             StructuralDenoiser {
                 identity,
