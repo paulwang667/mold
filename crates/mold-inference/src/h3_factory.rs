@@ -3377,6 +3377,7 @@ fn validate_target_budget(
             .checked_mul(32 * 4)
             .ok_or_else(|| anyhow!("H3 target audio latent bytes overflow"))?
     );
+    // The builder charges visual + audio (private_opened_evidence).
     expect_eq!(
         "condition_latent_backing_device_bytes",
         memory.condition_latent_backing_device_bytes,
@@ -3385,19 +3386,39 @@ fn validate_target_budget(
             .condition_visual_rows
             .checked_mul(96 * 4)
             .ok_or_else(|| anyhow!("H3 condition latent bytes overflow"))?
+            .checked_add(
+                request
+                    .rows
+                    .condition_audio_rows
+                    .checked_mul(32 * 4)
+                    .ok_or_else(|| anyhow!("H3 condition audio latent bytes overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("H3 condition latent bytes overflow"))?
     );
+    // The builder splits condition latents BY MODALITY: visual rows land in the
+    // video packed state, audio rows in the audio one.
     expect_eq!(
         "packed_video_state_device_bytes",
         memory.packed_video_state_device_bytes,
-        memory
-            .condition_latent_backing_device_bytes
+        request
+            .rows
+            .condition_visual_rows
+            .checked_mul(96 * 4)
+            .ok_or_else(|| anyhow!("H3 condition visual latent bytes overflow"))?
             .checked_add(memory.target_video_latent_device_bytes)
             .ok_or_else(|| anyhow!("H3 packed video state bytes overflow"))?
     );
+    // Ref2VA's audio condition rows belong here.
     expect_eq!(
         "packed_audio_state_device_bytes",
         memory.packed_audio_state_device_bytes,
-        memory.target_audio_latent_device_bytes
+        request
+            .rows
+            .condition_audio_rows
+            .checked_mul(32 * 4)
+            .ok_or_else(|| anyhow!("H3 condition audio latent bytes overflow"))?
+            .checked_add(memory.target_audio_latent_device_bytes)
+            .ok_or_else(|| anyhow!("H3 packed audio state bytes overflow"))?
     );
     expect_eq!(
         "packed_layout_device_bytes",

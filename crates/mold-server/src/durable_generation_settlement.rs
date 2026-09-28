@@ -519,7 +519,19 @@ pub(crate) fn settle_completion_blocking(
     for attempt in 1..=MAX_EXACT_ATTEMPTS {
         let job_id = owned.id().to_string();
         match owned.complete_exact_with_result(Some(result_json)) {
-            RetainOutcome::Released | RetainOutcome::Stale => return SettlementOutcome::Settled,
+            RetainOutcome::Released => return SettlementOutcome::Settled,
+            // A stale ticket means the commit matched no row: the completion
+            // was DISCARDED. Reporting it as `Settled` is how a durable row
+            // that never left `Queued` becomes an unresolvable predecessor
+            // for every later row, with nothing in the log to say so.
+            RetainOutcome::Stale => {
+                tracing::error!(
+                    job = %job_id,
+                    "durable completion matched no running row; the row was not retired \
+                     and will block every later row as an unready predecessor"
+                );
+                return SettlementOutcome::Settled;
+            }
             RetainOutcome::Cancelled => return SettlementOutcome::Cancelled,
             RetainOutcome::Retry { ticket, error } => {
                 tracing::warn!(
