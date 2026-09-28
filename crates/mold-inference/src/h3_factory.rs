@@ -6133,12 +6133,18 @@ mod tests {
         let qwen_host_output_state_bytes = qwen_output_state_device_bytes;
         let qwen_host_workspace_bytes =
             qwen_host_parameter_bytes + qwen_host_activation_bytes + qwen_host_output_state_bytes;
-        let condition_latent_backing_device_bytes = request.rows.condition_visual_rows * 96 * 4;
+        // Mirrors the builder (`private_opened_evidence`): condition latents are
+        // visual + audio, split BY MODALITY into the two packed states.
+        let condition_visual_latent_device_bytes = request.rows.condition_visual_rows * 96 * 4;
+        let condition_audio_latent_device_bytes = request.rows.condition_audio_rows * 32 * 4;
+        let condition_latent_backing_device_bytes =
+            condition_visual_latent_device_bytes + condition_audio_latent_device_bytes;
         let target_video_latent_device_bytes = request.rows.target_video_rows * 96 * 4;
         let target_audio_latent_device_bytes = request.rows.target_audio_rows * 32 * 4;
         let packed_video_state_device_bytes =
-            condition_latent_backing_device_bytes + target_video_latent_device_bytes;
-        let packed_audio_state_device_bytes = target_audio_latent_device_bytes;
+            condition_visual_latent_device_bytes + target_video_latent_device_bytes;
+        let packed_audio_state_device_bytes =
+            condition_audio_latent_device_bytes + target_audio_latent_device_bytes;
         let packed_layout_device_bytes = request.rows.total_packed_rows * 24;
         let denoise_tensor_copy_workspace_device_bytes =
             (packed_video_state_device_bytes + packed_audio_state_device_bytes) * 9;
