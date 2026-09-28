@@ -3160,6 +3160,15 @@ mod tests {
             !advertised.contains(mold_core::minimax_h3::REF2VA_COMFY_TURBO_4STEP_R21),
             "the Ref2VA rank-21 Turbo tag must never ride the FL2VA partition either"
         );
+        for ref2va in [
+            mold_core::minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P,
+            mold_core::minimax_h3::REF2VA_COMFY_TURBO_4STEP_S050,
+        ] {
+            assert!(
+                !advertised.contains(ref2va),
+                "{ref2va} is a Ref2VA Turbo tag and must never ride the FL2VA partition"
+            );
+        }
         for variant in turbo {
             assert!(!variant.installed);
             assert!(variant.request.is_none());

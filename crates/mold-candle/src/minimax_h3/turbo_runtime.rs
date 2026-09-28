@@ -27,6 +27,16 @@
 //! add requantization error to a distilled model with only 4–8 steps of budget
 //! to recover in.
 //!
+//! A tier may apply its file at a reduced STRENGTH
+//! (`H3TurboLoraTier::adapter_strength`, `1.0` for every published
+//! distillation). The strength multiplies the file's own `alpha / rank`
+//! before the delta is built, so the branch stays one affine and the effective
+//! per-module scale is `(alpha / rank) x strength`:
+//!
+//! ```text
+//! y = int8_convrot_forward(x) + ((x @ Aᵀ) @ Bᵀ) · (alpha / rank) · strength
+//! ```
+//!
 //! The in-repo precedent for this shape is
 //! `crates/mold-inference/src/flux/lora_bypass.rs`, which applies FLUX LoRAs
 //! as a parallel low-rank branch over a quantized base rather than merging.
@@ -325,6 +335,9 @@ enum H3TurboMainBlocks {
 
 struct H3TurboMainBlockStream {
     modules: Vec<[H3TurboLoraModule; 4]>,
+    /// The tier's adapter strength, applied to every streamed block exactly
+    /// as the resident token-refiner blocks had it applied at open.
+    adapter_strength: f32,
     data_start: u64,
     device: Device,
     dtype: DType,
@@ -343,6 +356,7 @@ impl std::fmt::Debug for H3TurboMainBlockStream {
         formatter
             .debug_struct("H3TurboMainBlockStream")
             .field("modules", &self.modules.len())
+            .field("adapter_strength", &self.adapter_strength)
             .field("data_start", &self.data_start)
             .field("device", &self.device)
             .field("dtype", &self.dtype)
@@ -358,6 +372,7 @@ pub struct H3TurboLoraRuntime {
     tier: H3TurboLoraTier,
     adapter_identity_sha256: String,
     content_sha256: String,
+    adapter_strength: f32,
     scale: f32,
     main_blocks: H3TurboMainBlocks,
     token_refiner_blocks: Vec<H3TurboBlockDeltas>,
@@ -382,9 +397,17 @@ impl H3TurboLoraRuntime {
         &self.content_sha256
     }
 
-    /// The one `alpha / rank` every module agreed on.
+    /// The EFFECTIVE scale every delta carries: the one `alpha / rank`
+    /// every module of the file agreed on (`1.0` for a resized file),
+    /// multiplied by the tier's [`Self::adapter_strength`].
     pub const fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// The strength the tier applies its file at; `1.0` for every published
+    /// distillation.
+    pub const fn adapter_strength(&self) -> f32 {
+        self.adapter_strength
     }
 
     pub fn block_count(&self) -> usize {
@@ -488,6 +511,7 @@ impl H3TurboLoraRuntime {
             ));
         }
         let inspection = contract.inspection();
+        let adapter_strength = validated_adapter_strength(contract.tier())?;
         let data_start = 8u64.checked_add(inspection.header_len).ok_or_else(|| {
             failure(
                 H3TurboLoraErrorCode::InvalidHeader,
@@ -515,7 +539,15 @@ impl H3TurboLoraRuntime {
                 })?;
             }
             widest_module_bytes = widest_module_bytes.max(module_bytes);
-            let delta = load_module_delta(module, file, data_start, device, dtype, cancellation)?;
+            let delta = load_module_delta(
+                module,
+                adapter_strength,
+                file,
+                data_start,
+                device,
+                dtype,
+                cancellation,
+            )?;
             device_bytes = device_bytes
                 .checked_add(delta.device_bytes())
                 .ok_or_else(|| {
@@ -542,7 +574,8 @@ impl H3TurboLoraRuntime {
             tier: contract.tier(),
             adapter_identity_sha256: contract.adapter_identity_sha256().to_owned(),
             content_sha256: contract.content_sha256().to_owned(),
-            scale: inspection.scale,
+            adapter_strength,
+            scale: inspection.scale * adapter_strength,
             main_blocks: H3TurboMainBlocks::Resident(collect_contiguous_blocks(main, "main")?),
             token_refiner_blocks: collect_contiguous_blocks(refiner, "token refiner")?,
             device_bytes,
@@ -603,6 +636,7 @@ impl H3TurboLoraRuntime {
                 .map_err(|error| failure(H3TurboLoraErrorCode::Io, error.to_string()))?,
         );
         let inspection = contract.inspection();
+        let adapter_strength = validated_adapter_strength(contract.tier())?;
         let data_start = 8u64.checked_add(inspection.header_len).ok_or_else(|| {
             failure(
                 H3TurboLoraErrorCode::InvalidHeader,
@@ -619,6 +653,7 @@ impl H3TurboLoraRuntime {
             cancellation_boundary(cancellation.as_ref())?;
             let delta = load_module_delta(
                 module,
+                adapter_strength,
                 &mut file,
                 data_start,
                 device,
@@ -681,9 +716,11 @@ impl H3TurboLoraRuntime {
             tier: contract.tier(),
             adapter_identity_sha256: contract.adapter_identity_sha256().to_owned(),
             content_sha256: contract.content_sha256().to_owned(),
-            scale: inspection.scale,
+            adapter_strength,
+            scale: inspection.scale * adapter_strength,
             main_blocks: H3TurboMainBlocks::MetalStreamed(H3TurboMainBlockStream {
                 modules,
+                adapter_strength,
                 data_start,
                 device: device.clone(),
                 dtype,
@@ -754,6 +791,7 @@ impl H3TurboMainBlockStream {
             cancellation_boundary(self.cancellation.as_ref())?;
             let delta = load_module_delta(
                 module,
+                self.adapter_strength,
                 &mut state.file,
                 self.data_start,
                 &self.device,
@@ -930,8 +968,27 @@ fn collect_one_block_deltas(
     })
 }
 
+/// The tier's adapter strength, refused unless it is a finite positive factor
+/// no larger than the published `1.0`. `H3TurboLoraDelta::new` would refuse a
+/// non-positive product anyway; this names the TIER as the cause instead of a
+/// module.
+fn validated_adapter_strength(tier: H3TurboLoraTier) -> H3TurboLoraResult<f32> {
+    let strength = tier.adapter_strength();
+    if !strength.is_finite() || strength <= 0.0 || strength > 1.0 {
+        return Err(failure(
+            H3TurboLoraErrorCode::ConfigMismatch,
+            format!(
+                "H3 Turbo tier {tier:?} declares adapter strength {strength}; \
+                 it must be finite, positive and at most 1.0"
+            ),
+        ));
+    }
+    Ok(strength)
+}
+
 fn load_module_delta(
     module: &H3TurboLoraModule,
+    adapter_strength: f32,
     file: &mut File,
     data_start: u64,
     device: &Device,
@@ -954,7 +1011,8 @@ fn load_module_delta(
         dtype,
         cancellation,
     )?;
-    let delta = H3TurboLoraDelta::new(&down, &up, module.scale)?;
+    // The file's own per-module `alpha / rank`, times the tier's strength.
+    let delta = H3TurboLoraDelta::new(&down, &up, module.scale * adapter_strength)?;
     // Each constructor transposes both source matrices into the retained
     // layout. Metal queues those copies asynchronously and otherwise keeps
     // every module's read/conversion/transpose sources alive until the entire
@@ -1408,6 +1466,113 @@ mod tests {
         }
     }
 
+    /// A strength variant authenticates the SAME file as its full-strength
+    /// tier and applies every delta at `alpha / rank x strength`: the half-
+    /// strength branch is exactly half the full-strength branch, module for
+    /// module, and the two runtimes carry different adapter identities, so a
+    /// loaded full-strength delta can never stand in for the draft tier.
+    #[test]
+    fn a_strength_variant_applies_the_same_file_at_its_reduced_strength() {
+        let full_tier = H3TurboLoraTier::Ref2v4StepV10;
+        let draft_tier = H3TurboLoraTier::Ref2v4StepV10Strength050;
+        assert_eq!(draft_tier.published_file_tier(), full_tier);
+        let mut expectation = fixtures::expectation();
+        expectation.task = draft_tier.task();
+        let (header, data) = fixtures::adapter(&expectation);
+        let (_directory, path) = fixtures::write(&header, &data);
+        expectation.content_sha256 = Some(super::super::comfy_dit::sha256_hex(
+            <sha2::Sha256 as sha2::Digest>::digest(std::fs::read(&path).unwrap()),
+        ));
+        let open = |tier| {
+            H3TurboLoraRuntime::open_against(
+                &path,
+                &expectation,
+                tier,
+                &Device::Cpu,
+                DType::F32,
+                &H3ComfyNeverCancel,
+            )
+            .unwrap()
+        };
+        let full = open(full_tier);
+        let draft = open(draft_tier);
+
+        assert_eq!(full.adapter_strength(), 1.0);
+        assert_eq!(draft.adapter_strength(), 0.5);
+        assert_eq!(full.scale(), 0.0625);
+        assert_eq!(draft.scale(), 0.0625 * 0.5);
+        // Same bytes, different identity.
+        assert_eq!(full.content_sha256(), draft.content_sha256());
+        assert_ne!(
+            full.adapter_identity_sha256(),
+            draft.adapter_identity_sha256()
+        );
+        // Strength never changes what is resident.
+        assert_eq!(full.device_bytes(), draft.device_bytes());
+        assert_eq!(
+            full.device_staging_peak_bytes(),
+            draft.device_staging_peak_bytes()
+        );
+        assert_eq!(
+            full.host_staging_peak_bytes(),
+            draft.host_staging_peak_bytes()
+        );
+
+        let x = ramp(3, 256, 91, &Device::Cpu);
+        for (index, (full_block, draft_block)) in [
+            (full.main_block(0).unwrap(), draft.main_block(0).unwrap()),
+            (full.main_block(1).unwrap(), draft.main_block(1).unwrap()),
+            (
+                full.token_refiner_block(0).unwrap(),
+                draft.token_refiner_block(0).unwrap(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for kind in H3TurboLoraModuleKind::ALL {
+                let full_delta = full_block.kind(kind);
+                let draft_delta = draft_block.kind(kind);
+                assert_eq!(
+                    draft_delta.scale(),
+                    full_delta.scale() * 0.5,
+                    "{index} {kind:?}"
+                );
+                assert_eq!(
+                    draft_delta.scale(),
+                    f64::from(draft.scale()),
+                    "{index} {kind:?}"
+                );
+                let input = x.narrow(1, 0, full_delta.in_features()).unwrap();
+                let full_out = full_delta.delta(&input).unwrap().to_vec2::<f32>().unwrap();
+                let draft_out = draft_delta.delta(&input).unwrap().to_vec2::<f32>().unwrap();
+                for (full_row, draft_row) in full_out.iter().zip(draft_out.iter()) {
+                    for (full_value, draft_value) in full_row.iter().zip(draft_row.iter()) {
+                        assert!(
+                            (full_value * 0.5 - draft_value).abs()
+                                <= 1e-6 * full_value.abs().max(1.0),
+                            "{index} {kind:?}: {draft_value} is not half of {full_value}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every reviewed tier's strength is a finite positive factor no larger
+    /// than the published one, and the loader's own guard names the tier.
+    #[test]
+    fn every_tier_strength_passes_the_loader_guard() {
+        for tier in H3TurboLoraTier::ALL {
+            let strength = validated_adapter_strength(tier).unwrap();
+            assert_eq!(
+                strength.to_bits(),
+                tier.adapter_strength().to_bits(),
+                "{tier:?}"
+            );
+        }
+    }
+
     /// A resized adapter loads through the SAME path as a rank-uniform one:
     /// no runtime branch, no per-shape loader, no second scale authority.
     ///
@@ -1632,6 +1797,39 @@ mod tests {
             runtime.load_main_block(0).unwrap().device_bytes(),
             runtime.streamed_main_block_device_bytes()
         );
+    }
+
+    /// The Metal route streams main blocks lazily, long after `open`; the
+    /// strength must ride on the stream itself or every streamed block would
+    /// silently render at full strength while the resident token refiners
+    /// render at half.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_streamed_blocks_carry_the_tier_strength() {
+        let mut expectation = fixtures::expectation();
+        expectation.task = H3TurboLoraTier::Ref2v4StepV10Strength050.task();
+        let (header, data) = fixtures::adapter(&expectation);
+        let (_directory, path) = fixtures::write(&header, &data);
+        expectation.content_sha256 = Some(super::super::comfy_dit::sha256_hex(
+            <sha2::Sha256 as sha2::Digest>::digest(std::fs::read(&path).unwrap()),
+        ));
+        let device = Device::new_metal(0).unwrap();
+        let runtime = H3TurboLoraRuntime::open_metal_streamed_against(
+            &path,
+            &expectation,
+            H3TurboLoraTier::Ref2v4StepV10Strength050,
+            &device,
+            DType::F32,
+            Arc::new(H3ComfyNeverCancel),
+        )
+        .unwrap();
+        assert_eq!(runtime.scale(), 0.03125);
+        let streamed = runtime.load_main_block(1).unwrap();
+        let resident = runtime.token_refiner_block(0).unwrap();
+        for kind in H3TurboLoraModuleKind::ALL {
+            assert_eq!(streamed.kind(kind).scale(), 0.03125, "{kind:?}");
+            assert_eq!(resident.kind(kind).scale(), 0.03125, "{kind:?}");
+        }
     }
 
     #[test]

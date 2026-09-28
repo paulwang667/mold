@@ -36,7 +36,20 @@ pub(crate) const H3_AUDIO_SHIFT: f32 = 3.0;
 ///   `docs/qualification/minimax-h3.md`. Treat 6.0 for that one tier as mold's
 ///   choice, never as a transcribed upstream value.
 ///
-/// Every 544p-trained reviewed tier keeps [`H3_VIDEO_SHIFT`].
+/// Every 544p-trained reviewed tier keeps [`H3_VIDEO_SHIFT`], and so does the
+/// ONE 768p-trained tier that is not FL2V:
+///
+/// - `Ref2V 8-step v1.0 768p`: 12, TRANSCRIBED from its publisher's release
+///   note (lightx2v, huggingface.co/lightx2v/Minimax-h3-Turbo discussion #51,
+///   2026-09-03: "Steps: 8 / Video shift: 12 / Audio shift: 3 / Sampler:
+///   Euler / Resolution: Up to 768p"). ModelTC's spec table has no row for it
+///   at `02e26d59`, and neither does the Hugging Face model card. Two
+///   third-party pages list 6 — vllm-omni's MiniMax-H3 recipe, which states
+///   that it reads the shift from the FILENAME, and a comfyui-wiki news post
+///   citing a spec-table row that does not exist — so they infer "768p means
+///   6" rather than transcribe it, and mold follows the publisher. The
+///   construction is otherwise the FL2V 8-step tier's: 9 terminal-inclusive
+///   points on the Comfy simple grid, Euler.
 pub(crate) const H3_TURBO_768P_VIDEO_SHIFT: f32 = 6.0;
 /// Only meaningful for the RES-multistep carried-audio helpers, which is why a
 /// non-default video shift is refused for that integrator below.

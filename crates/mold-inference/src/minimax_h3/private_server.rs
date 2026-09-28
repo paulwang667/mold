@@ -8755,6 +8755,25 @@ mod tests {
             .expect_err("a resized ref2v tier must not mint an fl2va qualification")
             .to_string();
         assert!(error.contains("was not reviewed for"), "{error}");
+        // The Ref2V 8-step 768p tier coincides with every FL2V 8-step tier's
+        // 9-point schedule, and the draft tier with the 5-point ones: the task
+        // refuses both, whatever the step count or strength.
+        let fl2v_8 = turbo_authority_for(mold_candle::minimax_h3::H3TurboLoraTier::Fl2v8StepV10);
+        for tier in [
+            mold_candle::minimax_h3::H3TurboLoraTier::Ref2v768p8StepV10,
+            mold_candle::minimax_h3::H3TurboLoraTier::Ref2v4StepV10Strength050,
+        ] {
+            let authority = turbo_authority_for(tier);
+            assert!(
+                authority.grid_points() == fl2v.grid_points()
+                    || authority.grid_points() == fl2v_8.grid_points(),
+                "{tier:?}"
+            );
+            let error = mint(Some(&authority))
+                .expect_err("a ref2v tier must not mint an fl2va qualification")
+                .to_string();
+            assert!(error.contains("was not reviewed for"), "{tier:?}: {error}");
+        }
         // The FL2V tier at the identical step count is accepted, so the
         // refusal is about task identity and not about the number.
         assert!(mint(Some(&fl2v)).is_ok());

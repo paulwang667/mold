@@ -74,6 +74,15 @@ pub const H3_TURBO_LORA_DIRECTORY: &str = "loras";
 pub const H3_TURBO_LORA_LIGHTX2V_REPOSITORY: &str = "lightx2v/Minimax-h3-Turbo";
 /// Pinned lightx2v revision. Files there sit at the repository ROOT.
 pub const H3_TURBO_LORA_LIGHTX2V_SOURCE_REVISION: &str = "05ef678438e84933c406131b59abbf86919b3aac";
+/// The lightx2v revision that first published the Ref2V 8-step 768p adapter
+/// (commit "Upload folder using huggingface_hub", 2026-09-03). The adapter
+/// does not exist at [`H3_TURBO_LORA_LIGHTX2V_SOURCE_REVISION`], so it is a
+/// SECOND pin of the same repository, carried by that one tier alone. The
+/// earlier pin is deliberately left where it was: the two FL2V adapters it
+/// serves are byte-identical at both revisions, and moving it would repin
+/// already-installed artifacts for no change in content.
+pub const H3_TURBO_LORA_LIGHTX2V_REF2V_8STEP_768P_SOURCE_REVISION: &str =
+    "0eebcc7e79f9cb200927c80b8e7595265b770e34";
 /// Repository publishing the SVD-resized dynamic-rank Turbo adapters.
 ///
 /// These are DERIVATIVES of the rank-128 adapters above: an exact compact SVD
@@ -101,7 +110,7 @@ pub const H3_TURBO_LORA_TENSOR_COUNT: usize = 624;
 pub const H3_TURBO_LORA_DYNAMIC_TENSOR_COUNT: usize = 416;
 /// `52 blocks x 4 linear modules` — 50 main blocks plus 2 token-refiner blocks.
 pub const H3_TURBO_LORA_MODULE_COUNT: usize = 208;
-/// Tensor payload bytes shared by all five published RANK-UNIFORM adapters;
+/// Tensor payload bytes shared by all six published RANK-UNIFORM adapters;
 /// only the JSON header length differs between them. A rank-dynamic tier's
 /// payload is a per-file fact derived from its own golden header, never this
 /// constant.
@@ -178,6 +187,9 @@ const METADATA_RESIZED_FROM_KEY: &str = "resized_from";
 const CONTRACT_IDENTITY_DOMAIN: &[u8] = b"mold.minimax-h3.turbo-lora-contract.v1\0";
 /// Binds the verified content digest; this is the artifact identity.
 const ADAPTER_IDENTITY_DOMAIN: &[u8] = b"mold.minimax-h3.turbo-lora-adapter.v2\0";
+/// Tags the non-published adapter strength inside the adapter identity. Only
+/// ever hashed for a tier whose strength is not `1.0`.
+const ADAPTER_STRENGTH_IDENTITY_TAG: &[u8] = b"\0adapter-strength\0";
 
 /// How one reviewed adapter lays its low-rank factors out.
 ///
@@ -296,9 +308,17 @@ impl H3TurboLoraShape {
     }
 }
 
-/// One of the eight reviewed published Turbo adapters. Detection never uses a
-/// filename: the independently parsed header must agree with this authority,
-/// and each tier names the repository and revision it was published at.
+/// One of the ten reviewed Turbo tiers. Detection never uses a filename: the
+/// independently parsed header must agree with this authority, and each tier
+/// names the repository and revision it was published at.
+///
+/// A tier is an adapter FILE plus the strength it is applied at
+/// ([`Self::adapter_strength`]). Nine tiers apply their file at the published
+/// strength of `1.0` and own a distinct file; a STRENGTH VARIANT
+/// ([`Self::Ref2v4StepV10Strength050`]) re-applies another tier's exact file
+/// ([`Self::published_file_tier`]) at a lower strength, so it shares every
+/// file fact — name, repository, revision, size, digest, header — and differs
+/// only in its stable id, its strength, and therefore its adapter identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum H3TurboLoraTier {
     /// FL2V Turbo, 8 transformer evaluations, v1.0, trained at 544p.
@@ -319,11 +339,23 @@ pub enum H3TurboLoraTier {
     Fl2v8StepV10Rank21,
     /// SVD-resized derivative of [`Self::Ref2v4StepV10`], average rank 21.
     Ref2v4StepV10Rank21,
+    /// Ref2V Turbo, 8 transformer evaluations, v1.0, trained at 768p.
+    /// Published by lightx2v only, at its own later revision.
+    Ref2v768p8StepV10,
+    /// DRAFT tier: [`Self::Ref2v4StepV10`]'s exact adapter file applied at
+    /// strength `0.5`. It exists because the v0.1 Ref2V 4-step adapter at
+    /// full strength systematically places the subject left of centre
+    /// (measured 2026-09-28; mirroring every reference image does not move
+    /// it, and the same prompt on the undistilled checkpoint is centred);
+    /// halving the delta corrects the placement on both probe shots with no
+    /// obvious softening at draft resolution. It is a preview tier, not a
+    /// published distillation.
+    Ref2v4StepV10Strength050,
 }
 
 impl H3TurboLoraTier {
     /// Every reviewed tier, in a stable order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::Fl2v8StepV10,
         Self::Fl2v768p4StepV10,
         Self::Ref2v4StepV10,
@@ -332,7 +364,43 @@ impl H3TurboLoraTier {
         Self::Fl2v768p4StepV10Rank21,
         Self::Fl2v8StepV10Rank21,
         Self::Ref2v4StepV10Rank21,
+        Self::Ref2v768p8StepV10,
+        Self::Ref2v4StepV10Strength050,
     ];
+
+    /// The tier whose published adapter FILE this tier applies. Every tier
+    /// answers itself except a strength variant, which answers the tier it
+    /// re-applies. Every file fact — name, repository, revision, repository
+    /// path, size, digest, header length and identity, shape — is read
+    /// through this, so a strength variant can never drift from its file.
+    pub const fn published_file_tier(self) -> Self {
+        match self {
+            Self::Ref2v4StepV10Strength050 => Self::Ref2v4StepV10,
+            other => other,
+        }
+    }
+
+    /// The factor every low-rank delta of this tier is multiplied by ON TOP
+    /// of the file's own scale (`alpha / rank`, or `1.0` for a resized file):
+    /// the effective per-module scale is `file scale x adapter_strength`.
+    ///
+    /// `1.0` — the published strength — for every tier except a strength
+    /// variant. It is part of the tier's identity: it is folded into the
+    /// adapter identity whenever it is not `1.0`, so a loaded full-strength
+    /// delta can never be reused for a reduced-strength tier of the same
+    /// file.
+    pub const fn adapter_strength(self) -> f32 {
+        match self {
+            Self::Ref2v4StepV10Strength050 => 0.5,
+            _ => 1.0,
+        }
+    }
+
+    /// True when this tier re-applies another tier's file at a non-published
+    /// strength.
+    pub const fn is_strength_variant(self) -> bool {
+        self.published_file_tier() as u8 != self as u8
+    }
 
     pub const fn stable_id(self) -> &'static str {
         match self {
@@ -349,6 +417,12 @@ impl H3TurboLoraTier {
             }
             Self::Ref2v4StepV10Rank21 => {
                 "minimax-h3.turbo-lora.ref2v-4step-v0.1.comfyui-bf16.resized-avg-rank-21.v1"
+            }
+            Self::Ref2v768p8StepV10 => {
+                "minimax-h3.turbo-lora.ref2v-8step-768p-v1.0.comfyui-bf16.v1"
+            }
+            Self::Ref2v4StepV10Strength050 => {
+                "minimax-h3.turbo-lora.ref2v-4step-v0.1.comfyui-bf16.strength-0.5.v1"
             }
         }
     }
@@ -375,6 +449,10 @@ impl H3TurboLoraTier {
             Self::Ref2v4StepV10Rank21 => {
                 "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_resized_avg_rank_21_bf16.safetensors"
             }
+            Self::Ref2v768p8StepV10 => {
+                "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
+            }
+            Self::Ref2v4StepV10Strength050 => self.published_file_tier().file_name(),
         }
     }
 
@@ -384,10 +462,13 @@ impl H3TurboLoraTier {
             Self::Fl2v8StepV10 | Self::Fl2v768p4StepV10 | Self::Ref2v4StepV10 => {
                 H3_TURBO_LORA_REPOSITORY
             }
-            Self::Fl2v768p4StepV11 | Self::Fl2v768p8StepV10 => H3_TURBO_LORA_LIGHTX2V_REPOSITORY,
+            Self::Fl2v768p4StepV11 | Self::Fl2v768p8StepV10 | Self::Ref2v768p8StepV10 => {
+                H3_TURBO_LORA_LIGHTX2V_REPOSITORY
+            }
             Self::Fl2v768p4StepV10Rank21 | Self::Fl2v8StepV10Rank21 | Self::Ref2v4StepV10Rank21 => {
                 H3_TURBO_LORA_DRBAPH_REPOSITORY
             }
+            Self::Ref2v4StepV10Strength050 => self.published_file_tier().source_repository(),
         }
     }
 
@@ -401,9 +482,11 @@ impl H3TurboLoraTier {
             Self::Fl2v768p4StepV11 | Self::Fl2v768p8StepV10 => {
                 H3_TURBO_LORA_LIGHTX2V_SOURCE_REVISION
             }
+            Self::Ref2v768p8StepV10 => H3_TURBO_LORA_LIGHTX2V_REF2V_8STEP_768P_SOURCE_REVISION,
             Self::Fl2v768p4StepV10Rank21 | Self::Fl2v8StepV10Rank21 | Self::Ref2v4StepV10Rank21 => {
                 H3_TURBO_LORA_DRBAPH_SOURCE_REVISION
             }
+            Self::Ref2v4StepV10Strength050 => self.published_file_tier().source_revision(),
         }
     }
 
@@ -424,17 +507,23 @@ impl H3TurboLoraTier {
             | Self::Fl2v768p8StepV10
             | Self::Fl2v768p4StepV10Rank21
             | Self::Fl2v8StepV10Rank21
-            | Self::Ref2v4StepV10Rank21 => self.file_name().to_owned(),
+            | Self::Ref2v4StepV10Rank21
+            | Self::Ref2v768p8StepV10 => self.file_name().to_owned(),
+            Self::Ref2v4StepV10Strength050 => self.published_file_tier().repository_path(),
         }
     }
 
     pub const fn file_bytes(self) -> u64 {
         match self {
-            Self::Fl2v8StepV10 | Self::Ref2v4StepV10 | Self::Fl2v768p8StepV10 => 1_956_193_000,
+            Self::Fl2v8StepV10
+            | Self::Ref2v4StepV10
+            | Self::Fl2v768p8StepV10
+            | Self::Ref2v768p8StepV10 => 1_956_193_000,
             Self::Fl2v768p4StepV10 | Self::Fl2v768p4StepV11 => 1_956_192_992,
             Self::Fl2v768p4StepV10Rank21 => 298_177_224,
             Self::Fl2v8StepV10Rank21 => 327_035_608,
             Self::Ref2v4StepV10Rank21 => 326_935_264,
+            Self::Ref2v4StepV10Strength050 => self.published_file_tier().file_bytes(),
         }
     }
 
@@ -464,17 +553,25 @@ impl H3TurboLoraTier {
             Self::Ref2v4StepV10Rank21 => {
                 "2c6abb194cff3e26c2295c87892913adf0c92d8f784f305238246759f9b333d0"
             }
+            Self::Ref2v768p8StepV10 => {
+                "6a56f41ab4229c9dd845b9501bbd475ee57e112d846cf2e819d534a1ae928c5a"
+            }
+            Self::Ref2v4StepV10Strength050 => self.published_file_tier().content_sha256(),
         }
     }
 
     /// JSON header length, excluding the eight-byte safetensors length prefix.
     pub const fn header_len(self) -> u64 {
         match self {
-            Self::Fl2v8StepV10 | Self::Ref2v4StepV10 | Self::Fl2v768p8StepV10 => 73_632,
+            Self::Fl2v8StepV10
+            | Self::Ref2v4StepV10
+            | Self::Fl2v768p8StepV10
+            | Self::Ref2v768p8StepV10 => 73_632,
             Self::Fl2v768p4StepV10 | Self::Fl2v768p4StepV11 => 73_624,
             Self::Fl2v768p4StepV10Rank21 => 52_928,
             Self::Fl2v8StepV10Rank21 => 52_944,
             Self::Ref2v4StepV10Rank21 => 52_952,
+            Self::Ref2v4StepV10Strength050 => self.published_file_tier().header_len(),
         }
     }
 
@@ -506,6 +603,10 @@ impl H3TurboLoraTier {
             Self::Ref2v4StepV10Rank21 => {
                 "3c1db66284973ee4eec4e9700e12b1fc587b1aa7f85af6a811daac0d15b4db6f"
             }
+            Self::Ref2v768p8StepV10 => {
+                "a00789bea7db0e9488317a55cd97e04a786eef79a687167cdae75c2178112a39"
+            }
+            Self::Ref2v4StepV10Strength050 => self.published_file_tier().header_identity_sha256(),
         }
     }
 
@@ -517,7 +618,10 @@ impl H3TurboLoraTier {
             | Self::Fl2v768p8StepV10
             | Self::Fl2v768p4StepV10Rank21
             | Self::Fl2v8StepV10Rank21 => H3TransformerTask::T2VaFl2Va,
-            Self::Ref2v4StepV10 | Self::Ref2v4StepV10Rank21 => H3TransformerTask::Ref2Va,
+            Self::Ref2v4StepV10
+            | Self::Ref2v4StepV10Rank21
+            | Self::Ref2v768p8StepV10
+            | Self::Ref2v4StepV10Strength050 => H3TransformerTask::Ref2Va,
         }
     }
 
@@ -530,12 +634,13 @@ impl H3TurboLoraTier {
     /// `resized_from` must equal are both derived here rather than restated.
     pub const fn shape(self) -> H3TurboLoraShape {
         match self {
-            Self::Fl2v8StepV10 | Self::Ref2v4StepV10 | Self::Fl2v768p8StepV10 => {
-                H3TurboLoraShape::Uniform {
-                    training_rank: H3_TURBO_LORA_TRAINING_RANK,
-                    training_alpha: 8.0,
-                }
-            }
+            Self::Fl2v8StepV10
+            | Self::Ref2v4StepV10
+            | Self::Fl2v768p8StepV10
+            | Self::Ref2v768p8StepV10 => H3TurboLoraShape::Uniform {
+                training_rank: H3_TURBO_LORA_TRAINING_RANK,
+                training_alpha: 8.0,
+            },
             Self::Fl2v768p4StepV10 | Self::Fl2v768p4StepV11 => H3TurboLoraShape::Uniform {
                 training_rank: H3_TURBO_LORA_TRAINING_RANK,
                 training_alpha: 128.0,
@@ -555,6 +660,8 @@ impl H3TurboLoraTier {
                 source: Self::Ref2v4StepV10,
                 baked_scale: 0.0625,
             },
+            // The FILE's shape; the strength is applied on top at load.
+            Self::Ref2v4StepV10Strength050 => self.published_file_tier().shape(),
         }
     }
 
@@ -2280,6 +2387,15 @@ fn turbo_adapter_identity(
     digest.update(header_identity_sha256.as_bytes());
     digest.update(structure_identity_sha256.as_bytes());
     digest.update(content_sha256.as_bytes());
+    // The strength is appended ONLY when it is not the published `1.0`, so
+    // every identity already recorded for a full-strength tier stays byte
+    // identical, while a strength variant of the same file can never collide
+    // with it even if its stable id were ever copied.
+    let strength = tier.adapter_strength();
+    if strength.to_bits() != 1.0f32.to_bits() {
+        digest.update(ADAPTER_STRENGTH_IDENTITY_TAG);
+        digest.update(strength.to_bits().to_le_bytes());
+    }
     sha256_hex(digest.finalize())
 }
 
@@ -2586,6 +2702,12 @@ impl H3TurboLoraTier {
             Self::Fl2v768p4StepV10Rank21 => "fl2v-4step-768p-v1.0-r21.header",
             Self::Fl2v8StepV10Rank21 => "fl2v-8step-v1.0-r21.header",
             Self::Ref2v4StepV10Rank21 => "ref2v-4step-v0.1-r21.header",
+            Self::Ref2v768p8StepV10 => "ref2v-8step-768p-v1.0.header",
+            // A strength variant has no file of its own, so it claims its
+            // file tier's golden rather than a copy of it.
+            Self::Ref2v4StepV10Strength050 => {
+                return self.published_file_tier().header_fixture_path();
+            }
         };
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata/minimax_h3/turbo")
@@ -2868,6 +2990,10 @@ mod tests {
             "05ef678438e84933c406131b59abbf86919b3aac"
         );
         assert_eq!(
+            H3_TURBO_LORA_LIGHTX2V_REF2V_8STEP_768P_SOURCE_REVISION,
+            "0eebcc7e79f9cb200927c80b8e7595265b770e34"
+        );
+        assert_eq!(
             H3_TURBO_LORA_DRBAPH_REPOSITORY,
             "drbaph/MiniMax-H3-Turbo-Lora-ComfyUI"
         );
@@ -2892,7 +3018,15 @@ mod tests {
         let mut files = BTreeSet::new();
         let mut sources = BTreeSet::new();
         for tier in H3TurboLoraTier::ALL {
+            // Every stable id is distinct, strength variants included.
             assert!(ids.insert(tier.stable_id()));
+            // A strength variant owns no file: it re-applies its file tier's
+            // exact bytes, so the FILE facts below are asserted distinct
+            // across file-owning tiers only, and the variant is checked to
+            // agree with its file tier on every one of them instead.
+            if tier.is_strength_variant() {
+                continue;
+            }
             assert!(digests.insert(tier.content_sha256()));
             assert!(headers.insert(tier.header_identity_sha256()));
             // A resized tier is a DIFFERENT artifact from its source, its
@@ -2918,6 +3052,90 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
         }
+    }
+
+    /// A strength variant is its file tier's exact artifact at a different
+    /// strength: every file fact is shared, and only the stable id, the
+    /// strength, and therefore the adapter identity differ. Every other tier
+    /// applies its own file at the published strength of exactly `1.0`.
+    #[test]
+    fn a_strength_variant_shares_every_file_fact_and_differs_only_in_strength() {
+        let mut variants = 0;
+        for tier in H3TurboLoraTier::ALL {
+            let strength = tier.adapter_strength();
+            assert!(
+                strength.is_finite() && strength > 0.0 && strength <= 1.0,
+                "{tier:?} strength {strength}"
+            );
+            let file = tier.published_file_tier();
+            // One level deep: a variant's file tier owns its own file.
+            assert_eq!(file.published_file_tier(), file, "{tier:?}");
+            assert!(!file.is_strength_variant(), "{tier:?}");
+            if !tier.is_strength_variant() {
+                assert_eq!(file, tier);
+                assert_eq!(strength.to_bits(), 1.0f32.to_bits(), "{tier:?}");
+                continue;
+            }
+            variants += 1;
+            assert_ne!(file, tier);
+            assert_ne!(strength.to_bits(), 1.0f32.to_bits(), "{tier:?}");
+            assert_eq!(file.adapter_strength().to_bits(), 1.0f32.to_bits());
+            assert_eq!(tier.task(), file.task(), "{tier:?}");
+            assert_eq!(tier.shape(), file.shape(), "{tier:?}");
+            assert_eq!(tier.file_name(), file.file_name(), "{tier:?}");
+            assert_eq!(tier.source_repository(), file.source_repository());
+            assert_eq!(tier.source_revision(), file.source_revision());
+            assert_eq!(tier.repository_path(), file.repository_path());
+            assert_eq!(tier.file_bytes(), file.file_bytes());
+            assert_eq!(tier.content_sha256(), file.content_sha256());
+            assert_eq!(tier.header_len(), file.header_len());
+            assert_eq!(tier.header_identity_sha256(), file.header_identity_sha256());
+            assert_eq!(tier.header_fixture_path(), file.header_fixture_path());
+            assert_eq!(tier.expectation(), file.expectation(), "{tier:?}");
+            assert_ne!(tier.stable_id(), file.stable_id());
+            // The file's own `alpha / rank` is unchanged; the strength rides
+            // on top of it at load, never inside the file contract.
+            assert_eq!(tier.training_scale(), file.training_scale());
+        }
+        assert_eq!(variants, 1);
+        assert_eq!(
+            H3TurboLoraTier::Ref2v4StepV10Strength050.published_file_tier(),
+            H3TurboLoraTier::Ref2v4StepV10
+        );
+        assert_eq!(
+            H3TurboLoraTier::Ref2v4StepV10Strength050.adapter_strength(),
+            0.5
+        );
+    }
+
+    /// The same authenticated bytes under a strength variant mint a DIFFERENT
+    /// adapter identity, so no frozen plan, cache, or admission record keyed
+    /// on it can confuse a half-strength render with a full-strength one —
+    /// while the full-strength identity is exactly what it was before
+    /// strength existed.
+    #[test]
+    fn adapter_identity_distinguishes_a_strength_variant_of_the_same_file() {
+        let file = H3TurboLoraTier::Ref2v4StepV10;
+        let variant = H3TurboLoraTier::Ref2v4StepV10Strength050;
+        let identity = |tier: H3TurboLoraTier| {
+            turbo_adapter_identity(
+                tier,
+                tier.task(),
+                tier.header_identity_sha256(),
+                "structure",
+                tier.content_sha256(),
+            )
+        };
+        assert_ne!(identity(file), identity(variant));
+        // Full strength hashes exactly the pre-strength preimage.
+        let mut digest = Sha256::new();
+        digest.update(ADAPTER_IDENTITY_DOMAIN);
+        digest.update(file.stable_id().as_bytes());
+        digest.update([0, file.task() as u8]);
+        digest.update(file.header_identity_sha256().as_bytes());
+        digest.update(b"structure");
+        digest.update(file.content_sha256().as_bytes());
+        assert_eq!(identity(file), sha256_hex(digest.finalize()));
     }
 
     /// An inspection reports the source the EXPECTATION named, never a global
@@ -2958,10 +3176,15 @@ mod tests {
                     assert_eq!(tier.source_revision(), H3_TURBO_LORA_SOURCE_REVISION);
                 }
                 H3_TURBO_LORA_LIGHTX2V_REPOSITORY => {
-                    assert_eq!(
-                        tier.source_revision(),
+                    // Two pins of one repository: the Ref2V 8-step 768p
+                    // adapter was published after the original pin, and only
+                    // that tier carries the later revision.
+                    let expected = if tier == H3TurboLoraTier::Ref2v768p8StepV10 {
+                        H3_TURBO_LORA_LIGHTX2V_REF2V_8STEP_768P_SOURCE_REVISION
+                    } else {
                         H3_TURBO_LORA_LIGHTX2V_SOURCE_REVISION
-                    );
+                    };
+                    assert_eq!(tier.source_revision(), expected, "{tier:?}");
                 }
                 H3_TURBO_LORA_DRBAPH_REPOSITORY => {
                     assert_eq!(tier.source_revision(), H3_TURBO_LORA_DRBAPH_SOURCE_REVISION);

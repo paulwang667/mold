@@ -7037,6 +7037,15 @@ mod tests {
         "minimax-h3.turbo-lora.fl2v-8step-v1.0.comfyui-bf16.resized-avg-rank-21.v1";
     const TURBO_REF2V_4STEP_R21_TIER: &str =
         "minimax-h3.turbo-lora.ref2v-4step-v0.1.comfyui-bf16.resized-avg-rank-21.v1";
+    /// The full-strength Ref2V 4-step tier the draft tier re-applies.
+    const TURBO_REF2V_4STEP_TIER: &str = "minimax-h3.turbo-lora.ref2v-4step-v0.1.comfyui-bf16.v1";
+    /// lightx2v's Ref2V 8-step 768p tier: 9 points at the publisher's
+    /// recommended shift of 12, not the FL2V 768p tiers' 6.
+    const TURBO_REF2V_8STEP_768P_TIER: &str =
+        "minimax-h3.turbo-lora.ref2v-8step-768p-v1.0.comfyui-bf16.v1";
+    /// The draft tier: the Ref2V 4-step file at strength 0.5.
+    const TURBO_REF2V_4STEP_S050_TIER: &str =
+        "minimax-h3.turbo-lora.ref2v-4step-v0.1.comfyui-bf16.strength-0.5.v1";
 
     fn turbo_authority_for(tier_stable_id: &str) -> H3FactoryTurboAdapterAuthority {
         H3FactoryTurboAdapterAuthority::for_reviewed_tier(
@@ -7280,6 +7289,8 @@ mod tests {
             contract::FL2VA_COMFY_TURBO_4STEP_768P_R21,
             contract::FL2VA_COMFY_TURBO_8STEP_R21,
             contract::REF2VA_COMFY_TURBO_4STEP_R21,
+            contract::REF2VA_COMFY_TURBO_8STEP_768P,
+            contract::REF2VA_COMFY_TURBO_4STEP_S050,
             contract::REF2VA_COMFY,
             "minimax-h3-fl2va:comfy-pruned-int8-turbo-2step",
         ] {
@@ -7546,6 +7557,26 @@ mod tests {
         assert_eq!(ref2v_r21.grid_points(), 5);
         assert_eq!(ref2v_r21.video_shift(), 12.0);
         assert_eq!(ref2v_r21.sampler_kind(), H3FactorySamplerKind::ComfyEuler);
+        // The Ref2VA 8-step 768p tier is 9 points at shift 12.
+        let ref2v_8_768p = turbo_authority_for(TURBO_REF2V_8STEP_768P_TIER);
+        assert_eq!(ref2v_8_768p.grid_points(), 9);
+        assert_eq!(ref2v_8_768p.video_shift(), 12.0);
+        assert_eq!(
+            ref2v_8_768p.sampler_kind(),
+            H3FactorySamplerKind::ComfyEuler
+        );
+        // The draft tier repeats its full-strength file tier's whole triple,
+        // but it is a DIFFERENT authority: the tier id is what every frozen
+        // plan, engine seam, and media pairing compares, so a plan frozen on
+        // the full-strength adapter can never execute the draft tag (or the
+        // reverse) on a matching step count.
+        let ref2v_4 = turbo_authority_for(TURBO_REF2V_4STEP_TIER);
+        let ref2v_s050 = turbo_authority_for(TURBO_REF2V_4STEP_S050_TIER);
+        assert_eq!(ref2v_s050.grid_points(), ref2v_4.grid_points());
+        assert_eq!(ref2v_s050.video_shift(), ref2v_4.video_shift());
+        assert_eq!(ref2v_s050.sampler_kind(), ref2v_4.sampler_kind());
+        assert_ne!(ref2v_s050.tier_stable_id(), ref2v_4.tier_stable_id());
+        assert_ne!(ref2v_s050, ref2v_4);
 
         let cases: [(&str, &str, &str, u64, u64, u64, &str); 6] = [
             (

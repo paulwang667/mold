@@ -60,6 +60,17 @@ pub const NVFP4_REVISION: &str = "908eccad7e68751190d04c171956f163bfeed741";
 /// checkpoint a tag executes on.
 pub const LIGHTX2V_REPO: &str = "lightx2v/Minimax-h3-Turbo";
 pub const LIGHTX2V_REVISION: &str = "05ef678438e84933c406131b59abbf86919b3aac";
+/// The later [`LIGHTX2V_REPO`] revision that first published the Ref2V
+/// 8-step 768p adapter (lightx2v commit "Upload folder using
+/// huggingface_hub", 2026-09-03). The adapter does not exist at
+/// [`LIGHTX2V_REVISION`], so exactly one tier row
+/// ([`REF2VA_COMFY_TURBO_8STEP_768P`]) carries this pin, resolved per file by
+/// [`file_revision`]. [`repo_revision`] keeps answering
+/// [`LIGHTX2V_REVISION`] for the repository: the two FL2V adapters pinned
+/// there are byte-identical at both revisions, and moving their pin would
+/// change the recorded provenance of already-installed files for no change
+/// in content.
+pub const LIGHTX2V_REF2VA_8STEP_768P_REVISION: &str = "0eebcc7e79f9cb200927c80b8e7595265b770e34";
 /// Third-party repository publishing the SVD-resized Turbo LoRA adapters.
 ///
 /// The third non-MiniMaxAI/non-Comfy-Org source mold pins, and like
@@ -123,6 +134,21 @@ pub const FL2VA_COMFY_TURBO_8STEP_R21: &str = "minimax-h3-fl2va:comfy-pruned-int
 /// tier of the Ref2VA partition.
 pub const REF2VA_COMFY_TURBO_4STEP_R21: &str =
     "minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-r21";
+/// lightx2v's 8-step 768p Ref2VA distillation — the full-quality Ref2VA Turbo
+/// tier. No version suffix: there is no other 8-step 768p Ref2VA tier.
+pub const REF2VA_COMFY_TURBO_8STEP_768P: &str =
+    "minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p";
+/// DRAFT tier: [`REF2VA_COMFY_TURBO_4STEP`]'s exact adapter applied at
+/// strength 0.5 (`s050`). Same file, same 5-point schedule, same shift; every
+/// low-rank delta is halved. It exists because the v0.1 Ref2V 4-step adapter
+/// at full strength systematically places the subject left of centre
+/// (measured 2026-09-28: mirroring every reference image does not move it,
+/// and the same prompt on the undistilled 21-step checkpoint is centred);
+/// 0.75 half-corrects it, 0.5 corrects both probe shots, 0.25 is close to
+/// the undistilled render, and 384x672 draft frames at 0.5 show no obvious
+/// softening. A preview tier, not a published distillation.
+pub const REF2VA_COMFY_TURBO_4STEP_S050: &str =
+    "minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050";
 /// Pruned NVFP4 compact transformers. Deliberately absent from
 /// [`REVIEWED_COMPACT_MODELS`]: they download, verify, inventory, and remove
 /// like any other pinned model, but mold has no engine arm for the weight
@@ -144,6 +170,8 @@ pub const REVIEWED_COMPACT_MODELS: &[&str] = &[
     FL2VA_COMFY_TURBO_4STEP_768P_R21,
     FL2VA_COMFY_TURBO_8STEP_R21,
     REF2VA_COMFY_TURBO_4STEP_R21,
+    REF2VA_COMFY_TURBO_8STEP_768P,
+    REF2VA_COMFY_TURBO_4STEP_S050,
 ];
 
 /// Exact-identity membership test for [`REVIEWED_COMPACT_MODELS`]. This is
@@ -178,10 +206,11 @@ const RESIZED_TURBO_ADAPTER_SHAPE: &str =
 ///
 /// This mirrors the runtime tier table owned by `mold-candle`
 /// (`H3TurboLoraTier`) — stable id, published file identity, and the
-/// terminal-inclusive reviewed step count — so acquisition manifests can pin
-/// the adapter without mold-core depending on candle. A contract test in
-/// `mold-inference` pins both tables together.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// terminal-inclusive reviewed step count, and the strength the adapter is
+/// applied at — so acquisition manifests can pin the adapter without
+/// mold-core depending on candle. A contract test in `mold-inference` pins
+/// both tables together.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TurboManifestTier {
     /// The manifest identity carrying this tier (a tag on the compact task).
     pub model: &'static str,
@@ -212,6 +241,13 @@ pub struct TurboManifestTier {
     pub adapter_shape_label: &'static str,
     /// Terminal-inclusive mold steps: published transformer evaluations + 1.
     pub steps: u32,
+    /// The factor every low-rank delta is multiplied by on top of the file's
+    /// own `alpha / rank`. `1.0` — the published strength — for every tier
+    /// except a strength variant, which re-applies ANOTHER row's exact
+    /// adapter file (same repo, revision, path, size, digest) at a lower
+    /// strength. Two rows may share an adapter file only that way; both
+    /// resolve to one on-disk copy, so neither downloads it twice.
+    pub adapter_strength: f32,
 }
 
 /// Reviewed Turbo tiers shipped as first-class manifest tags, for both task
@@ -238,6 +274,7 @@ pub const REVIEWED_TURBO_MANIFEST_TIERS: &[TurboManifestTier] = &[
         adapter_sha256: "2339acdf19bfe123f46b971ea35d367a84adb85de43627e1eceafa5a5b2b111e",
         adapter_shape_label: UNIFORM_TURBO_ADAPTER_SHAPE,
         steps: 9,
+        adapter_strength: 1.0,
     },
     TurboManifestTier {
         model: FL2VA_COMFY_TURBO_4STEP_768P,
@@ -250,6 +287,7 @@ pub const REVIEWED_TURBO_MANIFEST_TIERS: &[TurboManifestTier] = &[
         adapter_sha256: "c396a9a06f58399e9df9754b18299818d84a2ddd371724ba48fe4a41221437dc",
         adapter_shape_label: UNIFORM_TURBO_ADAPTER_SHAPE,
         steps: 5,
+        adapter_strength: 1.0,
     },
     TurboManifestTier {
         model: REF2VA_COMFY_TURBO_4STEP,
@@ -262,6 +300,7 @@ pub const REVIEWED_TURBO_MANIFEST_TIERS: &[TurboManifestTier] = &[
         adapter_sha256: "5b9ab5ade15d0775676d01a907268a69a1468dc6033b3b0d3ded5502f3ebb84c",
         adapter_shape_label: UNIFORM_TURBO_ADAPTER_SHAPE,
         steps: 5,
+        adapter_strength: 1.0,
     },
     TurboManifestTier {
         model: FL2VA_COMFY_TURBO_4STEP_768P_V11,
@@ -274,6 +313,7 @@ pub const REVIEWED_TURBO_MANIFEST_TIERS: &[TurboManifestTier] = &[
         adapter_sha256: "449d80f301ac571622c72e28b8fd72a4b3681b7a8df8a92f17c8f6ec43f56558",
         adapter_shape_label: UNIFORM_TURBO_ADAPTER_SHAPE,
         steps: 5,
+        adapter_strength: 1.0,
     },
     TurboManifestTier {
         model: FL2VA_COMFY_TURBO_8STEP_768P,
@@ -286,6 +326,7 @@ pub const REVIEWED_TURBO_MANIFEST_TIERS: &[TurboManifestTier] = &[
         adapter_sha256: "08cfe946033af7d27719b964b6e0a0e50c32138daabbd6ce4137e23df6bf9980",
         adapter_shape_label: UNIFORM_TURBO_ADAPTER_SHAPE,
         steps: 9,
+        adapter_strength: 1.0,
     },
     TurboManifestTier {
         model: FL2VA_COMFY_TURBO_4STEP_768P_R21,
@@ -300,6 +341,7 @@ pub const REVIEWED_TURBO_MANIFEST_TIERS: &[TurboManifestTier] = &[
         adapter_sha256: "1b85da614014024a0c9507f12558917dcc69b6adb564e716324594f401723115",
         adapter_shape_label: RESIZED_TURBO_ADAPTER_SHAPE,
         steps: 5,
+        adapter_strength: 1.0,
     },
     TurboManifestTier {
         model: FL2VA_COMFY_TURBO_8STEP_R21,
@@ -313,6 +355,7 @@ pub const REVIEWED_TURBO_MANIFEST_TIERS: &[TurboManifestTier] = &[
         adapter_sha256: "a3208be61329c27a6754c53db9a21a3c86e2a285381700adf2d97e279c062840",
         adapter_shape_label: RESIZED_TURBO_ADAPTER_SHAPE,
         steps: 9,
+        adapter_strength: 1.0,
     },
     TurboManifestTier {
         model: REF2VA_COMFY_TURBO_4STEP_R21,
@@ -327,6 +370,36 @@ pub const REVIEWED_TURBO_MANIFEST_TIERS: &[TurboManifestTier] = &[
         adapter_sha256: "2c6abb194cff3e26c2295c87892913adf0c92d8f784f305238246759f9b333d0",
         adapter_shape_label: RESIZED_TURBO_ADAPTER_SHAPE,
         steps: 5,
+        adapter_strength: 1.0,
+    },
+    TurboManifestTier {
+        model: REF2VA_COMFY_TURBO_8STEP_768P,
+        tier_stable_id: "minimax-h3.turbo-lora.ref2v-8step-768p-v1.0.comfyui-bf16.v1",
+        display_label: "Ref2VA Turbo 8-step 768p",
+        adapter_hf_repo: LIGHTX2V_REPO,
+        adapter_hf_revision: LIGHTX2V_REF2VA_8STEP_768P_REVISION,
+        adapter_hf_filename: "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+        adapter_size_bytes: 1_956_193_000,
+        adapter_sha256: "6a56f41ab4229c9dd845b9501bbd475ee57e112d846cf2e819d534a1ae928c5a",
+        adapter_shape_label: UNIFORM_TURBO_ADAPTER_SHAPE,
+        steps: 9,
+        adapter_strength: 1.0,
+    },
+    // A strength variant: the `REF2VA_COMFY_TURBO_4STEP` row's exact file,
+    // re-applied at half strength. Every file field below repeats that row
+    // verbatim; a test welds them together.
+    TurboManifestTier {
+        model: REF2VA_COMFY_TURBO_4STEP_S050,
+        tier_stable_id: "minimax-h3.turbo-lora.ref2v-4step-v0.1.comfyui-bf16.strength-0.5.v1",
+        display_label: "Turbo 4-step draft (strength 0.5)",
+        adapter_hf_repo: COMFY_REPO,
+        adapter_hf_revision: COMFY_TURBO_LORA_REVISION,
+        adapter_hf_filename: "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        adapter_size_bytes: 1_956_193_000,
+        adapter_sha256: "5b9ab5ade15d0775676d01a907268a69a1468dc6033b3b0d3ded5502f3ebb84c",
+        adapter_shape_label: UNIFORM_TURBO_ADAPTER_SHAPE,
+        steps: 5,
+        adapter_strength: 0.5,
     },
 ];
 
@@ -1302,6 +1375,8 @@ pub fn resolve_model_name(input: &str) -> Option<&'static str> {
         }
         value if value == FL2VA_COMFY_TURBO_8STEP_R21 => Some(FL2VA_COMFY_TURBO_8STEP_R21),
         value if value == REF2VA_COMFY_TURBO_4STEP_R21 => Some(REF2VA_COMFY_TURBO_4STEP_R21),
+        value if value == REF2VA_COMFY_TURBO_8STEP_768P => Some(REF2VA_COMFY_TURBO_8STEP_768P),
+        value if value == REF2VA_COMFY_TURBO_4STEP_S050 => Some(REF2VA_COMFY_TURBO_4STEP_S050),
         _ => None,
     }
 }
@@ -3659,8 +3734,10 @@ pub(crate) fn manifests() -> Vec<ModelManifest> {
             // ~42.8 GB pull, so it discloses the adapter's SHAPE and not
             // only its label: a lossy SVD resize is never described in the
             // same words as the full-rank adapter it approximates.
+            // A strength variant says so in the same sentence: it downloads
+            // the full-strength tag's exact adapter and renders a draft.
             description: format!(
-                "MiniMax H3 {} Comfy pruned INT8-convrot + NVFP4-AWQ with the reviewed{} {} LoRA (downloadable; CUDA or Apple Metal)",
+                "MiniMax H3 {} Comfy pruned INT8-convrot + NVFP4-AWQ with the reviewed{} {} LoRA{} (downloadable; CUDA or Apple Metal)",
                 match task {
                     Task::Fl2va => "FL2VA",
                     Task::Ref2va => "Ref2VA",
@@ -3670,7 +3747,15 @@ pub(crate) fn manifests() -> Vec<ModelManifest> {
                 } else {
                     ""
                 },
-                tier.display_label
+                tier.display_label,
+                if tier.adapter_strength.to_bits() == 1.0f32.to_bits() {
+                    String::new()
+                } else {
+                    format!(
+                        " applied at strength {} — a draft preview tier sharing the full-strength tag's adapter file",
+                        tier.adapter_strength
+                    )
+                }
             ),
             files,
             defaults: defaults_with_steps(tier.steps),
@@ -3886,6 +3971,8 @@ mod tests {
             FL2VA_COMFY_TURBO_4STEP_768P_R21,
             FL2VA_COMFY_TURBO_8STEP_R21,
             REF2VA_COMFY_TURBO_4STEP_R21,
+            REF2VA_COMFY_TURBO_8STEP_768P,
+            REF2VA_COMFY_TURBO_4STEP_S050,
         ] {
             assert_eq!(
                 source_fit_dimensions(model, 1024, 1024),
@@ -5058,6 +5145,8 @@ mod tests {
             FL2VA_COMFY_TURBO_4STEP_768P_R21,
             FL2VA_COMFY_TURBO_8STEP_R21,
             REF2VA_COMFY_TURBO_4STEP_R21,
+            REF2VA_COMFY_TURBO_8STEP_768P,
+            REF2VA_COMFY_TURBO_4STEP_S050,
         ] {
             for &(width, height) in REVIEWED_COMPACT_CANVASES {
                 assert!(
@@ -5377,6 +5466,18 @@ mod tests {
                 Layout::ComfyPrunedInt8ConvrotNvfp4Awq,
                 REF2VA_MODES,
             ),
+            (
+                REF2VA_COMFY_TURBO_8STEP_768P,
+                Task::Ref2va,
+                Layout::ComfyPrunedInt8ConvrotNvfp4Awq,
+                REF2VA_MODES,
+            ),
+            (
+                REF2VA_COMFY_TURBO_4STEP_S050,
+                Task::Ref2va,
+                Layout::ComfyPrunedInt8ConvrotNvfp4Awq,
+                REF2VA_MODES,
+            ),
         ];
         let mut observed_modes = Vec::new();
         for (model, task, layout, modes) in cases {
@@ -5447,6 +5548,8 @@ mod tests {
                 FL2VA_COMFY_TURBO_4STEP_768P_R21,
                 FL2VA_COMFY_TURBO_8STEP_R21,
                 REF2VA_COMFY_TURBO_4STEP_R21,
+                REF2VA_COMFY_TURBO_8STEP_768P,
+                REF2VA_COMFY_TURBO_4STEP_S050,
             ])
         );
         assert!(advertised
@@ -5468,6 +5571,8 @@ mod tests {
         let fl_turbo_4_768p_r21 = find_manifest(FL2VA_COMFY_TURBO_4STEP_768P_R21).unwrap();
         let fl_turbo_8_r21 = find_manifest(FL2VA_COMFY_TURBO_8STEP_R21).unwrap();
         let ref_turbo_4_r21 = find_manifest(REF2VA_COMFY_TURBO_4STEP_R21).unwrap();
+        let ref_turbo_8_768p = find_manifest(REF2VA_COMFY_TURBO_8STEP_768P).unwrap();
+        let ref_turbo_4_s050 = find_manifest(REF2VA_COMFY_TURBO_4STEP_S050).unwrap();
         let fl_nvfp4 = find_manifest(FL2VA_COMFY_NVFP4).unwrap();
         let ref_nvfp4 = find_manifest(REF2VA_COMFY_NVFP4).unwrap();
         assert!(!fl_nvfp4.hidden);
@@ -5483,6 +5588,8 @@ mod tests {
         assert!(!fl_turbo_4_768p_r21.hidden);
         assert!(!fl_turbo_8_r21.hidden);
         assert!(!ref_turbo_4_r21.hidden);
+        assert!(!ref_turbo_8_768p.hidden);
+        assert!(!ref_turbo_4_s050.hidden);
         for manifest in [
             fl_official,
             ref_official,
@@ -5495,6 +5602,8 @@ mod tests {
             fl_turbo_4_768p_r21,
             fl_turbo_8_r21,
             ref_turbo_4_r21,
+            ref_turbo_8_768p,
+            ref_turbo_4_s050,
             fl_nvfp4,
             ref_nvfp4,
         ] {
@@ -5590,6 +5699,8 @@ mod tests {
                 FL2VA_COMFY_TURBO_4STEP_768P_R21,
                 FL2VA_COMFY_TURBO_8STEP_R21,
                 REF2VA_COMFY_TURBO_4STEP_R21,
+                REF2VA_COMFY_TURBO_8STEP_768P,
+                REF2VA_COMFY_TURBO_4STEP_S050,
             ])
         );
 
@@ -5785,11 +5896,15 @@ mod tests {
                     );
                 }
                 LIGHTX2V_REPO => {
-                    assert_eq!(
-                        tier.adapter_hf_revision, LIGHTX2V_REVISION,
-                        "{}",
-                        tier.model
-                    );
+                    // Two pins of one repository: only the Ref2VA 8-step 768p
+                    // adapter, published after the original pin, carries the
+                    // later revision.
+                    let expected = if tier.model == REF2VA_COMFY_TURBO_8STEP_768P {
+                        LIGHTX2V_REF2VA_8STEP_768P_REVISION
+                    } else {
+                        LIGHTX2V_REVISION
+                    };
+                    assert_eq!(tier.adapter_hf_revision, expected, "{}", tier.model);
                     assert!(
                         !tier.adapter_hf_filename.contains('/'),
                         "{} lightx2v adapter is not at the repository root",
@@ -5831,8 +5946,15 @@ mod tests {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap();
+            // A strength variant re-applies another row's exact file, so it
+            // is checked against that row (by
+            // `a_strength_variant_row_shares_one_adapter_file_with_its_full_strength_row`)
+            // instead of joining the file-uniqueness sets below. Its tag,
+            // stable id and label stay unique like every other row's.
+            let shares_a_file = tier.adapter_strength.to_bits() != 1.0f32.to_bits();
             assert!(
-                repo_paths.insert((tier.adapter_hf_repo, tier.adapter_hf_filename)),
+                shares_a_file
+                    || repo_paths.insert((tier.adapter_hf_repo, tier.adapter_hf_filename)),
                 "{} repeats a repository path",
                 tier.model
             );
@@ -5840,12 +5962,12 @@ mod tests {
             // tiers sharing one basename would share one on-disk file with two
             // different digests.
             assert!(
-                basenames.insert(basename),
+                shares_a_file || basenames.insert(basename),
                 "{} repeats a basename",
                 tier.model
             );
             assert!(
-                digests.insert(tier.adapter_sha256),
+                shares_a_file || digests.insert(tier.adapter_sha256),
                 "{} repeats a digest",
                 tier.model
             );
@@ -5894,6 +6016,99 @@ mod tests {
                 .map(|tier| tier.adapter_hf_repo)
                 .collect::<std::collections::BTreeSet<_>>(),
             std::collections::BTreeSet::from([COMFY_REPO, LIGHTX2V_REPO, DRBAPH_TURBO_LORA_REPO])
+        );
+    }
+
+    /// Two rows may share one adapter file only as a STRENGTH VARIANT: a row
+    /// whose `adapter_strength` is not the published `1.0` must repeat, field
+    /// for field, the file of exactly one full-strength row of its own task,
+    /// and both resolve to ONE on-disk path — so a host holding the
+    /// full-strength adapter already holds the variant's, and pulling either
+    /// tag never downloads the file twice. Every full-strength row owns a
+    /// distinct file (the sources test above).
+    #[test]
+    fn a_strength_variant_row_shares_one_adapter_file_with_its_full_strength_row() {
+        let mut variants = 0;
+        for tier in REVIEWED_TURBO_MANIFEST_TIERS {
+            assert!(
+                tier.adapter_strength.is_finite()
+                    && tier.adapter_strength > 0.0
+                    && tier.adapter_strength <= 1.0,
+                "{} strength {}",
+                tier.model,
+                tier.adapter_strength
+            );
+            if tier.adapter_strength.to_bits() == 1.0f32.to_bits() {
+                continue;
+            }
+            variants += 1;
+            let owners = REVIEWED_TURBO_MANIFEST_TIERS
+                .iter()
+                .filter(|row| {
+                    row.adapter_strength.to_bits() == 1.0f32.to_bits()
+                        && row.adapter_hf_repo == tier.adapter_hf_repo
+                        && row.adapter_hf_filename == tier.adapter_hf_filename
+                })
+                .collect::<Vec<_>>();
+            let [owner] = owners.as_slice() else {
+                panic!(
+                    "{} must share exactly one full-strength row's file",
+                    tier.model
+                );
+            };
+            assert_eq!(owner.adapter_hf_revision, tier.adapter_hf_revision);
+            assert_eq!(owner.adapter_size_bytes, tier.adapter_size_bytes);
+            assert_eq!(owner.adapter_sha256, tier.adapter_sha256);
+            assert_eq!(owner.adapter_shape_label, tier.adapter_shape_label);
+            assert_eq!(owner.steps, tier.steps);
+            assert_eq!(task_for_model(owner.model), task_for_model(tier.model));
+            assert_ne!(owner.tier_stable_id, tier.tier_stable_id);
+
+            let manifest = find_manifest(tier.model).unwrap();
+            let owner_manifest = find_manifest(owner.model).unwrap();
+            let adapter = |manifest: &'static ModelManifest| {
+                manifest
+                    .files
+                    .iter()
+                    .find(|file| file.component == ModelComponent::DistilledLora)
+                    .unwrap()
+            };
+            // The same file row, the same storage path: one download, one
+            // copy on disk, and the same base-stack directory.
+            assert_eq!(adapter(manifest), adapter(owner_manifest));
+            assert_eq!(
+                storage_path(manifest, adapter(manifest)),
+                storage_path(owner_manifest, adapter(owner_manifest))
+            );
+            assert_eq!(
+                crate::manifest::storage_directory_name(manifest),
+                crate::manifest::storage_directory_name(owner_manifest)
+            );
+            let paths = |manifest: &'static ModelManifest| {
+                manifest
+                    .files
+                    .iter()
+                    .map(|file| storage_path(manifest, file))
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            assert_eq!(paths(manifest), paths(owner_manifest), "{}", tier.model);
+            // The sentence a user reads before a pull says it is a draft.
+            assert!(
+                manifest.description.contains("draft"),
+                "{}: {}",
+                tier.model,
+                manifest.description
+            );
+            assert!(!owner_manifest.description.contains("draft"));
+        }
+        assert_eq!(variants, 1);
+        let draft = turbo_tier_for_model(REF2VA_COMFY_TURBO_4STEP_S050).unwrap();
+        assert_eq!(draft.adapter_strength, 0.5);
+        assert_eq!(
+            draft.adapter_hf_filename,
+            turbo_tier_for_model(REF2VA_COMFY_TURBO_4STEP)
+                .unwrap()
+                .adapter_hf_filename
         );
     }
 
@@ -6001,6 +6216,25 @@ mod tests {
         assert_eq!(
             file_revision(DRBAPH_TURBO_LORA_REPO, drbaph.adapter_hf_filename),
             Some(DRBAPH_TURBO_LORA_REVISION)
+        );
+        // The Ref2VA 8-step 768p adapter does not exist at the repository-wide
+        // lightx2v pin; the exact `(repo, path)` pair resolves it to the
+        // later revision, while the repository itself keeps its original pin.
+        let ref2va_8step = REVIEWED_TURBO_MANIFEST_TIERS
+            .iter()
+            .find(|tier| tier.model == REF2VA_COMFY_TURBO_8STEP_768P)
+            .unwrap();
+        assert_eq!(
+            file_revision(LIGHTX2V_REPO, ref2va_8step.adapter_hf_filename),
+            Some(LIGHTX2V_REF2VA_8STEP_768P_REVISION)
+        );
+        assert_eq!(repo_revision(LIGHTX2V_REPO), Some(LIGHTX2V_REVISION));
+        assert_ne!(LIGHTX2V_REF2VA_8STEP_768P_REVISION, LIGHTX2V_REVISION);
+        // The draft tier's shared file resolves exactly as its owner's does.
+        let draft = turbo_tier_for_model(REF2VA_COMFY_TURBO_4STEP_S050).unwrap();
+        assert_eq!(
+            file_revision(draft.adapter_hf_repo, draft.adapter_hf_filename),
+            Some(COMFY_TURBO_LORA_REVISION)
         );
         // A Comfy-Org path that merely LOOKS like a lightx2v adapter is not
         // one: the tier lookup keys on the pair, so this falls back to the
@@ -6265,6 +6499,87 @@ mod tests {
             .unique_files
             .iter()
             .any(|(path, _)| path == &transformer_path));
+
+        std::env::remove_var("MOLD_MODELS_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A machine that already holds `-turbo-4step` holds the draft tier too:
+    /// the draft manifest resolves every file — base stack AND adapter — to a
+    /// path the 4-step install already completed, so it reads as downloaded
+    /// with nothing to fetch, and neither tag's removal deletes the shared
+    /// adapter while the other is installed.
+    #[test]
+    fn the_draft_tier_is_installed_wherever_the_full_strength_tier_is() {
+        use crate::removal::plan_removal;
+        use crate::Config;
+
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("mold-h3-turbo-draft-dedupe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("MOLD_MODELS_DIR", &root);
+
+        let full = find_manifest(REF2VA_COMFY_TURBO_4STEP).unwrap();
+        let draft = find_manifest(REF2VA_COMFY_TURBO_4STEP_S050).unwrap();
+        // Install ONLY the full-strength tag, exactly as a pull leaves it.
+        for file in &full.files {
+            let path = root.join(storage_path(full, file));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"weights").unwrap();
+            crate::download::write_sha256_marker(&path, file.sha256.unwrap_or("deadbeef")).unwrap();
+        }
+
+        let config = Config::default();
+        assert!(config.manifest_model_is_downloaded(REF2VA_COMFY_TURBO_4STEP));
+        assert!(
+            config.manifest_model_is_downloaded(REF2VA_COMFY_TURBO_4STEP_S050),
+            "the draft tier must read as installed on a host holding -turbo-4step"
+        );
+        assert!(!config.manifest_model_needs_download(REF2VA_COMFY_TURBO_4STEP_S050));
+        // Every draft file resolves to a completed path the full tag owns.
+        for file in &draft.files {
+            assert_eq!(
+                config.complete_manifest_file_path(draft, file),
+                Some(root.join(storage_path(full, file))),
+                "{}",
+                file.hf_filename
+            );
+        }
+
+        // Both tags installed: removing either keeps the one adapter copy.
+        let adapter = draft
+            .files
+            .iter()
+            .find(|file| file.component == ModelComponent::DistilledLora)
+            .unwrap();
+        let adapter_path = root
+            .join(storage_path(draft, adapter))
+            .to_string_lossy()
+            .to_string();
+        for (removed, kept) in [
+            (REF2VA_COMFY_TURBO_4STEP_S050, REF2VA_COMFY_TURBO_4STEP),
+            (REF2VA_COMFY_TURBO_4STEP, REF2VA_COMFY_TURBO_4STEP_S050),
+        ] {
+            let plan = plan_removal(&config, removed);
+            assert!(
+                !plan
+                    .unique_files
+                    .iter()
+                    .any(|(path, _)| path == &adapter_path),
+                "removing {removed} must not delete the adapter {kept} still uses"
+            );
+            assert!(
+                plan.shared_files
+                    .iter()
+                    .any(|(path, used_by)| path == &adapter_path
+                        && used_by.iter().any(|model| model == kept)),
+                "removing {removed} must report the adapter as kept for {kept}: {:?}",
+                plan.shared_files
+            );
+        }
 
         std::env::remove_var("MOLD_MODELS_DIR");
         let _ = std::fs::remove_dir_all(&root);
@@ -6808,6 +7123,10 @@ mod tests {
         assert_eq!(
             source_revision("lightx2v-turbo-adapters"),
             LIGHTX2V_REVISION
+        );
+        assert_eq!(
+            source_revision("lightx2v-turbo-adapters-ref2v-8step-768p"),
+            LIGHTX2V_REF2VA_8STEP_768P_REVISION
         );
         assert_eq!(
             source_revision("drbaph-resized-loras"),

@@ -21,8 +21,27 @@ fails the test rather than the download.
 | `fl2v-4step-768p-v1.0-r21.header` | `drbaph/MiniMax-H3-Turbo-Lora-ComfyUI` | `be8eb3ea3466cbb7def202ffec0d2fdc054256ac` | `minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_resized_avg_rank_21_bf16.safetensors` | 2026-09-02 | `scripts/fetch-minimax-h3-turbo-header.py` | 52,928 | `e9a8cf11d436ab25df9667896a02c9768aca800ed5b8e5d794e80b7cb866f539` | `1b85da614014024a0c9507f12558917dcc69b6adb564e716324594f401723115` |
 | `fl2v-8step-v1.0-r21.header` | `drbaph/MiniMax-H3-Turbo-Lora-ComfyUI` | `be8eb3ea3466cbb7def202ffec0d2fdc054256ac` | `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_resized_avg_rank_21_bf16.safetensors` | 2026-09-02 | `scripts/fetch-minimax-h3-turbo-header.py` | 52,944 | `f1bbb213d10d64aaf63d4e973d72887e43d356a3352ba73534e04aa317795f2a` | `a3208be61329c27a6754c53db9a21a3c86e2a285381700adf2d97e279c062840` |
 | `ref2v-4step-v0.1-r21.header` | `drbaph/MiniMax-H3-Turbo-Lora-ComfyUI` | `be8eb3ea3466cbb7def202ffec0d2fdc054256ac` | `minimax_h3_ref2v_turbo_4step_v0.1_comfyui_resized_avg_rank_21_bf16.safetensors` | 2026-09-02 | `scripts/fetch-minimax-h3-turbo-header.py` | 52,952 | `3c1db66284973ee4eec4e9700e12b1fc587b1aa7f85af6a811daac0d15b4db6f` | `2c6abb194cff3e26c2295c87892913adf0c92d8f784f305238246759f9b333d0` |
+| `ref2v-8step-768p-v1.0.header` | `lightx2v/Minimax-h3-Turbo` | `0eebcc7e79f9cb200927c80b8e7595265b770e34` | `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors` | 2026-09-28 | `scripts/fetch-minimax-h3-turbo-header.py` | 73,632 | `a00789bea7db0e9488317a55cd97e04a786eef79a687167cdae75c2178112a39` | `6a56f41ab4229c9dd845b9501bbd475ee57e112d846cf2e819d534a1ae928c5a` |
 
-The last three rows are SVD-resized derivatives rather than published PEFT
+The `ref2v-8step-768p-v1.0` row is pinned at a LATER lightx2v revision than
+the two FL2V rows above it: the adapter was first published in lightx2v commit
+`0eebcc7e…` (2026-09-03) and does not exist at `05ef6784…`. Its header has the
+exact 624-tensor, 208-module key set, shapes and dtypes of the Ref2V 4-step
+v0.1 adapter (`training_rank "128"`, `training_alpha "8.0"`,
+`training_scale "0.0625"`, the same `base_model`), so it rides the
+rank-uniform contract unchanged. It carries no `final_layer` / `adaln_proj`
+tensor; a community report of ComfyUI meeting an unexpected
+`diffusion_model.final_layer.adaln_proj.linear.weight` does not reproduce
+against this file (or against the Diffusers export beside it, which likewise
+covers only the 50 blocks and 2 token refiners).
+
+The draft tier `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050`
+(`H3TurboLoraTier::Ref2v4StepV10Strength050`) has NO fixture of its own: it
+applies the exact `ref2v-4step-v0.1` file at strength 0.5 and claims that
+row's golden, so the "every fixture is claimed" rule holds without a
+duplicate blob.
+
+The drbaph rows are SVD-resized derivatives rather than published PEFT
 exports: 416 tensors instead of 624 (no `alpha` scalars), a per-module rank
 read from the header rather than one `training_rank` for the whole file, and a
 numeric `__metadata__.baked_scale` recording the source `alpha / rank` that was

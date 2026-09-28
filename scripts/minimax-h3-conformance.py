@@ -65,6 +65,10 @@ EXPECTED_REVISIONS = {
     # Third-party Turbo LoRA adapters (v1.1 4-step 768p, v1.0 8-step 768p):
     # runnable on the FL2VA compact stack.
     "lightx2v-turbo-adapters": "05ef678438e84933c406131b59abbf86919b3aac",
+    # The Ref2V 8-step 768p adapter from the same repository, first published
+    # at a later revision than the two FL2V adapters above: runnable on the
+    # Ref2VA compact stack.
+    "lightx2v-turbo-adapters-ref2v-8step-768p": "0eebcc7e79f9cb200927c80b8e7595265b770e34",
     # Third-party SVD-resized Turbo LoRA adapters (avg rank 21, lossy):
     # derivatives of three adapters already pinned above, runnable on the
     # compact stacks.

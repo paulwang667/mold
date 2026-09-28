@@ -97,6 +97,13 @@
       "authority": "deployment"
     },
     {
+      "id": "lightx2v-turbo-adapters-ref2v-8step-768p",
+      "repository": "https://huggingface.co/lightx2v/Minimax-h3-Turbo",
+      "revision": "0eebcc7e79f9cb200927c80b8e7595265b770e34",
+      "role": "third-party Turbo LoRA adapter (Ref2V v1.0 8-step 768p), first published at this later revision; runnable on the Ref2VA compact stack",
+      "authority": "deployment"
+    },
+    {
       "id": "drbaph-resized-loras",
       "repository": "https://huggingface.co/drbaph/MiniMax-H3-Turbo-Lora-ComfyUI",
       "revision": "be8eb3ea3466cbb7def202ffec0d2fdc054256ac",

@@ -5415,6 +5415,8 @@ mod tests {
             (crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P_R21, 5),
             (crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP_R21, 9),
             (crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP_R21, 5),
+            (crate::minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P, 9),
+            (crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP_S050, 5),
         ] {
             let turbo = crate::minimax_h3::turbo_tier_for_model(model).is_some();
             let mut h3_input = input(model, "minimax-h3");
@@ -5714,6 +5716,8 @@ mod tests {
             crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P_R21,
             crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP_R21,
             crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP_R21,
+            crate::minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P,
+            crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP_S050,
         ] {
             let profile = resolve_generation_profile(input(model, "minimax-h3"));
             let recipe = profile.default_recipe().unwrap();
@@ -5892,6 +5896,37 @@ mod tests {
             assert_eq!(resized_steps.default, source_steps.default, "{resized}");
             assert_eq!(resized_steps.note, source_steps.note, "{resized}");
         }
+
+        // A strength variant changes the delta, never the schedule: the draft
+        // tier carries its full-strength tag's count and sentence.
+        let draft = resolve_generation_profile(input(
+            crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP_S050,
+            "minimax-h3",
+        ));
+        let full = resolve_generation_profile(input(
+            crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP,
+            "minimax-h3",
+        ));
+        let draft_steps = &draft.default_recipe().unwrap().steps;
+        let full_steps = &full.default_recipe().unwrap().steps;
+        assert_eq!(draft_steps.mode, ControlMode::Fixed);
+        assert_eq!(draft_steps.default, 5);
+        assert_eq!(draft_steps.default, full_steps.default);
+        assert_eq!(draft_steps.note, full_steps.note);
+
+        // The Ref2VA 8-step 768p tier is a 9-point schedule on the Ref2VA
+        // partition: the same sentence as every other 9-point tier.
+        let ref_eight = resolve_generation_profile(input(
+            crate::minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P,
+            "minimax-h3",
+        ));
+        let ref_eight_steps = &ref_eight.default_recipe().unwrap().steps;
+        assert_eq!(ref_eight_steps.mode, ControlMode::Fixed);
+        assert_eq!(ref_eight_steps.default, 9);
+        assert_eq!(
+            ref_eight_steps.note.as_deref(),
+            eight.default_recipe().unwrap().steps.note.as_deref()
+        );
     }
 
     /// The distilled FLUX/LTX case keeps the sentence clients used to

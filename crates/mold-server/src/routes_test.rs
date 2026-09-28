@@ -12642,7 +12642,8 @@ mod tests {
             FL2VA_COMFY_TURBO_4STEP_768P_V11, FL2VA_COMFY_TURBO_8STEP,
             FL2VA_COMFY_TURBO_8STEP_768P, FL2VA_COMFY_TURBO_8STEP_R21, FL2VA_OFFICIAL, NVFP4_REPO,
             OFFICIAL_REPO, REF2VA_COMFY, REF2VA_COMFY_NVFP4, REF2VA_COMFY_TURBO_4STEP,
-            REF2VA_COMFY_TURBO_4STEP_R21, REF2VA_OFFICIAL,
+            REF2VA_COMFY_TURBO_4STEP_R21, REF2VA_COMFY_TURBO_4STEP_S050,
+            REF2VA_COMFY_TURBO_8STEP_768P, REF2VA_OFFICIAL,
         };
         // Both compact task partitions execute since #825, so their answer
         // depends only on how this binary was compiled; the pinned layouts
@@ -12722,6 +12723,20 @@ mod tests {
                 ),
                 (
                     REF2VA_COMFY_TURBO_4STEP_R21,
+                    false,
+                    COMFY_REPO,
+                    ref2va.0,
+                    ref2va.1
+                ),
+                (
+                    REF2VA_COMFY_TURBO_8STEP_768P,
+                    false,
+                    COMFY_REPO,
+                    ref2va.0,
+                    ref2va.1
+                ),
+                (
+                    REF2VA_COMFY_TURBO_4STEP_S050,
                     false,
                     COMFY_REPO,
                     ref2va.0,

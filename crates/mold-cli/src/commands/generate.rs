@@ -6439,6 +6439,11 @@ mod tests {
             (mold_core::minimax_h3::FL2VA_COMFY_TURBO_8STEP_768P, 9),
             (mold_core::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P_R21, 5),
             (mold_core::minimax_h3::FL2VA_COMFY_TURBO_8STEP_R21, 9),
+            // The Ref2VA Turbo tags default from their own tier rows too,
+            // the draft tier included (its full-strength tag's 5 points).
+            (mold_core::minimax_h3::REF2VA_COMFY_TURBO_4STEP, 5),
+            (mold_core::minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P, 9),
+            (mold_core::minimax_h3::REF2VA_COMFY_TURBO_4STEP_S050, 5),
         ] {
             let model_cfg = config.resolved_model_config(model);
             assert_eq!(
@@ -6528,6 +6533,16 @@ mod tests {
                 false,
             ),
             (mold_core::minimax_h3::FL2VA_COMFY_TURBO_8STEP_R21, 9, false),
+            (
+                mold_core::minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P,
+                9,
+                false,
+            ),
+            (
+                mold_core::minimax_h3::REF2VA_COMFY_TURBO_4STEP_S050,
+                5,
+                false,
+            ),
         ] {
             let mut stale = config.resolved_model_config(model);
             stale.default_steps = Some(30);

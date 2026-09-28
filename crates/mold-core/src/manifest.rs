@@ -10428,7 +10428,13 @@ mod tests {
         // q5, q4, q3, q2) on the shared conditioner/VAE, and +3 turbo tags
         // (bf16, int8-conv, q8) that stack the Viggle 6-step adapter on those
         // base files.
-        assert_eq!(known_manifests().len(), 222);
+        // Ref2VA Turbo tiers bump: +2. `minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p`
+        // (lightx2v's 8-step 768p Ref2VA adapter) and
+        // `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050` (the draft
+        // tier: the Ref2VA 4-step adapter re-applied at strength 0.5, sharing
+        // that tag's exact file). Both ride the Ref2VA compact base stack, so
+        // each is one manifest.
+        assert_eq!(known_manifests().len(), 224);
     }
 
     /// Every reviewed H3 Turbo adapter lands in the one family `loras/`
