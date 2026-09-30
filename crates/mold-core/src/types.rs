@@ -14923,6 +14923,24 @@ mod mesh_reference_contract_tests {
     }
 
     #[test]
+    fn turbo_lora_strength_round_trips_and_is_absent_when_unset() {
+        let json = serde_json::json!({"prompt": "p", "model": "m", "width": 64, "height": 64, "steps": 1, "turbo_lora_strength": 0.75});
+        let req: GenerateRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.turbo_lora_strength, Some(0.75));
+        let back = serde_json::to_value(&req).unwrap();
+        assert_eq!(back["turbo_lora_strength"], 0.75);
+        let plain: GenerateRequest = serde_json::from_value(
+            serde_json::json!({"prompt": "p", "model": "m", "width": 64, "height": 64, "steps": 1}),
+        )
+        .unwrap();
+        assert_eq!(plain.turbo_lora_strength, None);
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("turbo_lora_strength")
+            .is_none());
+    }
+
+    #[test]
     fn mesh_reference_survives_wire_without_disclosing_its_authority() {
         let reference = GenerationReference::Mesh {
             media: GenerationReferenceAuthority::ServerPath {
