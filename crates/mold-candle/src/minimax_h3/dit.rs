@@ -1423,6 +1423,23 @@ impl H3TokenRefinerBlock {
         })
     }
 
+    /// Re-apply this block's resident Turbo deltas at another strength. The
+    /// matrices are shared; blocks without deltas stay untouched.
+    fn rescale_turbo(&mut self, strength: f32) -> Result<()> {
+        fn rescale(delta: &mut Option<H3TurboLoraDelta>, strength: f32) -> Result<()> {
+            if let Some(current) = delta.as_mut() {
+                *current = current
+                    .rescaled(strength)
+                    .map_err(|error| candle::Error::Msg(error.to_string()))?;
+            }
+            Ok(())
+        }
+        rescale(&mut self.attention.qkv_delta, strength)?;
+        rescale(&mut self.attention.out_delta, strength)?;
+        rescale(&mut self.mlp.fc1_delta, strength)?;
+        rescale(&mut self.mlp.fc2_delta, strength)
+    }
+
     fn forward(&self, hidden: &Tensor, attention_plan: &H3FrozenAttentionPlan) -> Result<Tensor> {
         let attention =
             self.attention
@@ -2918,6 +2935,17 @@ impl H3StreamedTransformer {
             Some(checkpoint_identity_sha256),
             turbo,
         )
+    }
+
+    /// Re-apply the resident token-refiner Turbo deltas at another strength
+    /// (research prototype: `MOLD_H3_REFINE_PROTO` `lora2`). The streamed main
+    /// blocks are rescaled through their loader instead. A transformer loaded
+    /// without an adapter is left as it is.
+    pub fn rescale_turbo_token_refiners(&mut self, strength: f32) -> Result<()> {
+        for block in &mut self.token_refiner {
+            block.rescale_turbo(strength)?;
+        }
+        Ok(())
     }
 
     pub(super) fn streamed_identity(&self) -> Arc<H3StreamedTransformerIdentity> {

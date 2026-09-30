@@ -94,7 +94,13 @@ fn failure(code: H3TurboLoraErrorCode, message: impl Into<String>) -> H3TurboLor
 pub struct H3TurboLoraDelta {
     down_t: Tensor,
     up_t: Tensor,
+    /// The applied scale: `f64::from(unit_scale * strength)`.
     scale: f64,
+    /// The file's own `alpha / rank` for this module, before any strength.
+    unit_scale: f32,
+    /// The strength `scale` was built at. `1.0` for a delta built through
+    /// [`Self::new`], whose caller already folded any strength into `scale`.
+    strength: f32,
     rank: usize,
     in_features: usize,
     out_features: usize,
@@ -105,6 +111,21 @@ impl H3TurboLoraDelta {
     /// Build from `A` at `[rank, in]` and `B` at `[out, rank]`, exactly the
     /// published `lora_A` / `lora_B` orientation.
     pub fn new(down: &Tensor, up: &Tensor, scale: f32) -> H3TurboLoraResult<Self> {
+        Self::new_with_strength(down, up, scale, 1.0)
+    }
+
+    /// [`Self::new`] keeping the file's `alpha / rank` (`unit_scale`) and the
+    /// applied `strength` apart, so [`Self::rescaled`] can re-derive the scale
+    /// for another strength without touching the matrices. The applied scale
+    /// is the f32 product `unit_scale * strength`, bit-identical to what a
+    /// caller that multiplied before calling [`Self::new`] would have passed.
+    pub fn new_with_strength(
+        down: &Tensor,
+        up: &Tensor,
+        unit_scale: f32,
+        strength: f32,
+    ) -> H3TurboLoraResult<Self> {
+        let scale = unit_scale * strength;
         let (rank, in_features) = down.dims2().map_err(|error| {
             failure(
                 H3TurboLoraErrorCode::ShapeMismatch,
@@ -181,6 +202,8 @@ impl H3TurboLoraDelta {
             down_t: transpose(down, "lora_A")?,
             up_t: transpose(up, "lora_B")?,
             scale: f64::from(scale),
+            unit_scale,
+            strength,
             rank,
             in_features,
             out_features,
@@ -202,6 +225,32 @@ impl H3TurboLoraDelta {
 
     pub const fn scale(&self) -> f64 {
         self.scale
+    }
+
+    /// The strength this delta's scale was built at.
+    pub const fn strength(&self) -> f32 {
+        self.strength
+    }
+
+    /// The same low-rank branch at another strength: `alpha / rank * strength`.
+    ///
+    /// The matrices are `Arc`-backed tensor handles, so the result shares the
+    /// device allocation with `self` (no copy) and `self` is left untouched.
+    /// Research-prototype hook for running one denoise pass at a different
+    /// strength than another (`MOLD_H3_REFINE_PROTO`, `lora2`).
+    pub fn rescaled(&self, strength: f32) -> H3TurboLoraResult<Self> {
+        let scale = self.unit_scale * strength;
+        if !strength.is_finite() || strength <= 0.0 || !scale.is_finite() || scale <= 0.0 {
+            return Err(failure(
+                H3TurboLoraErrorCode::ScaleMismatch,
+                format!("H3 Turbo delta strength {strength} must be finite and positive"),
+            ));
+        }
+        Ok(Self {
+            scale: f64::from(scale),
+            strength,
+            ..self.clone()
+        })
     }
 
     /// Resident bytes of this delta's two matrices.
@@ -282,6 +331,16 @@ impl H3TurboBlockDeltas {
             + self.fc2.device_bytes
     }
 
+    /// All four deltas at another strength; the matrices are shared.
+    pub fn rescaled(&self, strength: f32) -> H3TurboLoraResult<Self> {
+        Ok(Self {
+            qkv: self.qkv.rescaled(strength)?,
+            out: self.out.rescaled(strength)?,
+            fc1: self.fc1.rescaled(strength)?,
+            fc2: self.fc2.rescaled(strength)?,
+        })
+    }
+
     /// The delta overlaying one of the four adapted linears.
     pub fn kind(&self, kind: H3TurboLoraModuleKind) -> &H3TurboLoraDelta {
         match kind {
@@ -331,14 +390,13 @@ pub(super) fn validate_turbo_block_shapes(
 #[derive(Debug)]
 enum H3TurboMainBlocks {
     Resident(Vec<H3TurboBlockDeltas>),
-    MetalStreamed(H3TurboMainBlockStream),
+    /// Shared (`Arc`) so a runtime rescaled to another strength reads the same
+    /// authenticated descriptor; the strength is the RUNTIME's, passed per read.
+    MetalStreamed(Arc<H3TurboMainBlockStream>),
 }
 
 struct H3TurboMainBlockStream {
     modules: Vec<[H3TurboLoraModule; 4]>,
-    /// The tier's adapter strength, applied to every streamed block exactly
-    /// as the resident token-refiner blocks had it applied at open.
-    adapter_strength: f32,
     data_start: u64,
     device: Device,
     dtype: DType,
@@ -357,7 +415,6 @@ impl std::fmt::Debug for H3TurboMainBlockStream {
         formatter
             .debug_struct("H3TurboMainBlockStream")
             .field("modules", &self.modules.len())
-            .field("adapter_strength", &self.adapter_strength)
             .field("data_start", &self.data_start)
             .field("device", &self.device)
             .field("dtype", &self.dtype)
@@ -411,6 +468,47 @@ impl H3TurboLoraRuntime {
         self.adapter_strength
     }
 
+    /// The same authenticated adapter applied at another strength.
+    ///
+    /// Every delta shares its `lora_A` / `lora_B` device allocation with
+    /// `self`; only the per-module scalar `alpha / rank * strength` differs,
+    /// so this is cheap and adds no resident bytes. `self` is untouched. The
+    /// Metal route keeps reading the one retained descriptor. Research
+    /// prototype hook (`MOLD_H3_REFINE_PROTO` `lora2`); the published-strength
+    /// ceiling of 1.0 applies.
+    pub fn rescaled(&self, strength: f32) -> H3TurboLoraResult<Self> {
+        let adapter_strength = validated_adapter_strength(self.tier, Some(strength))?;
+        let main_blocks = match &self.main_blocks {
+            H3TurboMainBlocks::Resident(blocks) => H3TurboMainBlocks::Resident(
+                blocks
+                    .iter()
+                    .map(|block| block.rescaled(adapter_strength))
+                    .collect::<H3TurboLoraResult<Vec<_>>>()?,
+            ),
+            H3TurboMainBlocks::MetalStreamed(stream) => {
+                H3TurboMainBlocks::MetalStreamed(stream.clone())
+            }
+        };
+        let token_refiner_blocks = self
+            .token_refiner_blocks
+            .iter()
+            .map(|block| block.rescaled(adapter_strength))
+            .collect::<H3TurboLoraResult<Vec<_>>>()?;
+        Ok(Self {
+            tier: self.tier,
+            adapter_identity_sha256: self.adapter_identity_sha256.clone(),
+            content_sha256: self.content_sha256.clone(),
+            adapter_strength,
+            scale: self.scale / self.adapter_strength * adapter_strength,
+            main_blocks,
+            token_refiner_blocks,
+            device_bytes: self.device_bytes,
+            device_staging_peak_bytes: self.device_staging_peak_bytes,
+            host_staging_peak_bytes: self.host_staging_peak_bytes,
+            streamed_main_block_device_bytes: self.streamed_main_block_device_bytes,
+        })
+    }
+
     pub fn block_count(&self) -> usize {
         match &self.main_blocks {
             H3TurboMainBlocks::Resident(blocks) => blocks.len(),
@@ -439,7 +537,9 @@ impl H3TurboLoraRuntime {
                     format!("MiniMax H3 Turbo adapter has no main block {index}"),
                 )
             }),
-            H3TurboMainBlocks::MetalStreamed(stream) => stream.load_block(index),
+            H3TurboMainBlocks::MetalStreamed(stream) => {
+                stream.load_block(index, self.adapter_strength)
+            }
         }
     }
 
@@ -747,16 +847,15 @@ impl H3TurboLoraRuntime {
             content_sha256: contract.content_sha256().to_owned(),
             adapter_strength,
             scale: inspection.scale * adapter_strength,
-            main_blocks: H3TurboMainBlocks::MetalStreamed(H3TurboMainBlockStream {
+            main_blocks: H3TurboMainBlocks::MetalStreamed(Arc::new(H3TurboMainBlockStream {
                 modules,
-                adapter_strength,
                 data_start,
                 device: device.clone(),
                 dtype,
                 cancellation,
                 identity,
                 state: Mutex::new(H3TurboMainBlockStreamState { file }),
-            }),
+            })),
             token_refiner_blocks: collect_contiguous_blocks(refiner, "token refiner")?,
             device_bytes: token_refiner_device_bytes,
             device_staging_peak_bytes: widest_module_bytes,
@@ -828,7 +927,11 @@ impl H3TurboLoraRuntime {
 }
 
 impl H3TurboMainBlockStream {
-    fn load_block(&self, index: usize) -> H3TurboLoraResult<H3TurboBlockDeltas> {
+    fn load_block(
+        &self,
+        index: usize,
+        adapter_strength: f32,
+    ) -> H3TurboLoraResult<H3TurboBlockDeltas> {
         cancellation_boundary(self.cancellation.as_ref())?;
         let modules = self.modules.get(index).ok_or_else(|| {
             failure(
@@ -848,7 +951,7 @@ impl H3TurboMainBlockStream {
             cancellation_boundary(self.cancellation.as_ref())?;
             let delta = load_module_delta(
                 module,
-                self.adapter_strength,
+                adapter_strength,
                 &mut state.file,
                 self.data_start,
                 &self.device,
@@ -1072,7 +1175,7 @@ fn load_module_delta(
         cancellation,
     )?;
     // The file's own per-module `alpha / rank`, times the tier's strength.
-    let delta = H3TurboLoraDelta::new(&down, &up, module.scale * adapter_strength)?;
+    let delta = H3TurboLoraDelta::new_with_strength(&down, &up, module.scale, adapter_strength)?;
     // Each constructor transposes both source matrices into the retained
     // layout. Metal queues those copies asynchronously and otherwise keeps
     // every module's read/conversion/transpose sources alive until the entire
@@ -1674,6 +1777,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The research-prototype second pass re-applies the loaded adapter at
+    /// another strength: `alpha / rank x new_strength` on every delta, the
+    /// tensors shared with the original, and the original untouched.
+    #[test]
+    fn a_rescaled_runtime_applies_alpha_over_rank_times_the_new_strength() {
+        let tier = H3TurboLoraTier::Ref2v4StepV10;
+        let mut expectation = fixtures::expectation();
+        expectation.task = tier.task();
+        let (header, data) = fixtures::adapter(&expectation);
+        let (_directory, path) = fixtures::write(&header, &data);
+        expectation.content_sha256 = Some(super::super::comfy_dit::sha256_hex(
+            <sha2::Sha256 as sha2::Digest>::digest(std::fs::read(&path).unwrap()),
+        ));
+        let original = H3TurboLoraRuntime::open_against(
+            &path,
+            &expectation,
+            tier,
+            &Device::Cpu,
+            DType::F32,
+            &H3ComfyNeverCancel,
+            Some(1.0),
+        )
+        .unwrap();
+        let unit = original.scale();
+        assert_eq!(unit, 0.0625);
+
+        let rescaled = original.rescaled(0.5).unwrap();
+        assert_eq!(rescaled.adapter_strength(), 0.5);
+        assert_eq!(rescaled.scale(), unit * 0.5);
+        assert_eq!(rescaled.block_count(), original.block_count());
+        assert_eq!(
+            rescaled.token_refiner_block_count(),
+            original.token_refiner_block_count()
+        );
+        assert_eq!(rescaled.content_sha256(), original.content_sha256());
+        assert_eq!(rescaled.device_bytes(), original.device_bytes());
+
+        // The original is untouched, module for module.
+        assert_eq!(original.adapter_strength(), 1.0);
+        let x = ramp(3, 256, 91, &Device::Cpu);
+        let blocks = |runtime: &H3TurboLoraRuntime| {
+            vec![
+                runtime.main_block(0).unwrap().clone(),
+                runtime.main_block(1).unwrap().clone(),
+                runtime.token_refiner_block(0).unwrap().clone(),
+            ]
+        };
+        for (original_block, rescaled_block) in blocks(&original).iter().zip(blocks(&rescaled)) {
+            for kind in H3TurboLoraModuleKind::ALL {
+                let before = original_block.kind(kind);
+                let after = rescaled_block.kind(kind);
+                assert_eq!(before.scale(), f64::from(unit), "{kind:?}");
+                assert_eq!(before.strength(), 1.0);
+                assert_eq!(after.strength(), 0.5);
+                assert_eq!(after.scale(), before.scale() * 0.5, "{kind:?}");
+                let input = x.narrow(1, 0, before.in_features()).unwrap();
+                let full = before.delta(&input).unwrap().to_vec2::<f32>().unwrap();
+                let half = after.delta(&input).unwrap().to_vec2::<f32>().unwrap();
+                for (full_row, half_row) in full.iter().zip(&half) {
+                    for (full_value, half_value) in full_row.iter().zip(half_row) {
+                        assert!(
+                            (full_value * 0.5 - half_value).abs()
+                                <= 1e-6 * full_value.abs().max(1.0),
+                            "{kind:?}: {half_value} is not half of {full_value}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Rescaling back to the original strength restores the exact scale, and
+        // the published ceiling and positivity guards still apply.
+        let restored = rescaled.rescaled(1.0).unwrap();
+        assert_eq!(
+            restored.main_block(0).unwrap().qkv.scale(),
+            original.main_block(0).unwrap().qkv.scale()
+        );
+        assert!(original.rescaled(0.0).is_err());
+        assert!(original.rescaled(1.5).is_err());
+        assert!(original.rescaled(f32::NAN).is_err());
     }
 
     /// Without a request strength every reviewed tier resolves to the
