@@ -447,11 +447,10 @@ describe("MiniMax H3 Studio authority", () => {
     expect(turboV11.maxFrames).toBe(345);
 
     // The Ref2VA Turbo tiers pin their own schedule lengths too: 9 for the
-    // 8-step 768p tier, and 5 for the strength-0.5 draft tier, which shares
-    // the full-strength 4-step adapter and schedule.
+    // 8-step 768p tier and 5 for the 4-step tier.
     for (const [name, steps] of [
       ["minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p", 9],
-      ["minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050", 5],
+      ["minimax-h3-ref2va:comfy-pruned-int8-turbo-4step", 5],
     ] as const) {
       const ref2va = minimaxH3AuthoringCapabilities({
         name,

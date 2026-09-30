@@ -105,11 +105,6 @@ describe("modelDisplayName", () => {
         name: "minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p",
       }),
     ).toBe("MiniMax H3 Ref2VA Turbo 8-step 768p");
-    expect(
-      modelDisplayName({
-        name: "minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050",
-      }),
-    ).toBe("MiniMax H3 Ref2VA Turbo 4-step draft (strength 0.5)");
   });
 
   it("resolves a wire model id through the model inventory", () => {

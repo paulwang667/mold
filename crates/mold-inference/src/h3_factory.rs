@@ -1013,10 +1013,10 @@ pub struct H3FactoryTurboAdapterAuthority {
     resident_device_bytes: u64,
     device_staging_peak_bytes: u64,
     host_staging_peak_bytes: u64,
-    /// The request's adapter strength when it differs from the tier's own
-    /// (`f32` bits). `None` is the tier's reviewed strength, so a request that
-    /// names no strength — or names exactly the tier's — freezes byte-identical
-    /// to one made before the control existed.
+    /// The request's adapter strength when it differs from the published one
+    /// (`f32` bits). `None` is the published strength, so a request that names
+    /// no strength — or names exactly `1.0` — freezes byte-identical to one
+    /// made before the control existed.
     strength_override_bits: Option<u32>,
 }
 
@@ -1053,7 +1053,7 @@ impl H3FactoryTurboAdapterAuthority {
     }
 
     /// Freeze the request's adapter strength beside the tier. A value equal to
-    /// the tier's own strength canonicalizes to no override, so the identity
+    /// the published strength (`1.0`) canonicalizes to no override, so the identity
     /// depends on the effective strength and never on how it was spelled.
     pub fn with_strength_override(mut self, strength: f32) -> Result<Self> {
         let default = self.tier_default_strength()?;
@@ -1063,7 +1063,7 @@ impl H3FactoryTurboAdapterAuthority {
         Ok(self)
     }
 
-    /// The strength the runtime applies: the request's, else the tier's.
+    /// The strength the runtime applies: the request's, else the published one.
     pub fn effective_adapter_strength(&self) -> f32 {
         self.strength_override_bits
             .map(f32::from_bits)
@@ -1071,7 +1071,7 @@ impl H3FactoryTurboAdapterAuthority {
             .unwrap_or(1.0)
     }
 
-    /// The request's strength when it is not the tier's own.
+    /// The request's strength when it is not the published `1.0`.
     pub fn adapter_strength_override(&self) -> Option<f32> {
         self.strength_override_bits.map(f32::from_bits)
     }
@@ -1080,7 +1080,7 @@ impl H3FactoryTurboAdapterAuthority {
         mold_candle::minimax_h3::H3TurboLoraTier::ALL
             .into_iter()
             .find(|tier| tier.stable_id() == self.tier_stable_id)
-            .map(|tier| tier.adapter_strength())
+            .map(|_| mold_candle::minimax_h3::H3_TURBO_LORA_PUBLISHED_STRENGTH)
             .ok_or_else(|| {
                 anyhow!(
                     "MiniMax H3 Turbo tier {:?} is not a reviewed tier",
@@ -7101,15 +7101,12 @@ mod tests {
         "minimax-h3.turbo-lora.fl2v-8step-v1.0.comfyui-bf16.resized-avg-rank-21.v1";
     const TURBO_REF2V_4STEP_R21_TIER: &str =
         "minimax-h3.turbo-lora.ref2v-4step-v0.1.comfyui-bf16.resized-avg-rank-21.v1";
-    /// The full-strength Ref2V 4-step tier the draft tier re-applies.
+    /// The Ref2V 4-step tier.
     const TURBO_REF2V_4STEP_TIER: &str = "minimax-h3.turbo-lora.ref2v-4step-v0.1.comfyui-bf16.v1";
     /// lightx2v's Ref2V 8-step 768p tier: 9 points at the publisher's
     /// recommended shift of 12, not the FL2V 768p tiers' 6.
     const TURBO_REF2V_8STEP_768P_TIER: &str =
         "minimax-h3.turbo-lora.ref2v-8step-768p-v1.0.comfyui-bf16.v1";
-    /// The draft tier: the Ref2V 4-step file at strength 0.5.
-    const TURBO_REF2V_4STEP_S050_TIER: &str =
-        "minimax-h3.turbo-lora.ref2v-4step-v0.1.comfyui-bf16.strength-0.5.v1";
 
     fn turbo_authority_for(tier_stable_id: &str) -> H3FactoryTurboAdapterAuthority {
         H3FactoryTurboAdapterAuthority::for_reviewed_tier(
@@ -7161,14 +7158,25 @@ mod tests {
     }
 
     #[test]
-    fn a_request_strength_replaces_a_strength_variants_own_and_canonicalizes_back() {
-        let draft = turbo_authority_for(TURBO_REF2V_4STEP_S050_TIER);
-        assert_eq!(draft.effective_adapter_strength(), 0.5);
-        // Naming the variant's own 0.5 is no override; naming 1.0 is one.
-        assert_eq!(draft.clone().with_strength_override(0.5).unwrap(), draft);
-        let full = draft.clone().with_strength_override(1.0).unwrap();
-        assert_eq!(full.adapter_strength_override(), Some(1.0));
-        assert_eq!(full.effective_adapter_strength(), 1.0);
+    fn a_half_strength_request_on_the_ref2v_4step_tier_keeps_the_tier_and_canonicalizes_back() {
+        let plain = turbo_authority_for(TURBO_REF2V_4STEP_TIER);
+        assert_eq!(plain.effective_adapter_strength(), 1.0);
+        let half = plain.clone().with_strength_override(0.5).unwrap();
+        assert_eq!(half.effective_adapter_strength(), 0.5);
+        assert_eq!(half.adapter_strength_override(), Some(0.5));
+        // The strength rides beside the tier: the tier id and its whole
+        // distillation triple are the plain tier's, only the frozen identity
+        // differs.
+        assert_eq!(half.tier_stable_id(), plain.tier_stable_id());
+        assert_eq!(half.grid_points(), plain.grid_points());
+        assert_eq!(half.video_shift(), plain.video_shift());
+        assert_eq!(half.sampler_kind(), plain.sampler_kind());
+        assert_ne!(half, plain);
+        assert_ne!(turbo_identity_digest(&half), turbo_identity_digest(&plain));
+        // Naming the default 1.0 again canonicalizes back to no override.
+        let back = half.with_strength_override(1.0).unwrap();
+        assert_eq!(back, plain);
+        assert_eq!(back.adapter_strength_override(), None);
     }
 
     #[test]
@@ -7413,7 +7421,6 @@ mod tests {
             contract::FL2VA_COMFY_TURBO_8STEP_R21,
             contract::REF2VA_COMFY_TURBO_4STEP_R21,
             contract::REF2VA_COMFY_TURBO_8STEP_768P,
-            contract::REF2VA_COMFY_TURBO_4STEP_S050,
             contract::REF2VA_COMFY,
             "minimax-h3-fl2va:comfy-pruned-int8-turbo-2step",
         ] {
@@ -7688,19 +7695,6 @@ mod tests {
             ref2v_8_768p.sampler_kind(),
             H3FactorySamplerKind::ComfyEuler
         );
-        // The draft tier repeats its full-strength file tier's whole triple,
-        // but it is a DIFFERENT authority: the tier id is what every frozen
-        // plan, engine seam, and media pairing compares, so a plan frozen on
-        // the full-strength adapter can never execute the draft tag (or the
-        // reverse) on a matching step count.
-        let ref2v_4 = turbo_authority_for(TURBO_REF2V_4STEP_TIER);
-        let ref2v_s050 = turbo_authority_for(TURBO_REF2V_4STEP_S050_TIER);
-        assert_eq!(ref2v_s050.grid_points(), ref2v_4.grid_points());
-        assert_eq!(ref2v_s050.video_shift(), ref2v_4.video_shift());
-        assert_eq!(ref2v_s050.sampler_kind(), ref2v_4.sampler_kind());
-        assert_ne!(ref2v_s050.tier_stable_id(), ref2v_4.tier_stable_id());
-        assert_ne!(ref2v_s050, ref2v_4);
-
         let cases: [(&str, &str, &str, u64, u64, u64, &str); 6] = [
             (
                 "minimax-h3.turbo-lora.fl2v-2step.v1",

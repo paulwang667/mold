@@ -27349,11 +27349,6 @@
           "model": "minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-r21",
           "family": "minimax-h3",
           "hidden": false
-        },
-        {
-          "model": "minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050",
-          "family": "minimax-h3",
-          "hidden": false
         }
       ],
       "profile": {

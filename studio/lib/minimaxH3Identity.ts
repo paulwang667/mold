@@ -29,9 +29,6 @@ export const MINIMAX_H3_REF2VA_COMFY_TURBO_4STEP_R21 =
 // lightx2v's 8-step 768p Ref2VA distillation (the full-quality Ref2VA tier).
 export const MINIMAX_H3_REF2VA_COMFY_TURBO_8STEP_768P =
   "minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p";
-// Draft tier: the Ref2VA 4-step adapter above re-applied at strength 0.5.
-export const MINIMAX_H3_REF2VA_COMFY_TURBO_4STEP_S050 =
-  "minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050";
 
 function normalize(value: string): string {
   return value.trim().toLowerCase().replaceAll("_", "-");
@@ -67,8 +64,7 @@ export function canonicalMinimaxH3ModelName(
     value === MINIMAX_H3_FL2VA_COMFY_TURBO_4STEP_768P_R21 ||
     value === MINIMAX_H3_FL2VA_COMFY_TURBO_8STEP_R21 ||
     value === MINIMAX_H3_REF2VA_COMFY_TURBO_4STEP_R21 ||
-    value === MINIMAX_H3_REF2VA_COMFY_TURBO_8STEP_768P ||
-    value === MINIMAX_H3_REF2VA_COMFY_TURBO_4STEP_S050
+    value === MINIMAX_H3_REF2VA_COMFY_TURBO_8STEP_768P
   ) {
     return value;
   }

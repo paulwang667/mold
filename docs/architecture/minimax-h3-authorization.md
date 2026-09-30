@@ -14,7 +14,7 @@ like other supported model families. It does not require a per-user
 authorization file, private runtime record, location check, license-acceptance
 dialog, or H3-specific downstream control. Ordinary builds may advertise every
 registered H3 manifest identity — the two compact Comfy FL2VA and Ref2VA
-graphs, the eight reviewed Turbo LoRA tags built on them, and the
+graphs, the nine reviewed Turbo LoRA tags built on them, and the
 download-only `official-bf16` and `comfy-pruned-nvfp4` tags — download their
 exact revision-pinned files directly from Hugging Face, verify their recorded
 SHA-256 identities, retain them in the user's model store, and expose supported
@@ -84,7 +84,7 @@ configured models root and do not expose or copy that private evidence.
 The current decision permits:
 
 - public listing of every registered H3 manifest identity in Mold's Models
-  surfaces: the two compact Comfy FL2VA and Ref2VA graphs; the ten reviewed
+  surfaces: the two compact Comfy FL2VA and Ref2VA graphs; the nine reviewed
   Turbo tags built on them (`minimax-h3-fl2va:comfy-pruned-int8-turbo-8step`,
   `minimax-h3-fl2va:comfy-pruned-int8-turbo-4step-768p`,
   `minimax-h3-fl2va:comfy-pruned-int8-turbo-4step-768p-v1.1`,
@@ -93,14 +93,12 @@ The current decision permits:
   `minimax-h3-fl2va:comfy-pruned-int8-turbo-8step-r21`,
   `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step`,
   `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-r21`,
-  `minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p`, and
-  `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050`, each the compact
+  and `minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p`, each the compact
   stack of its own task plus one pinned adapter, stored once under
   `shared/minimax-h3/loras/` and shared, from the adapter's own source: three
-  from `Comfy-Org/MiniMax-H3` `loras/` at `COMFY_TURBO_LORA_REVISION` (the
-  Ref2VA 4-step adapter serves two tags — `-turbo-4step` at its published
-  strength and the `-turbo-4step-s050` draft tier at strength 0.5 — as one
-  file), the v1.1 4-step 768p and FL2V 8-step 768p adapters from
+  from `Comfy-Org/MiniMax-H3` `loras/` at `COMFY_TURBO_LORA_REVISION` (every
+  tag owns its own adapter file; a reduced adapter strength is the per-request
+  `turbo_lora_strength` control, frozen beside the tier, never a tag), the v1.1 4-step 768p and FL2V 8-step 768p adapters from
   `lightx2v/Minimax-h3-Turbo` at the repository root at
   `05ef678438e84933c406131b59abbf86919b3aac`, the Ref2V 8-step 768p adapter
   from the same repository root at the later revision

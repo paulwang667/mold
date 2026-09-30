@@ -35,12 +35,6 @@ tensor; a community report of ComfyUI meeting an unexpected
 against this file (or against the Diffusers export beside it, which likewise
 covers only the 50 blocks and 2 token refiners).
 
-The draft tier `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050`
-(`H3TurboLoraTier::Ref2v4StepV10Strength050`) has NO fixture of its own: it
-applies the exact `ref2v-4step-v0.1` file at strength 0.5 and claims that
-row's golden, so the "every fixture is claimed" rule holds without a
-duplicate blob.
-
 The drbaph rows are SVD-resized derivatives rather than published PEFT
 exports: 416 tensors instead of 624 (no `alpha` scalars), a per-module rank
 read from the header rather than one `training_rank` for the whole file, and a

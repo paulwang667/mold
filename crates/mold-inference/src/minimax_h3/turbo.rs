@@ -59,9 +59,7 @@ pub(crate) struct H3TurboTierContract {
 ///
 /// An SVD-resized tier repeats its SOURCE's triple exactly. A resize changes
 /// weights, never the schedule they were distilled for, so a row that differed
-/// from its source would be a transcription error rather than a decision. A
-/// strength variant repeats its FILE tier's triple exactly for the same
-/// reason: it is the same distillation applied more weakly.
+/// from its source would be a transcription error rather than a decision.
 pub(crate) const REVIEWED_TURBO_TIERS: &[H3TurboTierContract] = &[
     H3TurboTierContract {
         tier: H3TurboLoraTier::Fl2v8StepV10,
@@ -114,12 +112,6 @@ pub(crate) const REVIEWED_TURBO_TIERS: &[H3TurboTierContract] = &[
     H3TurboTierContract {
         tier: H3TurboLoraTier::Ref2v768p8StepV10,
         grid_points: 9,
-        sampler_kind: H3SamplerKind::ComfyEuler,
-        video_shift: H3_VIDEO_SHIFT,
-    },
-    H3TurboTierContract {
-        tier: H3TurboLoraTier::Ref2v4StepV10Strength050,
-        grid_points: 5,
         sampler_kind: H3SamplerKind::ComfyEuler,
         video_shift: H3_VIDEO_SHIFT,
     },
@@ -177,7 +169,6 @@ pub(crate) const fn short_tier_alias(tier: H3TurboLoraTier) -> &'static str {
         H3TurboLoraTier::Fl2v8StepV10Rank21 => "fl2v-8step-r21",
         H3TurboLoraTier::Ref2v4StepV10Rank21 => "ref2v-4step-r21",
         H3TurboLoraTier::Ref2v768p8StepV10 => "ref2v-8step-768p",
-        H3TurboLoraTier::Ref2v4StepV10Strength050 => "ref2v-4step-s050",
     }
 }
 
@@ -543,9 +534,6 @@ mod tests {
             // 768p-trained, but its publisher recommends video shift 12 for
             // the Ref2V path, not the FL2V 768p tiers' 6.
             (H3TurboLoraTier::Ref2v768p8StepV10, 9, H3_VIDEO_SHIFT),
-            // The same distillation as `Ref2v4StepV10`, applied at half
-            // strength: the schedule is the file tier's, asserted below.
-            (H3TurboLoraTier::Ref2v4StepV10Strength050, 5, H3_VIDEO_SHIFT),
         ];
         assert_eq!(expected.len(), H3TurboLoraTier::ALL.len());
         for (tier, grid_points, video_shift) in expected {
@@ -585,26 +573,6 @@ mod tests {
             );
             assert_eq!(source.task(), tier.task(), "{tier:?}");
         }
-
-        // A strength variant's triple is its file tier's, for the same
-        // reason: strength moves the delta, never the schedule.
-        let mut variants = 0;
-        for tier in H3TurboLoraTier::ALL {
-            if !tier.is_strength_variant() {
-                continue;
-            }
-            variants += 1;
-            let variant = turbo_tier_contract(tier).unwrap();
-            let file = turbo_tier_contract(tier.published_file_tier()).unwrap();
-            assert_eq!(variant.grid_points, file.grid_points, "{tier:?}");
-            assert_eq!(variant.sampler_kind, file.sampler_kind, "{tier:?}");
-            assert_eq!(
-                variant.video_shift.to_bits(),
-                file.video_shift.to_bits(),
-                "{tier:?}"
-            );
-        }
-        assert_eq!(variants, 1);
     }
 
     /// The Ref2V 8-step 768p schedule is the published one: 8 forwards over
@@ -651,7 +619,6 @@ mod tests {
         assert!(error.contains("fl2v-8step-r21"), "{error}");
         assert!(error.contains("ref2v-4step-r21"), "{error}");
         assert!(error.contains("ref2v-8step-768p"), "{error}");
-        assert!(error.contains("ref2v-4step-s050"), "{error}");
     }
 
     #[test]
@@ -733,14 +700,6 @@ mod tests {
             );
             let contract = turbo_tier_contract(tier).unwrap();
             assert_eq!(contract.grid_points, manifest_tier.steps);
-            // The strength is part of the tier on BOTH sides: a manifest row
-            // that disagreed would download one tier and render another.
-            assert_eq!(
-                tier.adapter_strength().to_bits(),
-                manifest_tier.adapter_strength.to_bits(),
-                "{} strength disagrees with the runtime tier",
-                manifest_tier.model
-            );
         }
         // Every runtime tier ships exactly one manifest tag.
         assert_eq!(
@@ -822,56 +781,6 @@ mod tests {
             );
         }
         assert_eq!(resized, 3);
-    }
-
-    /// A strength variant downloads nothing of its own: its manifest row pins
-    /// the exact file of the full-strength tag it re-applies, that tag ships
-    /// beside it on the same partition, and both select ONE on-disk path —
-    /// so a host that already holds the full-strength adapter has the draft
-    /// tier's adapter too, and pulling either never downloads it twice.
-    #[test]
-    fn a_strength_variant_tag_shares_the_full_strength_tags_adapter_file() {
-        let root = std::path::Path::new("/models");
-        let mut variants = 0;
-        for manifest_tier in mold_core::minimax_h3::REVIEWED_TURBO_MANIFEST_TIERS {
-            let tier = parse_turbo_tier(manifest_tier.tier_stable_id).unwrap();
-            if !tier.is_strength_variant() {
-                continue;
-            }
-            variants += 1;
-            let file_tier = tier.published_file_tier();
-            let file_row = mold_core::minimax_h3::REVIEWED_TURBO_MANIFEST_TIERS
-                .iter()
-                .find(|row| row.tier_stable_id == file_tier.stable_id())
-                .unwrap();
-            assert_eq!(manifest_tier.adapter_hf_repo, file_row.adapter_hf_repo);
-            assert_eq!(
-                manifest_tier.adapter_hf_revision,
-                file_row.adapter_hf_revision
-            );
-            assert_eq!(
-                manifest_tier.adapter_hf_filename,
-                file_row.adapter_hf_filename
-            );
-            assert_eq!(
-                manifest_tier.adapter_size_bytes,
-                file_row.adapter_size_bytes
-            );
-            assert_eq!(manifest_tier.adapter_sha256, file_row.adapter_sha256);
-            assert_eq!(manifest_tier.steps, file_row.steps);
-            assert_eq!(
-                mold_core::minimax_h3::task_for_model(manifest_tier.model),
-                mold_core::minimax_h3::task_for_model(file_row.model)
-            );
-            let (variant_path, _) = manifest_turbo_selection(manifest_tier.model, root)
-                .unwrap()
-                .unwrap();
-            let (file_path, _) = manifest_turbo_selection(file_row.model, root)
-                .unwrap()
-                .unwrap();
-            assert_eq!(variant_path, file_path);
-        }
-        assert_eq!(variants, 1);
     }
 
     #[test]

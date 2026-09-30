@@ -1581,9 +1581,10 @@ enumeration.
   (maintainer call, 2026-09-02, PR #1555; measured band 16.15 dB at 768x768 /
   17.00 dB at 1344x768).
 
-### The Ref2VA 8-step 768p and draft-strength tiers (2026-09-28)
+### The Ref2VA 8-step 768p tier and the Turbo strength control (2026-09-28)
 
-Two more Ref2VA Turbo tags, both on the Ref2VA compact stack.
+One more Ref2VA Turbo tag on the Ref2VA compact stack, and a per-request
+strength control for every Turbo tag.
 
 **`minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p`** takes lightx2v's
 `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors` — 1,956,193,000
@@ -1625,26 +1626,27 @@ FL2V 768p tiers. Mold follows the publisher and records the disagreement on
 tier has been made yet**; a shift 12 vs 6 A/B on a GPU host is the obvious
 first measurement, and a one-row change follows if it prefers 6.
 
-**`minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050`** is a DRAFT tier:
-the Ref2VA 4-step v0.1 adapter (`-turbo-4step`'s exact file — same repository,
-revision, path, size and digest) applied at `adapter_strength` 0.5, so every
-module's delta is `(alpha / rank) x 0.5` = 0.03125. It keeps the 5-point
-schedule and shift 12. The strength is a first-class tier fact on both tables
-(`TurboManifestTier::adapter_strength`, `H3TurboLoraTier::adapter_strength`,
-`1.0` for every other tier), is folded into the adapter identity whenever it
-is not `1.0` (so no frozen plan, cache or admission record can confuse the
-two), and the draft tag shares the 4-step tag's on-disk adapter, so a host
-that holds `-turbo-4step` pulls nothing new for it.
+**Turbo LoRA strength is a per-request control, not a tier.** A request may
+carry `turbo_lora_strength` in `(0, 1]` (CLI: `mold run --turbo-strength`),
+which replaces the published strength `1.0` for that render: every module's
+delta becomes `(alpha / rank) x strength` (0.03125 at 0.5 on the Ref2VA 4-step
+adapter). It is valid on every Turbo tag, keeps the tier's schedule and video
+shift, and is frozen into the factory authority beside the tier
+(`H3FactoryTurboAdapterAuthority::with_strength_override`), so a render at one
+strength is never reused for another; a value equal to `1.0` canonicalizes to
+no override and freezes byte-identically to a request that names none. There
+is no tier row for a reduced strength: a draft `-turbo-4step-s050` tag existed
+on this branch before any release and was removed once the strength became a
+request field (`turbo_lora_strength: 0.5` on `-turbo-4step` is its behaviour).
 
-Why it exists (measured 2026-09-28 on the deployer's server; the evidence
-lives with the deployer, not in this repository): the v0.1 Ref2V 4-step
-adapter at strength 1.0 systematically places the subject left of centre.
-Mirroring every reference image does not move it, and the same prompt on the
-undistilled 21-step checkpoint is centred. Strength 0.75 half-corrects the
-placement, 0.5 corrects both probe shots, and 0.25 is close to the
-undistilled render; 384x672 draft frames at 0.5 show no obvious softening.
-The tier is labelled a draft/preview tier everywhere it is named; a
-full-resolution quality comparison against `-turbo-4step` has not been run.
+Why the control exists (measured 2026-09-28 on the deployer's server; the
+evidence lives with the deployer, not in this repository): the v0.1 Ref2V
+4-step adapter at strength 1.0 systematically places the subject left of
+centre. Mirroring every reference image does not move it, and the same prompt
+on the undistilled 21-step checkpoint is centred. Strength 0.75 half-corrects
+the placement, 0.5 corrects both probe shots, and 0.25 is close to the
+undistilled render; 384x672 draft frames at 0.5 show no obvious softening. A
+full-resolution quality comparison against strength 1.0 has not been run.
 
 ### What is derived, and how
 

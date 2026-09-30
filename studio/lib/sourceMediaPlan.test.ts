@@ -100,7 +100,6 @@ describe("sourceMediaPlan", () => {
       "minimax-h3-ref2va:comfy-pruned-int8",
       "minimax-h3-ref2va:comfy-pruned-int8-turbo-4step",
       "minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p",
-      "minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-s050",
       "minimax-h3-ref2va:comfy-pruned-nvfp4",
     ]) {
       expect(plan("minimax-h3", model)).toEqual({ kind: "h3-references" });

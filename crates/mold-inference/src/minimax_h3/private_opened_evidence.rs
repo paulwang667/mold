@@ -3073,7 +3073,6 @@ mod tests {
             contract::REF2VA_COMFY_TURBO_4STEP_R21,
             contract::REF2VA_COMFY_TURBO_4STEP,
             contract::REF2VA_COMFY_TURBO_8STEP_768P,
-            contract::REF2VA_COMFY_TURBO_4STEP_S050,
         ] {
             let route = contract::capability_contract_for_model(model)
                 .unwrap_or_else(|| panic!("{model} must resolve a contract"));
