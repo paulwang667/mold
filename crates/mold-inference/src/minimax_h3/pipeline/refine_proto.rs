@@ -28,6 +28,15 @@
 //!   existing forward; `0` re-denoises from pure noise.
 //! - `lora2`: Turbo LoRA strength for pass 2 only, in `(0, 1]`; absent means
 //!   the request's strength is kept.
+//! - `uncap`: `1`/`true`/`on` lifts the request-side canvas AREA ceilings (the
+//!   compact rule, the family `MAX_PIXELS`, the profile's `max_pixels`) to
+//!   `mold_core::minimax_h3::UNCAP_MAX_PIXELS` (4 Mi) and waives the memory
+//!   refusals whose grants are extrapolated from the 1344x768 measurement, so a
+//!   FINAL canvas such as 1920x832, 2560x1088 or 2688x1536 can be asked for.
+//!   `mold-core` cannot see this module, so it re-reads the same variable for
+//!   this one key only (`refine_proto_uncap_from_spec`); this parser stays the
+//!   single owner of `scale`, `start` and `lora2`. Alignment, minimum axis and
+//!   aspect rules are unchanged, and pass 1 gets no new restriction.
 //!
 //! A bare `1`/`on`/`true` selects the defaults; empty, `0`, `off` and `false`
 //! leave the gate closed.
@@ -53,6 +62,10 @@ pub(crate) struct H3RefineProto {
     pub scale: usize,
     pub start: usize,
     pub lora2: Option<f32>,
+    /// Lift the request-side canvas area ceilings (see the module docs). The
+    /// admission code reads it through `mold-core`; it rides here so `parse`
+    /// accepts the key and the two readers can be checked against each other.
+    pub uncap: bool,
 }
 
 impl H3RefineProto {
@@ -111,6 +124,13 @@ impl H3RefineProto {
                     );
                     parsed.lora2 = Some(strength);
                 }
+                "uncap" => {
+                    parsed.uncap = match value.to_ascii_lowercase().as_str() {
+                        "1" | "true" | "on" => true,
+                        "0" | "false" | "off" => false,
+                        _ => bail!("{REFINE_PROTO_VARIABLE}: uncap must be 0 or 1, got {value:?}"),
+                    };
+                }
                 other => bail!("{REFINE_PROTO_VARIABLE}: unknown key {other:?}"),
             }
         }
@@ -122,6 +142,7 @@ impl H3RefineProto {
             scale: Self::DEFAULT_SCALE,
             start: Self::DEFAULT_START,
             lora2: None,
+            uncap: false,
         }
     }
 
@@ -181,6 +202,18 @@ impl H3RefineProto {
             self.start
         );
         Ok(pass1_forwards + (pass1_forwards - self.start))
+    }
+}
+
+/// `" free_vram_mib=N"` for a CUDA device (a cheap driver query taken at the
+/// moment of the log line, not a peak: the operator reads the peak from
+/// `nvidia-smi`), empty on any other device or if the query fails.
+pub(crate) fn free_device_memory_note(device: &Device) -> String {
+    match device.location() {
+        candle_core::DeviceLocation::Cuda { gpu_id } => crate::device::free_vram_bytes(gpu_id)
+            .map(|free| format!(" free_vram_mib={}", free >> 20))
+            .unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -294,7 +327,8 @@ mod tests {
                 Some(H3RefineProto {
                     scale: 2,
                     start: 4,
-                    lora2: None
+                    lora2: None,
+                    uncap: false,
                 })
             );
         }
@@ -307,7 +341,8 @@ mod tests {
             Some(H3RefineProto {
                 scale: 3,
                 start: 2,
-                lora2: Some(0.5)
+                lora2: Some(0.5),
+                uncap: false,
             })
         );
         assert_eq!(
@@ -315,7 +350,8 @@ mod tests {
             Some(H3RefineProto {
                 scale: 2,
                 start: 6,
-                lora2: None
+                lora2: None,
+                uncap: false,
             })
         );
         for bad in [
@@ -333,6 +369,44 @@ mod tests {
             assert!(
                 H3RefineProto::parse(bad).is_err(),
                 "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn uncap_is_a_boolean_key_and_the_two_readers_agree_on_it() {
+        assert!(!refine("scale=2").unwrap().uncap);
+        assert!(!refine("1").unwrap().uncap);
+        for spec in [
+            "uncap=1",
+            "scale=2,start=4,uncap=1",
+            "uncap=true,lora2=0.5",
+            "uncap=on",
+        ] {
+            assert!(refine(spec).unwrap().uncap, "{spec:?}");
+            assert!(mold_core::minimax_h3::refine_proto_uncap_from_spec(spec));
+        }
+        for spec in ["uncap=0", "uncap=off", "scale=2,uncap=false", "1", "on", ""] {
+            if let Some(parsed) = H3RefineProto::parse(spec).unwrap() {
+                assert!(!parsed.uncap, "{spec:?}");
+            }
+            assert!(!mold_core::minimax_h3::refine_proto_uncap_from_spec(spec));
+        }
+        assert!(H3RefineProto::parse("uncap=maybe").is_err());
+        assert!(H3RefineProto::parse("uncap=1,uncap=0").is_err());
+    }
+
+    #[test]
+    fn the_uncapped_ladder_splits_into_pass_one_canvases_in_32_multiples() {
+        let proto = refine("scale=2,uncap=1").unwrap();
+        for (final_canvas, pass1) in [
+            ((1920, 832), (960, 416)),
+            ((2560, 1088), (1280, 544)),
+            ((2688, 1536), (1344, 768)),
+        ] {
+            assert_eq!(
+                proto.pass1_canvas(final_canvas.0, final_canvas.1).unwrap(),
+                pass1
             );
         }
     }

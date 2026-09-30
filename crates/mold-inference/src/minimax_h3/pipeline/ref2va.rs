@@ -662,12 +662,14 @@ fn execute_staged_with(
     let (video_rows, audio_rows, packed, geometry) = match (&refine, final_packed) {
         (Some(refine), Some(final_packed)) => {
             tracing::info!(
-                "H3 refine-proto pass 1: {}x{} rows={} sigma=1.0000..0.0000 forwards={} elapsed_ms={}",
+                "H3 refine-proto pass 1: {}x{} pixels={} rows={} sigma=1.0000..0.0000 forwards={} elapsed_ms={}{}",
                 geometry.width,
                 geometry.height,
+                geometry.width * geometry.height,
                 packed.layout.seq_len(),
                 counts.transformer_evaluations,
-                pass1_started.elapsed().as_millis()
+                pass1_started.elapsed().as_millis(),
+                refine_proto::free_device_memory_note(&device)
             );
             let (video_rows, audio_rows, final_packed) = H3RefineSecondPass {
                 refine,
@@ -993,11 +995,13 @@ impl H3RefineSecondPass<'_> {
             audio_rows,
         )?;
         tracing::info!(
-            "H3 refine-proto pass 2: {}x{} rows={} sigma={sigma_video:.4}..0.0000 forwards={pass2_forwards} elapsed_ms={}",
+            "H3 refine-proto pass 2: {}x{} pixels={} rows={} sigma={sigma_video:.4}..0.0000 forwards={pass2_forwards} elapsed_ms={}{}",
             self.final_geometry.width,
             self.final_geometry.height,
+            self.final_geometry.width * self.final_geometry.height,
             pass2.layout.seq_len(),
-            pass2_started.elapsed().as_millis()
+            pass2_started.elapsed().as_millis(),
+            refine_proto::free_device_memory_note(self.device)
         );
         Ok((video_rows, audio_rows, self.final_packed))
     }
@@ -2675,6 +2679,7 @@ mod tests {
             scale: 2,
             start: 4,
             lora2: Some(0.5),
+            uncap: false,
         };
         let (backend, prepared, staged, observer) = run_refined(Some(refine));
         let schedule = H3DualSchedule::new_for_sampler_with_video_shift(
@@ -2821,6 +2826,7 @@ mod tests {
             scale: 2,
             start: 6,
             lora2: None,
+            uncap: false,
         }));
         assert!(backend.rescales.is_empty());
     }
@@ -2842,6 +2848,7 @@ mod tests {
                 scale: 2,
                 start: 4,
                 lora2: None,
+                uncap: false,
             }),
         )
         .unwrap_err();
