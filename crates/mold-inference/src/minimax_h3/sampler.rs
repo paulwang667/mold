@@ -405,6 +405,28 @@ impl H3DualSchedule {
         }
     }
 
+    /// Like [`Self::steps`], but the first descriptor is coupled forward
+    /// `start` of the same frozen grid; the sigmas, timesteps and
+    /// `evaluation_index` are exactly those the full run assigns to that
+    /// forward, so `steps_from(0)` is `steps()` and every later start is a
+    /// suffix of it.
+    ///
+    /// Used only by the env-gated research prototype that re-enters the grid
+    /// mid-way (`pipeline/refine_proto.rs`). `start` must address an existing
+    /// forward.
+    pub fn steps_from(&self, start: usize) -> Result<H3DualScheduleIter<'_>> {
+        if start >= self.video.evaluations() {
+            bail!(
+                "MiniMax H3 schedule has {} forwards; cannot start at forward {start}",
+                self.video.evaluations()
+            );
+        }
+        Ok(H3DualScheduleIter {
+            schedule: self,
+            next_index: start,
+        })
+    }
+
     fn step(&self, index: usize) -> H3DualScheduleStep {
         let video = self.video.step(index);
         let audio = self.audio.step(index);
@@ -683,6 +705,22 @@ impl H3DualSampler {
             previous_video_sigma: None,
             next_evaluation_index: 0,
         }
+    }
+
+    /// A sampler whose first accepted step is forward `start` of the frozen
+    /// grid. Only the history-free first-order integrators can re-enter the
+    /// grid: RES multistep carries denoised-estimate history that a mid-grid
+    /// start does not have, so it is refused for any `start > 0`.
+    pub(crate) fn starting_at(kind: H3SamplerKind, start: usize) -> Result<Self> {
+        if start > 0 && !kind.uses_euler_update() {
+            bail!(
+                "MiniMax H3 sampler {} carries step history and cannot start at forward {start}",
+                kind.as_str()
+            );
+        }
+        let mut sampler = Self::new(kind);
+        sampler.next_evaluation_index = start;
+        Ok(sampler)
     }
 
     pub(crate) fn step_pair(
@@ -1319,6 +1357,108 @@ mod tests {
         assert_eq!(last.progress_after_update().completed_evaluations, 49);
         assert_eq!(last.progress_after_update().total_evaluations, 49);
         assert!(last.progress_after_update().is_complete());
+    }
+
+    fn turbo_eight_step_schedule() -> H3DualSchedule {
+        H3DualSchedule::new_for_sampler_with_video_shift(
+            9,
+            H3SamplerKind::ComfyEuler,
+            H3_VIDEO_SHIFT,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn steps_from_zero_is_the_full_run_and_a_later_start_is_its_exact_tail() {
+        let schedule = turbo_eight_step_schedule();
+        let full: Vec<_> = schedule.steps().collect();
+        assert_eq!(full.len(), 8);
+        assert_eq!(schedule.steps_from(0).unwrap().collect::<Vec<_>>(), full);
+        for start in 1..full.len() {
+            let tail = schedule.steps_from(start).unwrap();
+            assert_eq!(tail.len(), full.len() - start);
+            assert_eq!(tail.collect::<Vec<_>>(), full[start..].to_vec());
+        }
+        // The prototype's default re-entry point sits on the shift-12 ladder.
+        assert!((schedule.video_sigmas()[4] - 0.9231).abs() < 1e-3);
+        let first = schedule.steps_from(4).unwrap().next().unwrap();
+        assert_eq!(first.evaluation_index, 4);
+        assert_eq!(first.video.sigma, schedule.video_sigmas()[4]);
+        assert_eq!(first.audio.sigma, schedule.audio_sigmas()[4]);
+        assert_eq!(first.progress_before_forward().completed_evaluations, 4);
+        assert_eq!(first.progress_after_update().total_evaluations, 8);
+        assert!(schedule.steps_from(8).is_err());
+    }
+
+    #[test]
+    fn a_sampler_started_mid_grid_reproduces_the_tail_of_the_full_run() {
+        let device = Device::Cpu;
+        let schedule = turbo_eight_step_schedule();
+        let kind = H3SamplerKind::ComfyEuler;
+        let velocity_of = |sample: &Tensor| sample.affine(-0.35, 0.02).unwrap();
+        let start = 4;
+
+        let mut video = Tensor::new(&[0.5f32, -1.25, 2.0, 0.125], &device).unwrap();
+        let mut audio = Tensor::new(&[-0.75f32, 0.25, 1.5, -2.0], &device).unwrap();
+        let mut full = H3DualSampler::new(kind);
+        let mut checkpoint = None;
+        for step in schedule.steps() {
+            if step.evaluation_index == start {
+                checkpoint = Some((video.clone(), audio.clone()));
+            }
+            let (next_video, next_audio) = full
+                .step_pair(
+                    &video,
+                    &audio,
+                    &velocity_of(&video),
+                    &velocity_of(&audio),
+                    step,
+                )
+                .unwrap();
+            video = next_video;
+            audio = next_audio;
+        }
+
+        let (mut tail_video, mut tail_audio) = checkpoint.unwrap();
+        let mut tail = H3DualSampler::starting_at(kind, start).unwrap();
+        for step in schedule.steps_from(start).unwrap() {
+            let (next_video, next_audio) = tail
+                .step_pair(
+                    &tail_video,
+                    &tail_audio,
+                    &velocity_of(&tail_video),
+                    &velocity_of(&tail_audio),
+                    step,
+                )
+                .unwrap();
+            tail_video = next_video;
+            tail_audio = next_audio;
+        }
+        assert_eq!(
+            tail_video.to_vec1::<f32>().unwrap(),
+            video.to_vec1::<f32>().unwrap()
+        );
+        assert_eq!(
+            tail_audio.to_vec1::<f32>().unwrap(),
+            audio.to_vec1::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_mid_grid_sampler_start_keeps_the_ordering_fence_and_refuses_history_integrators() {
+        let device = Device::Cpu;
+        let sample = Tensor::new(&[0.0f32], &device).unwrap();
+        let velocity = Tensor::new(&[1.0f32], &device).unwrap();
+        let schedule = turbo_eight_step_schedule();
+        let mut sampler = H3DualSampler::starting_at(H3SamplerKind::ComfyEuler, 4).unwrap();
+        let too_early = schedule.steps().nth(3).unwrap();
+        assert!(sampler
+            .step_pair(&sample, &sample, &velocity, &velocity, too_early)
+            .unwrap_err()
+            .to_string()
+            .contains("expected evaluation 4"));
+        assert!(H3DualSampler::starting_at(H3SamplerKind::ComfyResMultistep, 4).is_err());
+        assert!(H3DualSampler::starting_at(H3SamplerKind::ComfyResMultistep, 0).is_ok());
     }
 
     #[test]
