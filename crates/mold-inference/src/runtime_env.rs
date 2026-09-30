@@ -57,6 +57,12 @@ pub const ENGINE_SHAPING_VARIABLES: &[&str] = &[
     // batched, but batch boundaries move floating-point summation order, so
     // two renders that disagree on it are not bit-identical.
     "MOLD_HUNYUAN3D_DECODE_CHUNKS",
+    // Research prototype (env-gated, off by default): a "hires-fix" second
+    // pass for MiniMax H3 Ref2VA. It changes the pass count, the canvas the
+    // first pass runs on, the noise streams and the pixels, so a run with it
+    // set must never share a fingerprint or learned-timing bucket with one
+    // without.
+    "MOLD_H3_REFINE_PROTO",
     "MOLD_H3_TURBO_ADAPTER",
     "MOLD_H3_TURBO_TIER",
     "MOLD_KEEP_TE_RAM",

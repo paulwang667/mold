@@ -96,6 +96,13 @@ pub(crate) trait H3BlockLoader {
     fn wait_for_prefetch(&mut self, _index: usize) -> Result<()> {
         Ok(())
     }
+
+    /// Serve every later block load with the Turbo adapter at another
+    /// strength. Research-prototype hook (`MOLD_H3_REFINE_PROTO`, `lora2`):
+    /// only the private Comfy loader implements it.
+    fn rescale_turbo_adapter(&mut self, _strength: f32) -> Result<()> {
+        anyhow::bail!("this MiniMax H3 block loader cannot rescale a Turbo adapter")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,6 +174,12 @@ impl<L: H3BlockLoader, A: H3BlockLease> H3BlockStreamState<L, A> {
 
     fn validate_owned_lease(&self) -> Result<()> {
         validate_lease(&self.plan, &self.lease)
+    }
+
+    /// Mutable access to the paired loader, for the prototype's mid-run Turbo
+    /// strength change.
+    pub(crate) fn loader_mut(&mut self) -> &mut L {
+        &mut self.loader
     }
 
     pub(crate) fn resident_block_count(&self) -> usize {

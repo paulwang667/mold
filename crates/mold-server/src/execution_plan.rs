@@ -361,6 +361,7 @@ pub enum RuntimeSemanticVariable {
     Flux2QMatMul,
     Flux2Fp8Cache,
     Flux2Fp8Gemm,
+    H3RefineProto,
     H3TurboAdapter,
     H3TurboTier,
     Hunyuan3dDecodeChunks,
@@ -1043,6 +1044,7 @@ fn runtime_semantic_variable(name: &str) -> Option<RuntimeSemanticVariable> {
         // change, not just a speed one.
         "MOLD_FLUX2_FP8_GEMM" => RuntimeSemanticVariable::Flux2Fp8Gemm,
         "MOLD_HUNYUAN3D_DECODE_CHUNKS" => RuntimeSemanticVariable::Hunyuan3dDecodeChunks,
+        "MOLD_H3_REFINE_PROTO" => RuntimeSemanticVariable::H3RefineProto,
         "MOLD_H3_TURBO_ADAPTER" => RuntimeSemanticVariable::H3TurboAdapter,
         "MOLD_H3_TURBO_TIER" => RuntimeSemanticVariable::H3TurboTier,
         "MOLD_KEEP_TE_RAM" => RuntimeSemanticVariable::KeepTeRam,

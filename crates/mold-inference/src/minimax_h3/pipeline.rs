@@ -7,6 +7,7 @@
 //! attention, and admission gates permit a runnable family.
 
 pub(crate) mod ref2va;
+pub(crate) mod refine_proto;
 
 use std::io::Cursor;
 
@@ -128,6 +129,19 @@ impl H3Fl2VaGeometry {
         let height = usize::try_from(req.height).context("H3 height does not fit usize")?;
         let frames = usize::try_from(req.frames.unwrap_or(contract::REVIEWED_COMPACT_FRAMES))
             .context("H3 frame count does not fit usize")?;
+        Self::from_canvas(mode, width, height, frames, endpoint_count)
+    }
+
+    /// The geometry of an explicit canvas. `from_request` is this with the
+    /// request's own canvas; the env-gated refine prototype also asks for the
+    /// smaller pass-1 canvas.
+    fn from_canvas(
+        mode: Mode,
+        width: usize,
+        height: usize,
+        frames: usize,
+        endpoint_count: usize,
+    ) -> Result<Self> {
         let latent_frames = VisualTemporalGeometry::default().encoded_frames(frames)?;
         let latent_width = width / VIDEO_VAE_SPATIAL_COMPRESSION;
         let latent_height = height / VIDEO_VAE_SPATIAL_COMPRESSION;

@@ -2041,6 +2041,16 @@ where
         if expected_denoise_forwards != retention.denoise_forward_count()? {
             bail!("private H3 prepared denoise count differs from retained factory authority")
         }
+        // Research prototype (`MOLD_H3_REFINE_PROTO`, off by default): the
+        // env-gated second pass runs the tail of the same grid again on the
+        // still-resident transformer, so the ledger drops it only after the
+        // last forward of BOTH passes. Admission's own count (checked above)
+        // stays the schedule's.
+        let ledger_denoise_forwards =
+            match super::pipeline::refine_proto::H3RefineProto::from_environment()? {
+                Some(refine) => refine.total_forwards(expected_denoise_forwards)?,
+                None => expected_denoise_forwards,
+            };
         let (qwen_execution, qwen_artifacts) = attempt.qwen_projections();
         let block_execution = attempt.block_projection();
         let continuing_execution = attempt.block_projection();
@@ -2073,7 +2083,7 @@ where
             authority,
             activation_evidence,
             admitted,
-            ledger: H3PrivatePhaseLedger::new(expected_denoise_forwards)?,
+            ledger: H3PrivatePhaseLedger::new(ledger_denoise_forwards)?,
             storage,
             retention,
             memory_overlap,
@@ -2897,6 +2907,20 @@ where
     ) -> Result<StereoWaveform> {
         H3Fl2VaBackend::decode_audio(self, latents, checkpoint)
     }
+
+    /// Research prototype (`MOLD_H3_REFINE_PROTO`, `lora2`): between the two
+    /// passes the resident transformer's Turbo deltas move to another
+    /// strength. The transformer must be loaded and still owned (the ledger
+    /// drops it after the last forward of the LAST pass).
+    fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
+        self.require_ref2va()?;
+        self.validate_continuing_authority()?;
+        self.denoiser
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("private H3 transformer is not resident"))?
+            .rescale_turbo_adapter(strength)?;
+        self.validate_continuing_authority()
+    }
 }
 
 /// Borrow the normalized frames the visual VAE must encode for one reference.
@@ -3659,6 +3683,35 @@ mod tests {
         assert!(
             ledger.qwen_served_from_cache().is_err(),
             "the cache is consulted once, before the VAEs load"
+        );
+    }
+
+    /// The env-gated refine prototype runs the schedule and then its tail on
+    /// the SAME resident transformer: the ledger must keep it until the last
+    /// forward of the second pass, and expect exactly `n + (n - start)`.
+    #[test]
+    fn refine_prototype_ledger_keeps_the_transformer_until_the_second_pass_ends() {
+        let refine = super::super::pipeline::refine_proto::H3RefineProto::parse("scale=2,start=4")
+            .unwrap()
+            .unwrap();
+        let total = refine.total_forwards(8).unwrap();
+        assert_eq!(total, 12);
+        let mut ledger = H3PrivatePhaseLedger::new(total).unwrap();
+        ledger.qwen_loaded().unwrap();
+        ledger.qwen_dropped().unwrap();
+        ledger.vaes_loaded().unwrap();
+        ledger.conditions_encoded().unwrap();
+        ledger.vaes_parked().unwrap();
+        ledger.transformer_loaded().unwrap();
+        for forward in 1..total {
+            assert!(!ledger.denoise_completed().unwrap(), "forward {forward}");
+            assert_eq!(ledger.state, H3PrivatePhaseState::TransformerLoaded);
+        }
+        assert!(ledger.denoise_completed().unwrap());
+        assert_eq!(ledger.state, H3PrivatePhaseState::TransformerDropped);
+        assert!(
+            ledger.denoise_completed().is_err(),
+            "a thirteenth forward crosses the frozen count"
         );
     }
 

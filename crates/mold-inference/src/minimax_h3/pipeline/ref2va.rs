@@ -7,10 +7,14 @@
 //! admission constructs only after it has frozen a single device — so this
 //! module never decides whether Ref2VA may run, only what running it means.
 
+use std::time::Instant;
+
 use super::*;
 use crate::engine::GenerationReferenceBinding;
 use crate::minimax_h3::reference_media::H3ReferenceMediaAdapter;
-use crate::minimax_h3::sampler::{H3DualSampler, H3SamplerKind, H3_VISUAL_CONDITION_TIMESTEP};
+use crate::minimax_h3::sampler::{
+    H3DualSampler, H3DualScheduleStep, H3SamplerKind, H3_VISUAL_CONDITION_TIMESTEP,
+};
 use mold_candle::minimax_h3::{
     pack_h3_audio, sample_video_frames, AudioVaeConfig, RefPresentation, RefPresentationKind,
 };
@@ -209,6 +213,15 @@ pub(crate) trait H3Ref2VaBackend {
         latents: &StereoLatents,
         checkpoint: &mut dyn H3PipelineCheckpoint,
     ) -> Result<StereoWaveform>;
+
+    /// Run every later `denoise` forward with the Turbo adapter at another
+    /// strength, keeping the transformer resident. Only the env-gated research
+    /// prototype (`MOLD_H3_REFINE_PROTO`, `lora2`) calls this, between its two
+    /// passes; production never does.
+    fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
+        let _ = strength;
+        bail!("this MiniMax H3 Ref2VA backend cannot rescale its Turbo adapter")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -326,11 +339,44 @@ pub(crate) fn execute_staged(
     progress: &ProgressReporter,
     observer: &mut dyn H3PipelineObserver,
 ) -> Result<H3StagedAvOutput> {
+    // Research prototype gate (`MOLD_H3_REFINE_PROTO`, pipeline/refine_proto.rs);
+    // `None` in production.
+    let refine = refine_proto::H3RefineProto::from_environment()?;
+    execute_staged_with(prepared, bindings, backend, progress, observer, refine)
+}
+
+fn execute_staged_with(
+    prepared: &H3PreparedRef2VaRequest,
+    bindings: &[GenerationReferenceBinding],
+    backend: &mut dyn H3Ref2VaBackend,
+    progress: &ProgressReporter,
+    observer: &mut dyn H3PipelineObserver,
+    refine: Option<refine_proto::H3RefineProto>,
+) -> Result<H3StagedAvOutput> {
     validate_reference_bindings(prepared, bindings)?;
     let frozen_identity = backend.identity();
     frozen_identity.validate(backend.device())?;
     let device = backend.device().clone();
     let mut control = PipelineControl { progress, observer };
+
+    // With the gate closed `geometry` is `prepared.geometry` itself. Everything
+    // the gate needs to refuse is refused here, before any media is decoded or
+    // model loaded.
+    let geometry = match &refine {
+        Some(refine) => {
+            let sampler_kind = backend.sampler_kind();
+            refine.pass2_forwards(
+                &H3DualSchedule::new_for_sampler_with_video_shift(
+                    prepared.grid_points,
+                    sampler_kind,
+                    backend.sampler_video_shift(),
+                )?,
+                sampler_kind,
+            )?;
+            refine.pass1_geometry(&prepared.geometry)?
+        }
+        None => prepared.geometry.clone(),
+    };
 
     let total = prepared.references.len();
     control.checkpoint(H3PipelineEvent {
@@ -384,7 +430,7 @@ pub(crate) fn execute_staged(
         .iter()
         .map(reference_layout_spec)
         .collect::<Result<Vec<_>>>()?;
-    let packed = build_packed_sequence(&text.tags, &prepared.geometry, &reference_layout)?;
+    let packed = build_packed_sequence(&text.tags, &geometry, &reference_layout)?;
     if packed.layout.seq_len() > backend.maximum_packed_rows() {
         bail!(
             "MiniMax H3 Ref2VA packed {} rows, exceeding the frozen backend limit {}",
@@ -393,6 +439,23 @@ pub(crate) fn execute_staged(
         );
     }
     let frozen_layout = packed.layout.freeze(&device)?;
+    // Prototype only: the FINAL canvas must fit the admitted row ceiling, which
+    // admission priced at the final dims, so refuse before any forward is paid.
+    let final_packed = match &refine {
+        Some(_) => {
+            let final_packed =
+                build_packed_sequence(&text.tags, &prepared.geometry, &reference_layout)?;
+            if final_packed.layout.seq_len() > backend.maximum_packed_rows() {
+                bail!(
+                    "MiniMax H3 Ref2VA refine pass packs {} rows, exceeding the frozen backend limit {}",
+                    final_packed.layout.seq_len(),
+                    backend.maximum_packed_rows()
+                );
+            }
+            Some(final_packed)
+        }
+        None => None,
+    };
 
     let visual_total = reference_layout
         .iter()
@@ -521,7 +584,7 @@ pub(crate) fn execute_staged(
     let video_noise = request_noise.draw(
         "target-video",
         0,
-        &prepared.geometry.generated_video_shape(),
+        &geometry.generated_video_shape(),
         &device,
     )?;
     let generated_video = patchify_h3_video(&video_noise, VIDEO_PATCH)?;
@@ -533,7 +596,7 @@ pub(crate) fn execute_staged(
     let generated_audio = request_noise.draw(
         "target-audio",
         0,
-        &prepared.geometry.generated_audio_row_shape(),
+        &geometry.generated_audio_row_shape(),
         &device,
     )?;
     control.checkpoint(H3PipelineEvent {
@@ -562,68 +625,75 @@ pub(crate) fn execute_staged(
     )?;
     let mut sampler = H3DualSampler::new(sampler_kind);
     let counts = schedule.counts();
+    // Forwards of the prototype's second pass; zero in production, where the
+    // reported total is the schedule's own count.
+    let pass2_forwards = match &refine {
+        Some(refine) => refine.pass2_forwards(&schedule, sampler_kind)?,
+        None => 0,
+    };
+    let reported_forwards = counts.transformer_evaluations + pass2_forwards;
     control.checkpoint(H3PipelineEvent {
         phase: H3PipelinePhase::Denoise,
         completed: 0,
-        total: counts.transformer_evaluations,
+        total: reported_forwards,
     })?;
-    for step in schedule.steps() {
-        ensure_ref_identity(backend, &frozen_identity, &device)?;
-        let timesteps = Tensor::from_slice(
-            &[
-                step.row_timesteps.generated_video,
-                step.row_timesteps.visual_condition,
-                step.row_timesteps.generated_audio,
-                step.row_timesteps.audio_reference,
-            ],
-            4,
-            &device,
-        )?;
-        ensure_ref_identity(backend, &frozen_identity, &device)?;
-        let output = backend.denoise(
-            H3ForwardInput {
-                video_rows: &video_rows,
-                audio_rows: &audio_rows,
-                text_states: &text.states,
-                timesteps: &timesteps,
-            },
-            &frozen_layout,
-            &mut control,
-        )?;
-        ensure_ref_identity(backend, &frozen_identity, &device)?;
-        validate_transformer_output(&output, &video_rows, &audio_rows)?;
-
-        let generated_video_rows =
-            video_rows.narrow(1, packed.condition_video_rows, packed.generated_video_rows)?;
-        let generated_video_velocity =
-            output
-                .video
-                .narrow(1, packed.condition_video_rows, packed.generated_video_rows)?;
-        let generated_audio_rows =
-            audio_rows.narrow(1, packed.condition_audio_rows, packed.generated_audio_rows)?;
-        let generated_audio_velocity =
-            output
-                .audio
-                .narrow(1, packed.condition_audio_rows, packed.generated_audio_rows)?;
-        let (next_video, next_audio) = sampler.step_pair(
-            &generated_video_rows,
-            &generated_audio_rows,
-            &generated_video_velocity,
-            &generated_audio_velocity,
-            step,
-        )?;
-        video_rows = preserve_prefix(&video_rows, packed.condition_video_rows, &next_video)?;
-        audio_rows = preserve_prefix(&audio_rows, packed.condition_audio_rows, &next_audio)?;
-        let after = step.progress_after_update();
-        control.checkpoint(H3PipelineEvent {
-            phase: H3PipelinePhase::Denoise,
-            completed: after.completed_evaluations,
-            total: after.total_evaluations,
-        })?;
-    }
+    let pass1_started = Instant::now();
+    (video_rows, audio_rows) = run_denoise_pass(
+        &H3DenoisePass {
+            identity: &frozen_identity,
+            device: &device,
+            layout: &frozen_layout,
+            packed: &packed,
+            text_states: &text.states,
+            first_evaluation: 0,
+            completed_before: 0,
+            reported_total: reported_forwards,
+        },
+        backend,
+        &mut control,
+        &mut sampler,
+        schedule.steps(),
+        video_rows,
+        audio_rows,
+    )?;
     // RES history is denoise-only workspace. Release previous clean estimates
     // and the carried audio state before transformer teardown and VAE decode.
     drop(sampler);
+    let (video_rows, audio_rows, packed, geometry) = match (&refine, final_packed) {
+        (Some(refine), Some(final_packed)) => {
+            tracing::info!(
+                "H3 refine-proto pass 1: {}x{} rows={} sigma=1.0000..0.0000 forwards={} elapsed_ms={}",
+                geometry.width,
+                geometry.height,
+                packed.layout.seq_len(),
+                counts.transformer_evaluations,
+                pass1_started.elapsed().as_millis()
+            );
+            let (video_rows, audio_rows, final_packed) = H3RefineSecondPass {
+                refine,
+                seed: prepared.seed,
+                schedule: &schedule,
+                sampler_kind,
+                pass1_geometry: &geometry,
+                pass1_packed: &packed,
+                final_geometry: &prepared.geometry,
+                final_packed,
+                text_states: &text.states,
+                identity: &frozen_identity,
+                device: &device,
+                pass1_forwards: counts.transformer_evaluations,
+                reported_total: reported_forwards,
+            }
+            .run(backend, &mut control, progress, video_rows, audio_rows)?;
+            (
+                video_rows,
+                audio_rows,
+                final_packed,
+                prepared.geometry.clone(),
+            )
+        }
+        _ => (video_rows, audio_rows, packed, geometry),
+    };
     // Ref2VA has the same text-state lifetime as FL2VA: all transformer
     // forwards borrow it, while visual/audio decode must begin only after it
     // has released its device allocation.
@@ -634,9 +704,9 @@ pub(crate) fn execute_staged(
     let video_latents = unpatchify_h3_video(
         &generated_video_rows,
         [
-            prepared.geometry.latent_frames / VIDEO_PATCH[0],
-            prepared.geometry.latent_height / VIDEO_PATCH[1],
-            prepared.geometry.latent_width / VIDEO_PATCH[2],
+            geometry.latent_frames / VIDEO_PATCH[0],
+            geometry.latent_height / VIDEO_PATCH[1],
+            geometry.latent_width / VIDEO_PATCH[2],
         ],
         VIDEO_LATENT_CHANNELS,
         VIDEO_PATCH,
@@ -715,6 +785,222 @@ pub(crate) fn execute_staged(
             execution_fingerprint: frozen_identity.execution_fingerprint,
         },
     })
+}
+
+/// What one denoise pass borrows. Production runs exactly one pass with
+/// `first_evaluation == 0` and `completed_before == 0`; the env-gated refine
+/// prototype runs a second one that re-enters the same grid mid-way.
+struct H3DenoisePass<'a> {
+    identity: &'a H3PipelineBackendIdentity,
+    device: &'a Device,
+    layout: &'a H3FrozenPackedLayout,
+    packed: &'a H3RefPackedSequence,
+    text_states: &'a Tensor,
+    /// Evaluation index of this pass's first forward.
+    first_evaluation: usize,
+    /// Coupled forwards earlier passes already reported.
+    completed_before: usize,
+    /// Denominator of the reported `Denoise` progress.
+    reported_total: usize,
+}
+
+/// One denoise pass: a coupled transformer forward and Euler/RES update per
+/// step, the reference prefixes preserved. Returns the updated packed rows.
+fn run_denoise_pass(
+    pass: &H3DenoisePass<'_>,
+    backend: &mut dyn H3Ref2VaBackend,
+    control: &mut PipelineControl<'_>,
+    sampler: &mut H3DualSampler,
+    steps: impl Iterator<Item = H3DualScheduleStep>,
+    mut video_rows: Tensor,
+    mut audio_rows: Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let packed = pass.packed;
+    for step in steps {
+        ensure_ref_identity(backend, pass.identity, pass.device)?;
+        let timesteps = Tensor::from_slice(
+            &[
+                step.row_timesteps.generated_video,
+                step.row_timesteps.visual_condition,
+                step.row_timesteps.generated_audio,
+                step.row_timesteps.audio_reference,
+            ],
+            4,
+            pass.device,
+        )?;
+        ensure_ref_identity(backend, pass.identity, pass.device)?;
+        let output = backend.denoise(
+            H3ForwardInput {
+                video_rows: &video_rows,
+                audio_rows: &audio_rows,
+                text_states: pass.text_states,
+                timesteps: &timesteps,
+            },
+            pass.layout,
+            control,
+        )?;
+        ensure_ref_identity(backend, pass.identity, pass.device)?;
+        validate_transformer_output(&output, &video_rows, &audio_rows)?;
+
+        let generated_video_rows =
+            video_rows.narrow(1, packed.condition_video_rows, packed.generated_video_rows)?;
+        let generated_video_velocity =
+            output
+                .video
+                .narrow(1, packed.condition_video_rows, packed.generated_video_rows)?;
+        let generated_audio_rows =
+            audio_rows.narrow(1, packed.condition_audio_rows, packed.generated_audio_rows)?;
+        let generated_audio_velocity =
+            output
+                .audio
+                .narrow(1, packed.condition_audio_rows, packed.generated_audio_rows)?;
+        let (next_video, next_audio) = sampler.step_pair(
+            &generated_video_rows,
+            &generated_audio_rows,
+            &generated_video_velocity,
+            &generated_audio_velocity,
+            step,
+        )?;
+        video_rows = preserve_prefix(&video_rows, packed.condition_video_rows, &next_video)?;
+        audio_rows = preserve_prefix(&audio_rows, packed.condition_audio_rows, &next_audio)?;
+        control.checkpoint(H3PipelineEvent {
+            phase: H3PipelinePhase::Denoise,
+            completed: pass.completed_before + step.evaluation_index + 1 - pass.first_evaluation,
+            total: pass.reported_total,
+        })?;
+    }
+    Ok((video_rows, audio_rows))
+}
+
+/// RESEARCH PROTOTYPE (`MOLD_H3_REFINE_PROTO`, see `refine_proto.rs`): the
+/// pass that turns pass 1's clean small-canvas latents into final-canvas
+/// denoising. Never constructed when the gate is closed.
+struct H3RefineSecondPass<'a> {
+    refine: &'a refine_proto::H3RefineProto,
+    seed: u64,
+    schedule: &'a H3DualSchedule,
+    sampler_kind: H3SamplerKind,
+    pass1_geometry: &'a H3Fl2VaGeometry,
+    pass1_packed: &'a H3RefPackedSequence,
+    final_geometry: &'a H3Fl2VaGeometry,
+    final_packed: H3RefPackedSequence,
+    text_states: &'a Tensor,
+    identity: &'a H3PipelineBackendIdentity,
+    device: &'a Device,
+    pass1_forwards: usize,
+    reported_total: usize,
+}
+
+impl H3RefineSecondPass<'_> {
+    /// `video_rows` / `audio_rows` are pass 1's packed rows at sigma 0 (clean
+    /// generated suffix behind the untouched reference prefix). Returns the
+    /// packed rows of pass 2's end state and the final canvas' packed layout.
+    fn run(
+        self,
+        backend: &mut dyn H3Ref2VaBackend,
+        control: &mut PipelineControl<'_>,
+        progress: &ProgressReporter,
+        video_rows: Tensor,
+        audio_rows: Tensor,
+    ) -> Result<(Tensor, Tensor, H3RefPackedSequence)> {
+        const STAGE: &str = "Refine: latent upscale";
+        let start = self.refine.start;
+        let (pass1, pass2) = (self.pass1_packed, &self.final_packed);
+        // The reference blocks are canvas-independent: same rows, same
+        // positions (each is area-normalised on its own dims), so the prefix
+        // pass 1 preserved is exactly the one pass 2 needs.
+        if pass1.condition_video_rows != pass2.condition_video_rows
+            || pass1.condition_audio_rows != pass2.condition_audio_rows
+            || pass1.generated_audio_rows != pass2.generated_audio_rows
+        {
+            bail!("MiniMax H3 refine pass changed the reference or audio row layout");
+        }
+
+        progress.stage_start(STAGE);
+        let upscale_started = Instant::now();
+        let clean_video_rows =
+            video_rows.narrow(1, pass1.condition_video_rows, pass1.generated_video_rows)?;
+        let clean_video = unpatchify_h3_video(
+            &clean_video_rows,
+            [
+                self.pass1_geometry.latent_frames / VIDEO_PATCH[0],
+                self.pass1_geometry.latent_height / VIDEO_PATCH[1],
+                self.pass1_geometry.latent_width / VIDEO_PATCH[2],
+            ],
+            VIDEO_LATENT_CHANNELS,
+            VIDEO_PATCH,
+        )?;
+        let clean_audio =
+            audio_rows.narrow(1, pass1.condition_audio_rows, pass1.generated_audio_rows)?;
+        let upsampled = refine_proto::upsample_video_latent(&clean_video, self.refine.scale)?;
+        if upsampled.dims() != self.final_geometry.generated_video_shape() {
+            bail!(
+                "MiniMax H3 refine upsample produced {:?}, expected {:?}",
+                upsampled.dims(),
+                self.final_geometry.generated_video_shape()
+            );
+        }
+        let (video_noise, audio_noise) =
+            refine_proto::draw_refine_noise(self.seed, self.final_geometry, self.device)?;
+        let sigma_video = self.schedule.video_sigmas()[start];
+        let sigma_audio = self.schedule.audio_sigmas()[start];
+        let renoised_video = refine_proto::renoise_at_sigma(&upsampled, &video_noise, sigma_video)?;
+        let renoised_audio =
+            refine_proto::renoise_at_sigma(&clean_audio, &audio_noise, sigma_audio)?;
+        let video_rows = preserve_prefix(
+            &video_rows,
+            pass1.condition_video_rows,
+            &patchify_h3_video(&renoised_video, VIDEO_PATCH)?,
+        )?;
+        let audio_rows = preserve_prefix(&audio_rows, pass1.condition_audio_rows, &renoised_audio)?;
+        validate_packed_tensors(&video_rows, &audio_rows, self.text_states, pass2)?;
+        let frozen_layout = pass2.layout.freeze(self.device)?;
+        if let Some(strength) = self.refine.lora2 {
+            ensure_ref_identity(backend, self.identity, self.device)?;
+            backend.rescale_turbo_adapter(strength)?;
+        }
+        tracing::info!(
+            "H3 refine-proto upscale: latent {}x{} -> {}x{} (x{}), re-noise at grid index {start} sigma_video={sigma_video:.4} sigma_audio={sigma_audio:.4}, lora2={:?}, elapsed_ms={}",
+            self.pass1_geometry.latent_width,
+            self.pass1_geometry.latent_height,
+            self.final_geometry.latent_width,
+            self.final_geometry.latent_height,
+            self.refine.scale,
+            self.refine.lora2,
+            upscale_started.elapsed().as_millis()
+        );
+        progress.stage_done(STAGE, upscale_started.elapsed());
+
+        let pass2_started = Instant::now();
+        let pass2_forwards = self.pass1_forwards - start;
+        let mut sampler = H3DualSampler::starting_at(self.sampler_kind, start)?;
+        let (video_rows, audio_rows) = run_denoise_pass(
+            &H3DenoisePass {
+                identity: self.identity,
+                device: self.device,
+                layout: &frozen_layout,
+                packed: pass2,
+                text_states: self.text_states,
+                first_evaluation: start,
+                completed_before: self.pass1_forwards,
+                reported_total: self.reported_total,
+            },
+            backend,
+            control,
+            &mut sampler,
+            self.schedule.steps_from(start)?,
+            video_rows,
+            audio_rows,
+        )?;
+        tracing::info!(
+            "H3 refine-proto pass 2: {}x{} rows={} sigma={sigma_video:.4}..0.0000 forwards={pass2_forwards} elapsed_ms={}",
+            self.final_geometry.width,
+            self.final_geometry.height,
+            pass2.layout.seq_len(),
+            pass2_started.elapsed().as_millis()
+        );
+        Ok((video_rows, audio_rows, self.final_packed))
+    }
 }
 
 fn validate_reference_bindings(
@@ -1764,6 +2050,16 @@ mod tests {
         reroute_after_decode: bool,
         reroute_after_denoise: bool,
         text_lifetime: Option<Weak<()>>,
+        /// Decoded latent dims / frame size of the canvas under test (the
+        /// default is the 32x32 request), and the generated rows of the FIRST forward, from which the reference
+        /// prefix (identical for every forward and canvas) is derived once.
+        first_pass_video_rows: usize,
+        condition_video_rows: Option<usize>,
+        expected_latents: [usize; 5],
+        frame_size: u32,
+        /// Packed video rows and the video row timestep of every forward.
+        forward_log: Vec<(Tensor, f32)>,
+        rescales: Vec<f32>,
     }
 
     impl SyntheticBackend {
@@ -1785,6 +2081,12 @@ mod tests {
                 reroute_after_decode: false,
                 reroute_after_denoise: false,
                 text_lifetime: None,
+                first_pass_video_rows: 37,
+                condition_video_rows: None,
+                expected_latents: [1, 24, 37, 2, 2],
+                frame_size: 32,
+                forward_log: Vec::new(),
+                rescales: Vec::new(),
             }
         }
 
@@ -2016,7 +2318,14 @@ mod tests {
                 completed: 0,
                 total: 1,
             })?;
-            let video_prefix = input.video_rows.dims3()?.1 - 37;
+            self.forward_log.push((
+                input.video_rows.clone(),
+                input.timesteps.to_vec1::<f32>()?[0],
+            ));
+            let first_pass_video_rows = self.first_pass_video_rows;
+            let video_prefix = *self.condition_video_rows.get_or_insert_with(|| {
+                input.video_rows.dims3().expect("packed video rows").1 - first_pass_video_rows
+            });
             let audio_prefix = input.audio_rows.dims3()?.1 - 414;
             self.condition_video_checksums.push(
                 input
@@ -2045,7 +2354,7 @@ mod tests {
             checkpoint: &mut dyn H3PipelineCheckpoint,
         ) -> Result<()> {
             assert!(self.text_was_dropped());
-            assert_eq!(latents.dims(), [1, 24, 37, 2, 2]);
+            assert_eq!(latents.dims(), self.expected_latents);
             checkpoint.checkpoint(H3PipelineEvent {
                 phase: H3PipelinePhase::VisualDecodeChunk,
                 completed: 0,
@@ -2053,7 +2362,11 @@ mod tests {
             })?;
             for frame in 0..124 {
                 sink.push(
-                    &RgbImage::from_pixel(32, 32, Rgb([frame as u8, 2, 3])),
+                    &RgbImage::from_pixel(
+                        self.frame_size,
+                        self.frame_size,
+                        Rgb([frame as u8, 2, 3]),
+                    ),
                     checkpoint,
                 )?;
             }
@@ -2082,6 +2395,11 @@ mod tests {
                 AudioSoundtrackAssociation::Generated,
             )
             .map_err(Into::into)
+        }
+
+        fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
+            self.rescales.push(strength);
+            Ok(())
         }
     }
 
@@ -2269,6 +2587,266 @@ mod tests {
         }
         assert!(!staged.video_only_mp4.is_empty());
         assert!(!staged.thumbnail_png.is_empty());
+    }
+
+    /// The final canvas is 64x64 (request dims, admitted as such); pass 1 runs
+    /// on 32x32, which is exactly the geometry the other tests hard-code.
+    fn refine_request() -> GenerateRequest {
+        let mut req = request();
+        req.width = 64;
+        req.height = 64;
+        req
+    }
+
+    fn refine_backend(first_pass_video_rows: usize) -> SyntheticBackend {
+        let mut backend = SyntheticBackend::new();
+        backend.first_pass_video_rows = first_pass_video_rows;
+        backend.expected_latents = [1, 24, 37, 4, 4];
+        backend.frame_size = 64;
+        backend
+    }
+
+    fn run_refined(
+        refine: Option<refine_proto::H3RefineProto>,
+    ) -> (
+        SyntheticBackend,
+        H3PreparedRef2VaRequest,
+        H3StagedAvOutput,
+        RecordingObserver,
+    ) {
+        let prepared = prepare(&refine_request());
+        // Pass 1 packs 37 generated rows (32x32) under the gate, else 148.
+        let mut backend = refine_backend(if refine.is_some() { 37 } else { 37 * 4 });
+        let mut observer = RecordingObserver::default();
+        let staged = execute_staged_with(
+            &prepared,
+            &bindings(&prepared),
+            &mut backend,
+            &ProgressReporter::default(),
+            &mut observer,
+            refine,
+        )
+        .unwrap();
+        (backend, prepared, staged, observer)
+    }
+
+    #[test]
+    fn a_closed_gate_runs_one_pass_on_the_request_canvas() {
+        let prepared = prepare(&refine_request());
+        let forwards = H3DualSchedule::new_for_sampler_with_video_shift(
+            prepared.grid_points,
+            H3SamplerKind::OfficialEuler,
+            crate::minimax_h3::sampler::H3_VIDEO_SHIFT,
+        )
+        .unwrap()
+        .counts()
+        .transformer_evaluations;
+        // The synthetic backend's default sizing is the 32x32 canvas; a 64x64
+        // request with the gate closed must be denoised at 64x64 end to end.
+        let (backend, _, staged, observer) = run_refined(None);
+        assert_eq!(backend.forward_log.len(), forwards);
+        assert!(backend.rescales.is_empty());
+        let rows = backend.forward_log[0].0.dims3().unwrap().1;
+        assert!(backend
+            .forward_log
+            .iter()
+            .all(|(forward, _)| forward.dims3().unwrap().1 == rows));
+        assert_eq!(
+            (staged.provenance.width, staged.provenance.height),
+            (64, 64)
+        );
+        let denoise: Vec<_> = observer
+            .events
+            .iter()
+            .filter(|event| event.phase == H3PipelinePhase::Denoise)
+            .map(|event| (event.completed, event.total))
+            .collect();
+        assert_eq!(
+            denoise,
+            (0..=forwards)
+                .map(|done| (done, forwards))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_refine_gate_runs_pass_one_small_then_the_tail_of_the_grid_at_the_final_canvas() {
+        let refine = refine_proto::H3RefineProto {
+            scale: 2,
+            start: 4,
+            lora2: Some(0.5),
+        };
+        let (backend, prepared, staged, observer) = run_refined(Some(refine));
+        let schedule = H3DualSchedule::new_for_sampler_with_video_shift(
+            prepared.grid_points,
+            H3SamplerKind::OfficialEuler,
+            crate::minimax_h3::sampler::H3_VIDEO_SHIFT,
+        )
+        .unwrap();
+        let forwards = schedule.counts().transformer_evaluations;
+        let tail = forwards - refine.start;
+        assert_eq!(backend.forward_log.len(), forwards + tail);
+        assert_eq!(backend.rescales, [0.5]);
+
+        // Pass 1 packs 37 generated rows, pass 2 packs the final canvas' 148;
+        // the reference prefix is identical.
+        let prefix = backend.forward_log[0].0.dims3().unwrap().1 - 37;
+        for (index, (rows, timestep)) in backend.forward_log.iter().enumerate() {
+            let generated = if index < forwards { 37 } else { 37 * 4 };
+            assert_eq!(
+                rows.dims3().unwrap().1,
+                prefix + generated,
+                "forward {index}"
+            );
+            // The timestep is the frozen grid's, re-entered at `start`.
+            let evaluation = if index < forwards {
+                index
+            } else {
+                index - forwards + refine.start
+            };
+            assert_eq!(
+                *timestep,
+                schedule
+                    .steps()
+                    .nth(evaluation)
+                    .unwrap()
+                    .row_timesteps
+                    .generated_video,
+                "forward {index}"
+            );
+        }
+        assert_eq!(
+            backend.condition_video_checksums.first(),
+            backend.condition_video_checksums.last()
+        );
+        assert!(backend
+            .condition_video_checksums
+            .windows(2)
+            .all(|pair| pair[0] == pair[1]));
+
+        // Pass 2 starts from the upsampled pass-1 latent re-noised at sigma_k
+        // with fresh noise from the prototype's own streams. The zero-velocity
+        // synthetic transformer leaves pass 1's end state equal to its initial
+        // noise, which is replayed here from the documented draw order.
+        let mut noise = H3RequestNoise::new(prepared.seed);
+        for (ordinal, reference) in prepared
+            .references
+            .iter()
+            .filter(|reference| reference.metadata.kind != GenerationReferenceKind::Audio)
+            .enumerate()
+        {
+            let visual = reference_layout_spec(reference).unwrap().visual.unwrap();
+            noise
+                .draw(
+                    "condition-noise",
+                    ordinal,
+                    &[
+                        1,
+                        VIDEO_LATENT_CHANNELS,
+                        visual.latent_frames,
+                        visual.latent_height,
+                        visual.latent_width,
+                    ],
+                    &Device::Cpu,
+                )
+                .unwrap();
+        }
+        let pass1_noise = noise
+            .draw("target-video", 0, &[1, 24, 37, 2, 2], &Device::Cpu)
+            .unwrap();
+        let upsampled = refine_proto::upsample_video_latent(&pass1_noise, 2).unwrap();
+        let (fresh, _) =
+            refine_proto::draw_refine_noise(prepared.seed, &prepared.geometry, &Device::Cpu)
+                .unwrap();
+        let sigma = schedule.video_sigmas()[refine.start];
+        let expected = patchify_h3_video(
+            &refine_proto::renoise_at_sigma(&upsampled, &fresh, sigma).unwrap(),
+            VIDEO_PATCH,
+        )
+        .unwrap();
+        let observed = backend.forward_log[forwards]
+            .0
+            .narrow(1, prefix, 37 * 4)
+            .unwrap();
+        let worst = (observed - expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            worst < 1e-4,
+            "pass-2 start differs from the replay by {worst}"
+        );
+
+        // Pass 1's draws are untouched and decode/mux see the request canvas.
+        assert_eq!(
+            staged
+                .provenance
+                .noise_draws
+                .iter()
+                .map(|draw| (draw.stream, draw.shape.clone()))
+                .collect::<Vec<_>>()[4..],
+            [
+                ("target-video", vec![1, 24, 37, 2, 2]),
+                ("target-audio", vec![1, 414, 32])
+            ]
+        );
+        assert_eq!(
+            (staged.provenance.width, staged.provenance.height),
+            (64, 64)
+        );
+        assert_eq!(staged.provenance.transformer_evaluations, forwards);
+
+        // One Denoise progress line across both passes.
+        let denoise: Vec<_> = observer
+            .events
+            .iter()
+            .filter(|event| event.phase == H3PipelinePhase::Denoise)
+            .map(|event| (event.completed, event.total))
+            .collect();
+        assert_eq!(
+            denoise,
+            (0..=forwards + tail)
+                .map(|done| (done, forwards + tail))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_refine_pass_without_lora2_leaves_the_turbo_strength_alone() {
+        let (backend, ..) = run_refined(Some(refine_proto::H3RefineProto {
+            scale: 2,
+            start: 6,
+            lora2: None,
+        }));
+        assert!(backend.rescales.is_empty());
+    }
+
+    #[test]
+    fn the_refine_gate_refuses_an_unsplittable_canvas_before_any_media_is_touched() {
+        let mut req = request();
+        req.width = 96;
+        req.height = 96;
+        let prepared = prepare(&req);
+        let mut backend = SyntheticBackend::new();
+        let error = execute_staged_with(
+            &prepared,
+            &bindings(&prepared),
+            &mut backend,
+            &ProgressReporter::default(),
+            &mut NoopH3PipelineObserver,
+            Some(refine_proto::H3RefineProto {
+                scale: 2,
+                start: 4,
+                lora2: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("multiple of 32"), "{error}");
+        assert!(backend.decoded_order.is_empty());
     }
 
     #[test]
