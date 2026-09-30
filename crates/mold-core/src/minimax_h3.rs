@@ -585,6 +585,12 @@ pub const REVIEWED_COMPACT_CANVASES: &[(u32, u32)] = &[
 /// exactly the default canvas's own figure, so the conditioning row ceilings
 /// measured there remain ceilings for every admitted canvas.
 pub fn is_admitted_compact_canvas(width: u32, height: u32) -> bool {
+    compact_canvas_shape_ok(width, height)
+        && u64::from(width) * u64::from(height) <= COMPACT_MAX_PIXELS
+}
+
+/// The canvas rule without its area clause: alignment, minimum axis, aspect.
+fn compact_canvas_shape_ok(width: u32, height: u32) -> bool {
     if width == 0 || height == 0 {
         return false;
     }
@@ -594,16 +600,95 @@ pub fn is_admitted_compact_canvas(width: u32, height: u32) -> bool {
     if width < MIN_COMPACT_AXIS_PIXELS || height < MIN_COMPACT_AXIS_PIXELS {
         return false;
     }
-    if u64::from(width) * u64::from(height) > COMPACT_MAX_PIXELS {
-        return false;
-    }
     let aspect = f64::from(width) / f64::from(height);
     (MIN_ASPECT_RATIO..=MAX_ASPECT_RATIO).contains(&aspect)
 }
 
+// ---------------------------------------------------------------------------
+// RESEARCH PROTOTYPE (`MOLD_H3_REFINE_PROTO=...,uncap=1`) -- NOT a product
+// surface. The env-gated hires-fix second pass renders a FINAL canvas larger
+// than any measured campaign (pass 1 runs at final/scale, inside the ordinary
+// rules). `uncap=1` lifts ONLY the request-side area ceilings below to
+// `UNCAP_MAX_PIXELS`; alignment, minimum axis and aspect stay. The gate is read
+// once per process. `mold-inference`'s `refine_proto.rs` remains the single
+// owner of scale/start/lora2 -- this reader answers `uncap` and nothing else.
+// With the gate closed every function below returns exactly what it returned
+// before the prototype existed.
+// ---------------------------------------------------------------------------
+
+/// The variable the prototype gate is read from (same name `mold-inference`
+/// registers as an engine-shaping variable).
+pub const REFINE_PROTO_UNCAP_VARIABLE: &str = "MOLD_H3_REFINE_PROTO";
+
+/// Prototype-only area ceiling under `uncap=1`: 4 Mi pixels, which holds
+/// 2688x1536 (4,128,768).
+pub const UNCAP_MAX_PIXELS: u64 = 4 * 1024 * 1024;
+
+/// Whether a `MOLD_H3_REFINE_PROTO` value contains `uncap=1` (also `true`/`on`).
+///
+/// Lenient on purpose: `mold-inference`'s strict parser refuses malformed
+/// specs at run time; this only has to answer one question for request
+/// admission.
+pub fn refine_proto_uncap_from_spec(spec: &str) -> bool {
+    spec.split(',').any(|item| {
+        item.split_once('=').is_some_and(|(key, value)| {
+            key.trim() == "uncap"
+                && matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on"
+                )
+        })
+    })
+}
+
+/// Process-frozen answer to [`refine_proto_uncap_from_spec`] for the live
+/// environment.
+pub fn refine_proto_uncap() -> bool {
+    static UNCAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNCAP.get_or_init(|| {
+        std::env::var(REFINE_PROTO_UNCAP_VARIABLE)
+            .is_ok_and(|spec| refine_proto_uncap_from_spec(&spec))
+    })
+}
+
+fn request_max_pixels_with(uncap: bool) -> u64 {
+    if uncap {
+        UNCAP_MAX_PIXELS.max(MAX_PIXELS)
+    } else {
+        MAX_PIXELS
+    }
+}
+
+/// The family's request-side pixel ceiling: [`MAX_PIXELS`], or the prototype
+/// ceiling under `uncap=1`.
+pub fn request_max_pixels() -> u64 {
+    request_max_pixels_with(refine_proto_uncap())
+}
+
+fn compact_request_max_pixels_with(uncap: bool) -> u64 {
+    if uncap {
+        UNCAP_MAX_PIXELS.max(COMPACT_MAX_PIXELS)
+    } else {
+        COMPACT_MAX_PIXELS
+    }
+}
+
+fn is_admitted_request_canvas_with(width: u32, height: u32, uncap: bool) -> bool {
+    compact_canvas_shape_ok(width, height)
+        && u64::from(width) * u64::from(height) <= compact_request_max_pixels_with(uncap)
+}
+
+/// [`is_admitted_compact_canvas`] for a REQUEST: identical, except that the
+/// research-prototype `uncap=1` gate lifts the area clause to
+/// [`UNCAP_MAX_PIXELS`]. Recommendation lists (presets, source fitting) keep
+/// the strict rule.
+pub fn is_admitted_request_canvas(width: u32, height: u32) -> bool {
+    is_admitted_request_canvas_with(width, height, refine_proto_uncap())
+}
+
 /// The compact canvas rule's area ceiling, as a client-facing number.
-pub const fn reviewed_compact_max_pixels() -> u64 {
-    COMPACT_MAX_PIXELS
+pub fn reviewed_compact_max_pixels() -> u64 {
+    compact_request_max_pixels_with(refine_proto_uncap())
 }
 
 /// The longest single axis the compact canvas rule can admit.
@@ -614,10 +699,15 @@ pub const fn reviewed_compact_max_pixels() -> u64 {
 /// the presets' own maximum instead would hand a client a ceiling smaller than
 /// a canvas admission accepts.
 pub fn reviewed_compact_max_axis_pixels() -> u32 {
+    reviewed_compact_max_axis_pixels_with(refine_proto_uncap())
+}
+
+fn reviewed_compact_max_axis_pixels_with(uncap: bool) -> u32 {
+    let max_pixels = compact_request_max_pixels_with(uncap);
     let mut best = MIN_COMPACT_AXIS_PIXELS;
     let mut axis = MIN_COMPACT_AXIS_PIXELS;
-    while u64::from(axis) * u64::from(MIN_COMPACT_AXIS_PIXELS) <= COMPACT_MAX_PIXELS {
-        if is_admitted_compact_canvas(axis, shortest_admitted_partner(axis)) {
+    while u64::from(axis) * u64::from(MIN_COMPACT_AXIS_PIXELS) <= max_pixels {
+        if is_admitted_request_canvas_with(axis, shortest_admitted_partner(axis), uncap) {
             best = axis;
         }
         axis += VIDEO_ROW_STRIDE;
@@ -697,8 +787,18 @@ pub fn qualified_canvases_for_model(family: &str, model: &str) -> Option<&'stati
 /// canvas [`is_admitted_compact_canvas`] accepts; every other H3 identity takes
 /// the family's alignment/area/aspect envelope.
 pub fn valid_dimensions_for_model(family: &str, model: &str, width: u32, height: u32) -> bool {
+    valid_dimensions_for_model_with(family, model, width, height, refine_proto_uncap())
+}
+
+fn valid_dimensions_for_model_with(
+    family: &str,
+    model: &str,
+    width: u32,
+    height: u32,
+    uncap: bool,
+) -> bool {
     if uses_reviewed_compact_envelope(family, model) {
-        is_admitted_compact_canvas(width, height)
+        is_admitted_request_canvas_with(width, height, uncap)
     } else {
         true
     }
@@ -2507,6 +2607,15 @@ pub fn validate_request_contract(req: &GenerateRequest, task: Task) -> Result<Mo
 /// private ingress (which skips generation-profile validation), and the
 /// generation profile's `Buckets` + `OffBucketPolicy::Reject` for every
 /// ordinary client. `private_server.rs` keeps the last word either way.
+fn family_dimensions_ok(width: u32, height: u32, uncap: bool) -> bool {
+    width != 0
+        && height != 0
+        && width.is_multiple_of(DIMENSION_ALIGNMENT)
+        && height.is_multiple_of(DIMENSION_ALIGNMENT)
+        && u64::from(width) * u64::from(height) <= request_max_pixels_with(uncap)
+        && (MIN_ASPECT_RATIO..=MAX_ASPECT_RATIO).contains(&(width as f64 / height as f64))
+}
+
 pub fn validate_reviewed_canvas(req: &GenerateRequest) -> Result<(), ContractError> {
     if valid_dimensions_for_model(FAMILY, &req.model, req.width, req.height) {
         return Ok(());
@@ -2636,13 +2745,7 @@ fn validate_request_contract_with_authorities(
         return Err(error);
     }
 
-    if req.width == 0
-        || req.height == 0
-        || !req.width.is_multiple_of(DIMENSION_ALIGNMENT)
-        || !req.height.is_multiple_of(DIMENSION_ALIGNMENT)
-        || u64::from(req.width) * u64::from(req.height) > MAX_PIXELS
-        || !(MIN_ASPECT_RATIO..=MAX_ASPECT_RATIO).contains(&(req.width as f64 / req.height as f64))
-    {
+    if !family_dimensions_ok(req.width, req.height, refine_proto_uncap()) {
         let mut error = violation(
             "MINIMAX_H3_DIMENSIONS",
             format!(
@@ -4794,6 +4897,48 @@ mod tests {
             REVIEWED_COMPACT_FRAMES.cmp(&MAX_FRAMES),
             std::cmp::Ordering::Greater
         );
+    }
+
+    /// RESEARCH PROTOTYPE: the `uncap=1` gate lifts only the area clauses. With
+    /// it closed every ladder canvas is refused by every request-side rule;
+    /// with it open they pass while alignment, minimum axis and aspect stay.
+    #[test]
+    fn the_uncap_gate_lifts_only_the_request_area_ceilings() {
+        let ladder = [(1920, 832), (2560, 1088), (2688, 1536)];
+        let model = REF2VA_COMFY_TURBO_8STEP_768P;
+        for (width, height) in ladder {
+            assert!(!valid_dimensions_for_model_with(
+                FAMILY, model, width, height, false
+            ));
+            assert!(!is_admitted_request_canvas_with(width, height, false));
+            assert!(!family_dimensions_ok(width, height, false));
+            assert!(valid_dimensions_for_model_with(
+                FAMILY, model, width, height, true
+            ));
+            assert!(is_admitted_request_canvas_with(width, height, true));
+            assert!(family_dimensions_ok(width, height, true));
+            // The recommendation rule never moves.
+            assert!(!is_admitted_compact_canvas(width, height));
+        }
+        // 4 Mi is the prototype ceiling; alignment, min axis and aspect stay.
+        assert!(!is_admitted_request_canvas_with(4096, 1088, true));
+        assert!(!is_admitted_request_canvas_with(2688, 1535, true));
+        assert!(!is_admitted_request_canvas_with(2688, 100, true));
+        assert!(!is_admitted_request_canvas_with(4096, 800, true));
+        assert!(!family_dimensions_ok(4096, 1088, true));
+        // Closed gate: byte-for-byte the old rule.
+        for (width, height) in [(1344, 768), (2016, 512), (768, 1344), (1344, 800)] {
+            assert_eq!(
+                is_admitted_request_canvas_with(width, height, false),
+                is_admitted_compact_canvas(width, height)
+            );
+        }
+        assert_eq!(compact_request_max_pixels_with(false), COMPACT_MAX_PIXELS);
+        assert_eq!(request_max_pixels_with(false), MAX_PIXELS);
+        assert_eq!(reviewed_compact_max_axis_pixels_with(false), 2016);
+        assert!(reviewed_compact_max_axis_pixels_with(true) >= 2688);
+        assert!(!refine_proto_uncap_from_spec("scale=2,start=4"));
+        assert!(refine_proto_uncap_from_spec("scale=2,start=4,uncap=1"));
     }
 
     /// `is_admitted_compact_canvas` is the one canvas authority, and

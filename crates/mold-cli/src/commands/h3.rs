@@ -410,7 +410,7 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
         && height > 0
         && width.is_multiple_of(minimax_h3::DIMENSION_ALIGNMENT)
         && height.is_multiple_of(minimax_h3::DIMENSION_ALIGNMENT)
-        && u64::from(width) * u64::from(height) <= minimax_h3::MAX_PIXELS
+        && u64::from(width) * u64::from(height) <= minimax_h3::request_max_pixels()
         && (minimax_h3::MIN_ASPECT_RATIO..=minimax_h3::MAX_ASPECT_RATIO)
             .contains(&(f64::from(width) / f64::from(height)));
     if !valid {
@@ -419,7 +419,7 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
         anyhow::bail!(
             "MiniMax H3 dimensions must be positive multiples of {}, at most {} pixels, with aspect ratio 1:4 through 4:1; nearest official canvas is {}x{}",
             minimax_h3::DIMENSION_ALIGNMENT,
-            minimax_h3::MAX_PIXELS,
+            minimax_h3::request_max_pixels(),
             recommended_width,
             recommended_height,
         );

@@ -2206,7 +2206,7 @@ fn validate_prepared_request(request: &H3FactoryPreparedRequestInput) -> Result<
         || request.height == 0
         || !request.width.is_multiple_of(contract::DIMENSION_ALIGNMENT)
         || !request.height.is_multiple_of(contract::DIMENSION_ALIGNMENT)
-        || pixel_count > contract::MAX_PIXELS
+        || pixel_count > contract::request_max_pixels()
         || !(contract::MIN_ASPECT_RATIO..=contract::MAX_ASPECT_RATIO).contains(&aspect_ratio)
         || !contract::valid_frame_count(request.frames)
         || request.video_latent_frames != expected_video_latent_frames

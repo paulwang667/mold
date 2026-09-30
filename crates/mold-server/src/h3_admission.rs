@@ -748,7 +748,7 @@ impl H3PreparedRequestShape {
             || self.height == 0
             || !self.width.is_multiple_of(minimax_h3::DIMENSION_ALIGNMENT)
             || !self.height.is_multiple_of(minimax_h3::DIMENSION_ALIGNMENT)
-            || u64::from(self.width) * u64::from(self.height) > minimax_h3::MAX_PIXELS
+            || u64::from(self.width) * u64::from(self.height) > minimax_h3::request_max_pixels()
             || !(minimax_h3::MIN_ASPECT_RATIO..=minimax_h3::MAX_ASPECT_RATIO)
                 .contains(&(self.width as f64 / self.height as f64))
             || !minimax_h3::valid_frame_count(self.frames)

@@ -758,7 +758,11 @@ pub fn max_pixels_for_family_composed(
     match (family, composition) {
         (Some("ltx2"), Ltx2SpatialComposition::TiledTwoStage) => LTX2_COMPOSED_MAX_PIXELS,
         (Some("ltx2"), Ltx2SpatialComposition::SinglePass) => LTX2_MAX_PIXELS,
-        (Some(family), _) if crate::minimax_h3::is_family(family) => crate::minimax_h3::MAX_PIXELS,
+        (Some(family), _) if crate::minimax_h3::is_family(family) => {
+            // `request_max_pixels` is `MAX_PIXELS` unless the research-prototype
+            // `MOLD_H3_REFINE_PROTO=...,uncap=1` gate is set.
+            crate::minimax_h3::request_max_pixels()
+        }
         (Some("qwen-image21"), _) => QWEN_IMAGE21_MAX_PIXELS,
         _ => MAX_PIXELS,
     }
