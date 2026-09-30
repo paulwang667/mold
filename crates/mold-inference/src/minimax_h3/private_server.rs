@@ -382,7 +382,7 @@ impl H3PrivateRuntimeEnvelopeRecord {
         // The envelope is minted for the request's own shape, so the row
         // ceilings below travel with it; the memory bounds it carries are
         // scaled from the campaign's measurement by that shape's packed rows.
-        if !contract::is_admitted_compact_canvas(self.width, self.height)
+        if !contract::is_admitted_request_canvas(self.width, self.height)
             || !contract::valid_frame_count(self.frames)
             || self.fps != contract::FIXED_FPS
             || self.batch_size != 1
@@ -711,6 +711,43 @@ fn precheck_private_h3_admission_capacity(
     available_device_bytes: u64,
     available_host_headroom_bytes: u64,
 ) -> Result<()> {
+    let strict = precheck_private_h3_admission_capacity_strict(
+        bounds,
+        compute_capability,
+        available_device_bytes,
+        available_host_headroom_bytes,
+    );
+    waive_memory_shortfall_for_refine_uncap("admission floor", strict)
+}
+
+/// RESEARCH PROTOTYPE (`MOLD_H3_REFINE_PROTO=...,uncap=1`, closed by default):
+/// the linear workspace grants are extrapolated from a 1344x768 measurement, so
+/// at a multi-megapixel final canvas they can exceed a card the render would in
+/// fact fit (or, honestly, not). Under the gate a memory shortfall is logged
+/// with both numbers and waived so the run can be measured; a real OOM then
+/// surfaces from the device. With the gate closed the result is returned as-is.
+#[cfg(feature = "mp4")]
+fn waive_memory_shortfall_for_refine_uncap(what: &str, outcome: Result<()>) -> Result<()> {
+    match outcome {
+        Err(error) if contract::refine_proto_uncap() => {
+            tracing::warn!(
+                target: "mold::minimax_h3::refine_proto",
+                "H3 refine-proto uncap=1: waiving {what} memory refusal ({error:#}); \
+                 the run may OOM on the device"
+            );
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+#[cfg(feature = "mp4")]
+fn precheck_private_h3_admission_capacity_strict(
+    bounds: &H3PrivateRuntimeBoundRecord,
+    compute_capability: Option<(u16, u16)>,
+    available_device_bytes: u64,
+    available_host_headroom_bytes: u64,
+) -> Result<()> {
     let device_floor = private_h3_admission_device_floor_bytes(bounds)?;
     let host_floor = private_h3_admission_host_floor_bytes(bounds)?;
     if compute_capability.is_none() {
@@ -829,6 +866,35 @@ fn precheck_private_h3_record_canvas(
 /// nothing here may route through the fatal-CUDA quarantine.
 #[cfg(feature = "mp4")]
 fn check_private_h3_target_budget_fits(
+    predicted_device_peak_bytes: u64,
+    predicted_host_increment_bytes: u64,
+    compute_capability: Option<(u16, u16)>,
+    available_device_bytes: u64,
+    available_host_headroom_bytes: u64,
+) -> Result<()> {
+    let strict = check_private_h3_target_budget_fits_strict(
+        predicted_device_peak_bytes,
+        predicted_host_increment_bytes,
+        compute_capability,
+        available_device_bytes,
+        available_host_headroom_bytes,
+    );
+    if strict.is_ok() || !contract::refine_proto_uncap() {
+        return strict;
+    }
+    tracing::warn!(
+        target: "mold::minimax_h3::refine_proto",
+        predicted_device_peak_bytes,
+        predicted_host_increment_bytes,
+        available_device_bytes,
+        available_host_headroom_bytes,
+        "H3 refine-proto uncap=1: predicted target budget exceeds the admission sample"
+    );
+    waive_memory_shortfall_for_refine_uncap("target budget", strict)
+}
+
+#[cfg(feature = "mp4")]
+fn check_private_h3_target_budget_fits_strict(
     predicted_device_peak_bytes: u64,
     predicted_host_increment_bytes: u64,
     compute_capability: Option<(u16, u16)>,
@@ -1616,6 +1682,9 @@ impl H3PrivateFl2VaAdmissionEvidence {
         available_device_bytes: u64,
         available_host_headroom_bytes: u64,
     ) -> Result<()> {
+        // Research prototype (`MOLD_H3_REFINE_PROTO=...,uncap=1`, off by
+        // default): the four memory-vs-sample comparisons below are waived.
+        let refine_uncap = contract::refine_proto_uncap();
         self.validate_resolved_request(request)?;
         self.base_factory_authority.validate_engine_seam(
             &self.canonical_model,
@@ -1707,19 +1776,24 @@ impl H3PrivateFl2VaAdmissionEvidence {
             ),
             (
                 "available device bytes >= predicted device peak",
-                available_device_bytes >= self.predicted_device_peak_bytes,
+                // Research prototype: waived under `uncap=1` (see
+                // `waive_memory_shortfall_for_refine_uncap`).
+                refine_uncap || available_device_bytes >= self.predicted_device_peak_bytes,
             ),
             (
                 "available host headroom >= predicted host increment",
-                available_host_headroom_bytes >= self.predicted_host_increment_bytes,
+                refine_uncap
+                    || available_host_headroom_bytes >= self.predicted_host_increment_bytes,
             ),
             (
                 "admitted available device bytes >= predicted device peak",
-                self.admitted_available_device_bytes >= self.predicted_device_peak_bytes,
+                refine_uncap
+                    || self.admitted_available_device_bytes >= self.predicted_device_peak_bytes,
             ),
             (
                 "admitted host headroom >= predicted host increment",
-                self.admitted_host_headroom_bytes >= self.predicted_host_increment_bytes,
+                refine_uncap
+                    || self.admitted_host_headroom_bytes >= self.predicted_host_increment_bytes,
             ),
             (
                 "prepared request identity",
