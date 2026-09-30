@@ -4144,6 +4144,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: String::new(),
             negative_prompt: None,
             model: "flux-dev".to_string(),

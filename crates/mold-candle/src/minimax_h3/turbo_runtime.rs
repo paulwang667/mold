@@ -504,6 +504,19 @@ impl H3TurboLoraRuntime {
         dtype: DType,
         cancellation: &dyn H3ComfyInt8Cancellation,
     ) -> H3TurboLoraResult<Self> {
+        Self::from_authenticated_with_strength(contract, file, device, dtype, cancellation, None)
+    }
+
+    /// [`Self::from_authenticated`] with the request's strength in place of
+    /// the tier's own. `None` keeps the tier's strength.
+    pub fn from_authenticated_with_strength(
+        contract: &H3TurboLoraContract,
+        file: &mut File,
+        device: &Device,
+        dtype: DType,
+        cancellation: &dyn H3ComfyInt8Cancellation,
+        strength_override: Option<f32>,
+    ) -> H3TurboLoraResult<Self> {
         if !matches!(dtype, DType::BF16 | DType::F16 | DType::F32 | DType::F64) {
             return Err(failure(
                 H3TurboLoraErrorCode::DTypeMismatch,
@@ -511,7 +524,7 @@ impl H3TurboLoraRuntime {
             ));
         }
         let inspection = contract.inspection();
-        let adapter_strength = validated_adapter_strength(contract.tier())?;
+        let adapter_strength = validated_adapter_strength(contract.tier(), strength_override)?;
         let data_start = 8u64.checked_add(inspection.header_len).ok_or_else(|| {
             failure(
                 H3TurboLoraErrorCode::InvalidHeader,
@@ -599,6 +612,19 @@ impl H3TurboLoraRuntime {
         dtype: DType,
         cancellation: Arc<dyn H3ComfyInt8Cancellation>,
     ) -> H3TurboLoraResult<Self> {
+        Self::open_metal_streamed_with_strength(path, tier, device, dtype, cancellation, None)
+    }
+
+    /// [`Self::open_metal_streamed`] with the request's strength in place of
+    /// the tier's own.
+    pub fn open_metal_streamed_with_strength(
+        path: &Path,
+        tier: H3TurboLoraTier,
+        device: &Device,
+        dtype: DType,
+        cancellation: Arc<dyn H3ComfyInt8Cancellation>,
+        strength_override: Option<f32>,
+    ) -> H3TurboLoraResult<Self> {
         Self::open_metal_streamed_against(
             path,
             &tier.expectation(),
@@ -606,6 +632,7 @@ impl H3TurboLoraRuntime {
             device,
             dtype,
             cancellation,
+            strength_override,
         )
     }
 
@@ -616,6 +643,7 @@ impl H3TurboLoraRuntime {
         device: &Device,
         dtype: DType,
         cancellation: Arc<dyn H3ComfyInt8Cancellation>,
+        strength_override: Option<f32>,
     ) -> H3TurboLoraResult<Self> {
         if !device.is_metal() {
             return Err(failure(
@@ -636,7 +664,7 @@ impl H3TurboLoraRuntime {
                 .map_err(|error| failure(H3TurboLoraErrorCode::Io, error.to_string()))?,
         );
         let inspection = contract.inspection();
-        let adapter_strength = validated_adapter_strength(contract.tier())?;
+        let adapter_strength = validated_adapter_strength(contract.tier(), strength_override)?;
         let data_start = 8u64.checked_add(inspection.header_len).ok_or_else(|| {
             failure(
                 H3TurboLoraErrorCode::InvalidHeader,
@@ -753,7 +781,27 @@ impl H3TurboLoraRuntime {
         dtype: DType,
         cancellation: &dyn H3ComfyInt8Cancellation,
     ) -> H3TurboLoraResult<Self> {
-        Self::open_against(path, &tier.expectation(), tier, device, dtype, cancellation)
+        Self::open_with_strength(path, tier, device, dtype, cancellation, None)
+    }
+
+    /// [`Self::open`] with the request's strength in place of the tier's own.
+    pub fn open_with_strength(
+        path: &Path,
+        tier: H3TurboLoraTier,
+        device: &Device,
+        dtype: DType,
+        cancellation: &dyn H3ComfyInt8Cancellation,
+        strength_override: Option<f32>,
+    ) -> H3TurboLoraResult<Self> {
+        Self::open_against(
+            path,
+            &tier.expectation(),
+            tier,
+            device,
+            dtype,
+            cancellation,
+            strength_override,
+        )
     }
 
     pub(crate) fn open_against(
@@ -763,10 +811,18 @@ impl H3TurboLoraRuntime {
         device: &Device,
         dtype: DType,
         cancellation: &dyn H3ComfyInt8Cancellation,
+        strength_override: Option<f32>,
     ) -> H3TurboLoraResult<Self> {
         let (contract, mut file) =
             authenticate_h3_turbo_lora_adapter_retaining(path, expectation, tier, cancellation)?;
-        Self::from_authenticated(&contract, &mut file, device, dtype, cancellation)
+        Self::from_authenticated_with_strength(
+            &contract,
+            &mut file,
+            device,
+            dtype,
+            cancellation,
+            strength_override,
+        )
     }
 }
 
@@ -968,17 +1024,20 @@ fn collect_one_block_deltas(
     })
 }
 
-/// The tier's adapter strength, refused unless it is a finite positive factor
-/// no larger than the published `1.0`. `H3TurboLoraDelta::new` would refuse a
-/// non-positive product anyway; this names the TIER as the cause instead of a
-/// module.
-fn validated_adapter_strength(tier: H3TurboLoraTier) -> H3TurboLoraResult<f32> {
-    let strength = tier.adapter_strength();
+/// The effective adapter strength: the request's when it carries one, else the
+/// tier's own. Refused unless it is a finite positive factor no larger than the
+/// published `1.0`. `H3TurboLoraDelta::new` would refuse a non-positive product
+/// anyway; this names the TIER as the cause instead of a module.
+fn validated_adapter_strength(
+    tier: H3TurboLoraTier,
+    strength_override: Option<f32>,
+) -> H3TurboLoraResult<f32> {
+    let strength = strength_override.unwrap_or_else(|| tier.adapter_strength());
     if !strength.is_finite() || strength <= 0.0 || strength > 1.0 {
         return Err(failure(
             H3TurboLoraErrorCode::ConfigMismatch,
             format!(
-                "H3 Turbo tier {tier:?} declares adapter strength {strength}; \
+                "H3 Turbo tier {tier:?} is asked to apply adapter strength {strength}; \
                  it must be finite, positive and at most 1.0"
             ),
         ));
@@ -1412,6 +1471,7 @@ mod tests {
             &Device::Cpu,
             DType::F32,
             &H3ComfyNeverCancel,
+            None,
         )
         .unwrap();
 
@@ -1466,6 +1526,63 @@ mod tests {
         }
     }
 
+    /// A request strength replaces the tier's own: same file, same adapter
+    /// identity (strength is folded into the FACTORY authority, not the file's
+    /// contract), every delta scaled by the requested factor, and a value the
+    /// loader cannot apply is refused rather than clamped.
+    #[test]
+    fn a_request_strength_replaces_the_tiers_own_and_bad_values_are_refused() {
+        let tier = H3TurboLoraTier::Ref2v4StepV10;
+        let mut expectation = fixtures::expectation();
+        expectation.task = tier.task();
+        let (header, data) = fixtures::adapter(&expectation);
+        let (_directory, path) = fixtures::write(&header, &data);
+        expectation.content_sha256 = Some(super::super::comfy_dit::sha256_hex(
+            <sha2::Sha256 as sha2::Digest>::digest(std::fs::read(&path).unwrap()),
+        ));
+        let open = |strength| {
+            H3TurboLoraRuntime::open_against(
+                &path,
+                &expectation,
+                tier,
+                &Device::Cpu,
+                DType::F32,
+                &H3ComfyNeverCancel,
+                strength,
+            )
+        };
+        let full = open(None).unwrap();
+        let sweep = open(Some(0.75)).unwrap();
+        assert_eq!(sweep.adapter_strength(), 0.75);
+        assert_eq!(sweep.scale(), 0.0625 * 0.75);
+        assert_eq!(
+            full.adapter_identity_sha256(),
+            sweep.adapter_identity_sha256()
+        );
+        assert_eq!(full.content_sha256(), sweep.content_sha256());
+        let x = ramp(3, 256, 91, &Device::Cpu);
+        for kind in H3TurboLoraModuleKind::ALL {
+            let full_delta = full.main_block(0).unwrap().kind(kind);
+            let sweep_delta = sweep.main_block(0).unwrap().kind(kind);
+            assert_eq!(sweep_delta.scale(), full_delta.scale() * 0.75, "{kind:?}");
+            let input = x.narrow(1, 0, full_delta.in_features()).unwrap();
+            let full_out = full_delta.delta(&input).unwrap().to_vec2::<f32>().unwrap();
+            let sweep_out = sweep_delta.delta(&input).unwrap().to_vec2::<f32>().unwrap();
+            for (full_row, sweep_row) in full_out.iter().zip(sweep_out.iter()) {
+                for (full_value, sweep_value) in full_row.iter().zip(sweep_row.iter()) {
+                    assert!(
+                        (full_value * 0.75 - sweep_value).abs() <= 1e-6 * full_value.abs().max(1.0),
+                        "{kind:?}: {sweep_value} is not three quarters of {full_value}"
+                    );
+                }
+            }
+        }
+        for bad in [0.0, -0.1, 1.5, f32::NAN, f32::INFINITY] {
+            let error = open(Some(bad)).map(|_| ()).unwrap_err();
+            assert_eq!(error.code, H3TurboLoraErrorCode::ConfigMismatch, "{bad}");
+        }
+    }
+
     /// A strength variant authenticates the SAME file as its full-strength
     /// tier and applies every delta at `alpha / rank x strength`: the half-
     /// strength branch is exactly half the full-strength branch, module for
@@ -1491,6 +1608,7 @@ mod tests {
                 &Device::Cpu,
                 DType::F32,
                 &H3ComfyNeverCancel,
+                None,
             )
             .unwrap()
         };
@@ -1564,7 +1682,7 @@ mod tests {
     #[test]
     fn every_tier_strength_passes_the_loader_guard() {
         for tier in H3TurboLoraTier::ALL {
-            let strength = validated_adapter_strength(tier).unwrap();
+            let strength = validated_adapter_strength(tier, None).unwrap();
             assert_eq!(
                 strength.to_bits(),
                 tier.adapter_strength().to_bits(),
@@ -1598,6 +1716,7 @@ mod tests {
             &Device::Cpu,
             DType::BF16,
             &H3ComfyNeverCancel,
+            None,
         )
         .unwrap();
         assert_eq!(resident.device_bytes(), payload_bytes);
@@ -1610,6 +1729,7 @@ mod tests {
             &Device::Cpu,
             DType::F32,
             &H3ComfyNeverCancel,
+            None,
         )
         .unwrap();
         assert_eq!(runtime.tier(), tier);
@@ -1752,6 +1872,7 @@ mod tests {
             &device,
             DType::F32,
             Arc::new(H3ComfyNeverCancel),
+            None,
         )
         .unwrap();
 
@@ -1821,6 +1942,7 @@ mod tests {
             &device,
             DType::F32,
             Arc::new(H3ComfyNeverCancel),
+            None,
         )
         .unwrap();
         assert_eq!(runtime.scale(), 0.03125);
@@ -1843,6 +1965,7 @@ mod tests {
             &Device::Cpu,
             DType::F32,
             &H3ComfyNeverCancel,
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, H3TurboLoraErrorCode::MissingContentPin);
@@ -1858,6 +1981,7 @@ mod tests {
             &Device::Cpu,
             DType::U8,
             &H3ComfyNeverCancel,
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, H3TurboLoraErrorCode::DTypeMismatch);

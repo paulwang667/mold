@@ -3163,6 +3163,14 @@ fn validate_generate_request_after_activation_with(
             ));
         }
     }
+    // The Turbo LoRA strength is an H3 control; the H3 contract owns its range
+    // and tier rules. Rejected, not ignored, off-family.
+    if req.turbo_lora_strength.is_some() && !family.is_some_and(crate::minimax_h3::is_family) {
+        return Err(
+            "turbo_lora_strength is a MiniMax H3 Turbo control and is not supported for this model"
+                .to_string(),
+        );
+    }
     if family.is_some_and(crate::minimax_h3::is_family) {
         let task = crate::minimax_h3::task_for_model(&req.model).ok_or_else(|| {
             "MiniMax H3 requests must resolve an explicit FL2VA or Ref2VA task partition"
@@ -5116,6 +5124,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "a red apple".to_string(),
             negative_prompt: None,
             model: "test-model".to_string(),
@@ -7607,6 +7616,18 @@ mod tests {
             base.scheduler = Some(Scheduler::UniPc);
             assert!(validate_generate_request(&base).is_ok(), "{base_tier}");
         }
+    }
+
+    /// The H3 Turbo LoRA strength is rejected — never ignored — off the H3
+    /// family, so a client that sends it to the wrong model finds out.
+    #[test]
+    fn turbo_lora_strength_is_rejected_off_the_h3_family() {
+        let mut req = valid_req();
+        req.turbo_lora_strength = Some(0.5);
+        let err = validate_generate_request(&req).unwrap_err();
+        assert!(err.contains("turbo_lora_strength"), "{err}");
+        req.turbo_lora_strength = None;
+        assert!(validate_generate_request(&req).is_ok());
     }
 
     /// #782 / #795: the wan recipe knobs are admitted for wan and rejected —

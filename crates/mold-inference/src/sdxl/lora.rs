@@ -1248,6 +1248,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "sdxl".to_string(),

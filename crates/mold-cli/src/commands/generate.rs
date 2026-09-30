@@ -1127,6 +1127,8 @@ pub struct Ltx2Options {
     /// Wan Lightning distill strengths (#795). `None` = 1.0.
     pub distill_strength_high: Option<f64>,
     pub distill_strength_low: Option<f64>,
+    /// MiniMax H3 Turbo LoRA strength (`--turbo-strength`). `None` keeps the tier's.
+    pub turbo_lora_strength: Option<f64>,
     /// Display-safe first-frame provenance. Never a client path.
     pub source_image_name: Option<String>,
     /// `--fit`: resample the source image onto the REQUESTED canvas before
@@ -1293,6 +1295,7 @@ pub async fn run(
         sample_shift,
         distill_strength_high,
         distill_strength_low,
+        turbo_lora_strength,
         source_image_name,
         source_fit,
         references,
@@ -1642,6 +1645,7 @@ pub async fn run(
                         sample_shift: None,
                         distill_strength_high: None,
                         distill_strength_low: None,
+                        turbo_lora_strength: None,
                         prompt: prompt.to_string(),
                         negative_prompt: None,
                         model: model.to_string(),
@@ -1832,6 +1836,7 @@ pub async fn run(
         sample_shift,
         distill_strength_high,
         distill_strength_low,
+        turbo_lora_strength,
         prompt: prompt.to_string(),
         negative_prompt: effective_negative_prompt.clone(),
         model: model.to_string(),
@@ -5791,6 +5796,7 @@ mod tests {
                 sample_shift: None,
                 distill_strength_high: None,
                 distill_strength_low: None,
+                turbo_lora_strength: None,
                 source_image_name: None,
                 source_fit: None,
                 references: None,

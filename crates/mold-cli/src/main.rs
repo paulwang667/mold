@@ -1969,6 +1969,13 @@ Examples:
         #[arg(long, value_name = "SPEC", help_heading = "Video")]
         distill_strength: Option<String>,
 
+        /// MiniMax H3 Turbo LoRA strength in (0, 1], replacing the tier's own
+        /// (1.0 for the published tiers). Lower values soften the distillation
+        /// adapter's side effects, e.g. the subject sitting left of centre, at
+        /// some cost in sharpness. Turbo tags only.
+        #[arg(long, value_name = "STRENGTH", help_heading = "Video")]
+        turbo_strength: Option<f64>,
+
         /// Camera-control LoRA preset name or .safetensors path.
         ///
         /// Preset aliases (dolly-in, dolly-left, dolly-out, dolly-right,
@@ -3290,6 +3297,7 @@ async fn run() -> anyhow::Result<()> {
             sample_solver,
             sample_shift,
             distill_strength,
+            turbo_strength,
             camera_control,
             host,
             format,
@@ -3496,6 +3504,7 @@ async fn run() -> anyhow::Result<()> {
                     sample_solver,
                     sample_shift,
                     distill_strength,
+                    turbo_strength,
                 },
                 camera_control,
                 host,

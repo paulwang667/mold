@@ -2175,6 +2175,14 @@ pub struct GenerateRequest {
     /// Strength for the low-noise expert's distill. Absent = 1.0. Wan only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distill_strength_low: Option<f64>,
+    /// Strength the MiniMax H3 Turbo distillation LoRA is applied at, in
+    /// `(0, 1]`; every low-rank delta is scaled by it. Absent keeps the tier's
+    /// reviewed strength (`1.0` for the published tiers). It replaces the
+    /// tier's value rather than multiplying it. Distinct from `strength`,
+    /// which is the denoise strength H3 fixes at 1. Turbo tiers only; rejected,
+    /// not ignored, everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turbo_lora_strength: Option<f64>,
     /// Optional per-component device placement override. `None` preserves
     /// the engine's VRAM-aware auto-placement end-to-end. See §3 of the
     /// 2026-04-19 model-ui-overhaul design doc.
@@ -3429,6 +3437,8 @@ pub struct OutputMetadata {
     pub distill_strength_high: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distill_strength_low: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turbo_lora_strength: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frames: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3662,6 +3672,7 @@ impl OutputMetadata {
             sample_shift: req.sample_shift,
             distill_strength_high: req.distill_strength_high,
             distill_strength_low: req.distill_strength_low,
+            turbo_lora_strength: req.turbo_lora_strength,
             upscale_model: req.upscale_model.clone(),
             gif_preview: req.gif_preview.then_some(true),
             enable_audio: req.enable_audio,
@@ -7462,6 +7473,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "a cat on Mars".to_string(),
             negative_prompt: None,
             model: "flux-schnell".to_string(),
@@ -7719,6 +7731,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "a cat".to_string(),
             negative_prompt: Some("blurry, low quality".to_string()),
             model: "sd15:fp16".to_string(),
@@ -7804,6 +7817,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "test".to_string(),
@@ -8092,6 +8106,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "flux-schnell:q8".to_string(),
@@ -8428,6 +8443,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "flux-dev:q8".to_string(),
@@ -8680,6 +8696,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "a cat".to_string(),
             negative_prompt: Some("blurry, ugly".to_string()),
             model: "sd15:fp16".to_string(),
@@ -8762,6 +8779,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "sd15:fp16".to_string(),
@@ -8847,6 +8865,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "video".to_string(),
             negative_prompt: Some("blur".to_string()),
             model: "ltx-2.3-22b-distilled:fp8".to_string(),
@@ -9650,6 +9669,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "test".to_string(),
@@ -9738,6 +9758,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "qwen-image-edit-2511:q4".to_string(),
@@ -9839,6 +9860,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "test".to_string(),
@@ -9925,6 +9947,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "test".to_string(),
@@ -10032,6 +10055,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "test".to_string(),

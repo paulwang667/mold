@@ -106,6 +106,7 @@ impl VideoMetadata {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             job_id: None,
             prompt: self.prompt.clone(),
             negative_prompt: None,

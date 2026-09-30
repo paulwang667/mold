@@ -865,6 +865,9 @@ pub struct WanFlags {
     pub sample_solver: Option<String>,
     pub sample_shift: Option<f64>,
     pub distill_strength: Option<String>,
+    /// MiniMax H3 Turbo LoRA strength in (0, 1]; not a Wan recipe flag, grouped
+    /// here only to keep the `run` signature from growing.
+    pub turbo_strength: Option<f64>,
 }
 
 impl WanFlags {
@@ -901,6 +904,7 @@ impl WanFlags {
             sample_shift: self.sample_shift,
             distill_strength_high,
             distill_strength_low,
+            turbo_lora_strength: self.turbo_strength,
         })
     }
 }
@@ -910,6 +914,7 @@ pub(crate) struct ResolvedWanFlags {
     pub sample_shift: Option<f64>,
     pub distill_strength_high: Option<f64>,
     pub distill_strength_low: Option<f64>,
+    pub turbo_lora_strength: Option<f64>,
 }
 
 /// `high=1.5,low=1.0` (either half optional, any order) or one bare number
@@ -1960,6 +1965,7 @@ pub async fn run(
             sample_shift: wan.sample_shift,
             distill_strength_high: wan.distill_strength_high,
             distill_strength_low: wan.distill_strength_low,
+            turbo_lora_strength: wan.turbo_lora_strength,
             source_image_name: if is_h3 {
                 h3_authoring.source_image_name.or_else(|| {
                     image

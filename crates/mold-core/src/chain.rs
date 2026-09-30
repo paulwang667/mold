@@ -928,6 +928,7 @@ impl ChainRequest {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             placement: self.placement.clone(),
             id_image: None,
             id_image_name: None,

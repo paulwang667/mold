@@ -2754,6 +2754,26 @@ fn validate_request_contract_with_authorities(
             "MiniMax H3 generation has no denoise-strength control; strength must be 1",
         ));
     }
+    if let Some(strength) = req.turbo_lora_strength {
+        if turbo_tier_for_model(&req.model).is_none() {
+            return Err(violation(
+                "MINIMAX_H3_TURBO_STRENGTH_NOT_TURBO",
+                format!(
+                    "turbo_lora_strength scales a Turbo distillation adapter; {} is not a Turbo tag",
+                    req.model
+                ),
+            ));
+        }
+        // Checked after the `f32` cast the runtime applies: 1e-50 is a positive
+        // `f64` that would reach the adapter as zero.
+        let applied = strength as f32;
+        if !applied.is_finite() || applied <= 0.0 || applied > 1.0 {
+            return Err(violation(
+                "MINIMAX_H3_TURBO_STRENGTH_RANGE",
+                format!("turbo_lora_strength must be in (0, 1], received {strength}"),
+            ));
+        }
+    }
     if req.source_video.is_some()
         || req.source_video_path.is_some()
         || req.audio_file.is_some()
@@ -3941,6 +3961,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             placement: None,
             id_image: None,
             id_image_name: None,
@@ -4158,6 +4179,39 @@ mod tests {
                 .code,
             "MINIMAX_H3_GRID_POINTS"
         );
+    }
+
+    #[test]
+    fn turbo_lora_strength_is_a_turbo_only_control_in_zero_exclusive_one_inclusive() {
+        let mut req = request();
+        // A base (non-Turbo) tag has no adapter to scale.
+        req.turbo_lora_strength = Some(0.5);
+        assert_eq!(
+            validate_request_contract(&req, Task::Fl2va)
+                .unwrap_err()
+                .code,
+            "MINIMAX_H3_TURBO_STRENGTH_NOT_TURBO"
+        );
+
+        req.model = FL2VA_COMFY_TURBO_8STEP_768P.to_string();
+        req.steps = steps_floor_for_model(&req.model);
+        req.turbo_lora_strength = None;
+        validate_request_contract(&req, Task::Fl2va).expect("the Turbo request is otherwise valid");
+        for accepted in [0.05, 0.5, 0.75, 1.0] {
+            req.turbo_lora_strength = Some(accepted);
+            validate_request_contract(&req, Task::Fl2va)
+                .unwrap_or_else(|error| panic!("{accepted}: {error:?}"));
+        }
+        for refused in [0.0, -0.5, 1.01, f64::NAN, f64::INFINITY, 1e-50] {
+            req.turbo_lora_strength = Some(refused);
+            assert_eq!(
+                validate_request_contract(&req, Task::Fl2va)
+                    .unwrap_err()
+                    .code,
+                "MINIMAX_H3_TURBO_STRENGTH_RANGE",
+                "{refused}"
+            );
+        }
     }
 
     #[test]

@@ -317,6 +317,7 @@ pub(crate) fn turbo_adapter_authority(
 pub(crate) fn resolve_turbo_authority_for_request(
     model: &str,
     models_root: &std::path::Path,
+    strength_override: Option<f32>,
 ) -> Result<Option<H3FactoryTurboAdapterAuthority>> {
     let Some((path, tier)) = resolve_turbo_selection(model, models_root)? else {
         return Ok(None);
@@ -350,14 +351,20 @@ pub(crate) fn resolve_turbo_authority_for_request(
     let host_staging_peak_bytes = widest_matrix_bytes
         .checked_mul(2)
         .ok_or_else(|| anyhow!("MiniMax H3 Turbo host staging byte count overflows"))?;
-    turbo_adapter_authority(
+    let authority = turbo_adapter_authority(
         &contract,
         resident_device_bytes,
         // The widest module's transposed copies live beside their originals
         // during the upload; see `H3TurboLoraRuntime::device_staging_peak_bytes`.
         widest_module_bytes,
         host_staging_peak_bytes,
-    )
+    )?;
+    // The request's strength is frozen beside the tier here, so every later
+    // layer (attempt reopen, transformer load) reads one value.
+    match strength_override {
+        Some(strength) => authority.with_strength_override(strength),
+        None => Ok(authority),
+    }
     .map(Some)
 }
 
@@ -428,15 +435,36 @@ pub(crate) fn load_reviewed_turbo_runtime(
         )
     }
     let runtime = if device.is_metal() {
-        H3TurboLoraRuntime::open_metal_streamed(&path, tier, device, dtype, cancellation)
+        H3TurboLoraRuntime::open_metal_streamed_with_strength(
+            &path,
+            tier,
+            device,
+            dtype,
+            cancellation,
+            authority.adapter_strength_override(),
+        )
     } else {
-        H3TurboLoraRuntime::open(&path, tier, device, dtype, cancellation.as_ref())
+        H3TurboLoraRuntime::open_with_strength(
+            &path,
+            tier,
+            device,
+            dtype,
+            cancellation.as_ref(),
+            authority.adapter_strength_override(),
+        )
     }
     .map_err(|error| anyhow!("{error}"))?;
     if runtime.adapter_identity_sha256() != authority.adapter_identity_sha256()
         || runtime.content_sha256() != authority.adapter_content_sha256()
     {
         bail!("MiniMax H3 Turbo adapter changed between admission and transformer load")
+    }
+    if runtime.adapter_strength().to_bits() != authority.effective_adapter_strength().to_bits() {
+        bail!(
+            "MiniMax H3 Turbo adapter strength {} differs from the {} admission froze",
+            runtime.adapter_strength(),
+            authority.effective_adapter_strength()
+        )
     }
     let resident_cost_matches = if runtime.is_metal_streamed() {
         runtime

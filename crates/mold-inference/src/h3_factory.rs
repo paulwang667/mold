@@ -1013,6 +1013,11 @@ pub struct H3FactoryTurboAdapterAuthority {
     resident_device_bytes: u64,
     device_staging_peak_bytes: u64,
     host_staging_peak_bytes: u64,
+    /// The request's adapter strength when it differs from the tier's own
+    /// (`f32` bits). `None` is the tier's reviewed strength, so a request that
+    /// names no strength — or names exactly the tier's — freezes byte-identical
+    /// to one made before the control existed.
+    strength_override_bits: Option<u32>,
 }
 
 impl H3FactoryTurboAdapterAuthority {
@@ -1041,9 +1046,47 @@ impl H3FactoryTurboAdapterAuthority {
             resident_device_bytes,
             device_staging_peak_bytes,
             host_staging_peak_bytes,
+            strength_override_bits: None,
         };
         authority.validate()?;
         Ok(authority)
+    }
+
+    /// Freeze the request's adapter strength beside the tier. A value equal to
+    /// the tier's own strength canonicalizes to no override, so the identity
+    /// depends on the effective strength and never on how it was spelled.
+    pub fn with_strength_override(mut self, strength: f32) -> Result<Self> {
+        let default = self.tier_default_strength()?;
+        self.strength_override_bits =
+            (strength.to_bits() != default.to_bits()).then_some(strength.to_bits());
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The strength the runtime applies: the request's, else the tier's.
+    pub fn effective_adapter_strength(&self) -> f32 {
+        self.strength_override_bits
+            .map(f32::from_bits)
+            .or_else(|| self.tier_default_strength().ok())
+            .unwrap_or(1.0)
+    }
+
+    /// The request's strength when it is not the tier's own.
+    pub fn adapter_strength_override(&self) -> Option<f32> {
+        self.strength_override_bits.map(f32::from_bits)
+    }
+
+    fn tier_default_strength(&self) -> Result<f32> {
+        mold_candle::minimax_h3::H3TurboLoraTier::ALL
+            .into_iter()
+            .find(|tier| tier.stable_id() == self.tier_stable_id)
+            .map(|tier| tier.adapter_strength())
+            .ok_or_else(|| {
+                anyhow!(
+                    "MiniMax H3 Turbo tier {:?} is not a reviewed tier",
+                    self.tier_stable_id
+                )
+            })
     }
 
     pub fn tier_stable_id(&self) -> &str {
@@ -1127,6 +1170,14 @@ impl H3FactoryTurboAdapterAuthority {
                 f32::from_bits(self.video_shift_bits)
             );
         }
+        if let Some(bits) = self.strength_override_bits {
+            let strength = f32::from_bits(bits);
+            if !strength.is_finite() || strength <= 0.0 || strength > 1.0 {
+                bail!(
+                    "MiniMax H3 Turbo adapter strength must be finite, positive and at most 1.0, got {strength}"
+                );
+            }
+        }
         if !self.sampler_kind.runtime_kind().uses_comfy_simple_grid() {
             bail!(
                 "MiniMax H3 Turbo distillations require a Comfy sigma grid, got {}",
@@ -1198,6 +1249,7 @@ impl H3FactoryTurboAdapterAuthority {
             resident_device_bytes,
             device_staging_peak_bytes,
             host_staging_peak_bytes,
+            strength_override_bits,
         } = self;
         hash.update(b"turbo-adapter\0");
         for field in [
@@ -1214,6 +1266,12 @@ impl H3FactoryTurboAdapterAuthority {
         hash.update(resident_device_bytes.to_le_bytes());
         hash.update(device_staging_peak_bytes.to_le_bytes());
         hash.update(host_staging_peak_bytes.to_le_bytes());
+        // Appended only for an override, so every identity minted without one
+        // stays byte-identical.
+        if let Some(bits) = strength_override_bits {
+            hash.update(b"strength-override\0");
+            hash.update(bits.to_le_bytes());
+        }
     }
 }
 
@@ -7063,6 +7121,65 @@ mod tests {
             TURBO_HOST_STAGING_BYTES,
         )
         .unwrap()
+    }
+
+    fn turbo_identity_digest(authority: &H3FactoryTurboAdapterAuthority) -> String {
+        let mut hash = Sha256::new();
+        authority.update_identity(&mut hash);
+        format!("{:x}", hash.finalize())
+    }
+
+    #[test]
+    fn a_request_strength_equal_to_the_tier_default_freezes_the_same_identity() {
+        let plain = turbo_authority_for(TURBO_8STEP_768P_TIER);
+        let named_default = plain.clone().with_strength_override(1.0).unwrap();
+        assert_eq!(plain, named_default);
+        assert_eq!(named_default.adapter_strength_override(), None);
+        assert_eq!(named_default.effective_adapter_strength(), 1.0);
+        assert_eq!(
+            turbo_identity_digest(&plain),
+            turbo_identity_digest(&named_default)
+        );
+    }
+
+    #[test]
+    fn a_request_strength_changes_the_frozen_identity_and_the_applied_strength() {
+        let plain = turbo_authority_for(TURBO_8STEP_768P_TIER);
+        let half = plain.clone().with_strength_override(0.5).unwrap();
+        let three_quarters = plain.clone().with_strength_override(0.75).unwrap();
+        assert_ne!(plain, half);
+        assert_eq!(half.effective_adapter_strength(), 0.5);
+        assert_eq!(half.adapter_strength_override(), Some(0.5));
+        let digests = [
+            turbo_identity_digest(&plain),
+            turbo_identity_digest(&half),
+            turbo_identity_digest(&three_quarters),
+        ];
+        assert_ne!(digests[0], digests[1]);
+        assert_ne!(digests[1], digests[2]);
+        assert_ne!(digests[0], digests[2]);
+    }
+
+    #[test]
+    fn a_request_strength_replaces_a_strength_variants_own_and_canonicalizes_back() {
+        let draft = turbo_authority_for(TURBO_REF2V_4STEP_S050_TIER);
+        assert_eq!(draft.effective_adapter_strength(), 0.5);
+        // Naming the variant's own 0.5 is no override; naming 1.0 is one.
+        assert_eq!(draft.clone().with_strength_override(0.5).unwrap(), draft);
+        let full = draft.clone().with_strength_override(1.0).unwrap();
+        assert_eq!(full.adapter_strength_override(), Some(1.0));
+        assert_eq!(full.effective_adapter_strength(), 1.0);
+    }
+
+    #[test]
+    fn an_unusable_request_strength_is_refused_by_the_authority() {
+        let plain = turbo_authority_for(TURBO_8STEP_768P_TIER);
+        for bad in [0.0, -0.5, 1.0001, f32::NAN, f32::INFINITY, 1e-50f64 as f32] {
+            assert!(
+                plain.clone().with_strength_override(bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
     }
 
     /// Widen a baseline budget by exactly one adapter's declared cost.

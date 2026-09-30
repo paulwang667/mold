@@ -726,6 +726,7 @@ fn extract_request_fields(
         sample_shift,
         distill_strength_high,
         distill_strength_low,
+        turbo_lora_strength,
         placement,
         save_to_gallery,
     } = request;
@@ -919,6 +920,7 @@ fn extract_request_fields(
         sample_shift,
         distill_strength_high,
         distill_strength_low,
+        turbo_lora_strength,
         placement,
         save_to_gallery,
     };

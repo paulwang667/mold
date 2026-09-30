@@ -1742,6 +1742,7 @@ mod tests {
             sample_shift: None,
             distill_strength_high: None,
             distill_strength_low: None,
+            turbo_lora_strength: None,
             placement: None,
             id_image: None,
             id_image_name: None,

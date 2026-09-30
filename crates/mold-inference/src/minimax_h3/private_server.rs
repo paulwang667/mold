@@ -2169,8 +2169,11 @@ fn prepare_reviewed_h3_private_fl2va_admission(
     // reviewed Turbo manifest tag); the env pair survives only as the
     // capture-scope UAT override inside `resolve_turbo_selection`.
     timeline.enter(admission_phase::ADAPTER);
-    let turbo_adapter =
-        super::turbo::resolve_turbo_authority_for_request(admitted_model, paths.models_root)?;
+    let turbo_adapter = super::turbo::resolve_turbo_authority_for_request(
+        admitted_model,
+        paths.models_root,
+        request.turbo_lora_strength.map(|value| value as f32),
+    )?;
     timeline.enter(admission_phase::QUALIFICATION);
     #[cfg(not(feature = "h3"))]
     let private_compute_capability = compute_capability

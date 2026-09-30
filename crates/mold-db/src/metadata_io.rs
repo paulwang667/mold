@@ -154,6 +154,7 @@ pub fn synthesize_from_filename(filename: &str, timestamp_secs: u64) -> OutputMe
         sample_shift: None,
         distill_strength_high: None,
         distill_strength_low: None,
+        turbo_lora_strength: None,
         job_id: None,
         prompt: String::new(),
         negative_prompt: None,
