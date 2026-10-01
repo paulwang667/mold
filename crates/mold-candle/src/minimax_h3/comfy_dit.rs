@@ -1632,22 +1632,6 @@ impl H3ComfyInt8BlockLoader {
         )
     }
 
-    /// Serve every LATER main-block load with the Turbo adapter at another
-    /// strength (research prototype: `MOLD_H3_REFINE_PROTO` `lora2`). The
-    /// rescaled runtime shares the adapter's device tensors, so this adds no
-    /// resident bytes; blocks already live keep the strength they were loaded
-    /// with. A loader opened without an adapter refuses.
-    pub fn rescale_turbo_adapter(&mut self, strength: f32) -> candle::Result<()> {
-        let turbo = self.turbo.as_ref().ok_or_else(|| {
-            candle::Error::Msg("MiniMax H3 block loader has no Turbo adapter to rescale".into())
-        })?;
-        let rescaled = turbo
-            .rescaled(strength)
-            .map_err(|error| candle::Error::Msg(error.to_string()))?;
-        self.turbo = Some(Arc::new(rescaled));
-        Ok(())
-    }
-
     /// Load exactly one indexed main block. A second live block is rejected so
     /// neither compressed host weights nor protected device tensors can grow
     /// with the fifty-block stack.

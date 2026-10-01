@@ -295,12 +295,6 @@ impl H3BlockLoader for H3PrivateComfyBlockLoader {
         self.cancellation
             .run_candle_operation(|| self.inner.load_block(index))
     }
-
-    fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
-        self.inner
-            .rescale_turbo_adapter(strength)
-            .map_err(Into::into)
-    }
 }
 
 /// Per-step executor over the resident projections, refiners, MM-RoPE, and
@@ -387,15 +381,6 @@ impl H3StreamedTransformerExecutor<H3LoadedTransformerBlock> for H3PrivateComfyT
 
     fn abort_step(&mut self) {
         self.step = None;
-    }
-
-    fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
-        if self.step.is_some() {
-            bail!("private H3 streamed transformer cannot change strength inside a denoise step");
-        }
-        self.transformer
-            .rescale_turbo_token_refiners(strength)
-            .map_err(Into::into)
     }
 }
 

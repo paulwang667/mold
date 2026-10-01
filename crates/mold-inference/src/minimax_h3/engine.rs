@@ -868,12 +868,6 @@ pub(crate) trait H3StreamedTransformerExecutor<Block>: Send + Sync {
     ) -> Result<H3TransformerOutput>;
 
     fn abort_step(&mut self);
-
-    /// Re-apply the resident (non-streamed) Turbo deltas at another strength.
-    /// Research-prototype hook; see [`H3StreamedDenoiser::rescale_turbo_adapter`].
-    fn rescale_turbo_adapter(&mut self, _strength: f32) -> Result<()> {
-        bail!("this MiniMax H3 streamed executor cannot rescale a Turbo adapter")
-    }
 }
 
 pub(crate) trait H3StreamedDenoiser: Send + Sync {
@@ -884,14 +878,6 @@ pub(crate) trait H3StreamedDenoiser: Send + Sync {
         layout: &H3FrozenPackedLayout,
         checkpoint: &mut dyn H3PipelineCheckpoint,
     ) -> Result<H3TransformerOutput>;
-
-    /// Run every LATER forward with the Turbo adapter at another strength,
-    /// keeping the transformer resident. Research-prototype hook for the
-    /// env-gated second pass (`MOLD_H3_REFINE_PROTO`, `lora2`); a production
-    /// denoise never calls it.
-    fn rescale_turbo_adapter(&mut self, _strength: f32) -> Result<()> {
-        bail!("this MiniMax H3 denoiser cannot rescale a Turbo adapter")
-    }
 }
 
 pub(crate) struct H3BlockStreamedDenoiser<L, A, E>
@@ -976,11 +962,6 @@ where
                 Err(error)
             }
         }
-    }
-
-    fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
-        self.stream.loader_mut().rescale_turbo_adapter(strength)?;
-        self.executor.rescale_turbo_adapter(strength)
     }
 }
 
@@ -2382,7 +2363,6 @@ mod tests {
 
     struct SyntheticBlockLoader {
         loaded: Arc<Mutex<Vec<usize>>>,
-        rescales: Arc<Mutex<Vec<(&'static str, f32)>>>,
     }
 
     impl H3BlockLoader for SyntheticBlockLoader {
@@ -2398,11 +2378,6 @@ mod tests {
             assert_eq!(execution_fingerprint, EXECUTION);
             self.loaded.lock().unwrap().push(index);
             Ok(SyntheticBlock(index))
-        }
-
-        fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
-            self.rescales.lock().unwrap().push(("loader", strength));
-            Ok(())
         }
     }
 
@@ -2430,7 +2405,6 @@ mod tests {
         forwarded: Arc<Mutex<Vec<usize>>>,
         input: Option<(Tensor, Tensor)>,
         aborted: Arc<AtomicUsize>,
-        rescales: Arc<Mutex<Vec<(&'static str, f32)>>>,
     }
 
     impl H3StreamedTransformerExecutor<SyntheticBlock> for SyntheticExecutor {
@@ -2469,11 +2443,6 @@ mod tests {
         fn abort_step(&mut self) {
             self.input = None;
             self.aborted.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
-            self.rescales.lock().unwrap().push(("executor", strength));
-            Ok(())
         }
     }
 
@@ -3310,7 +3279,6 @@ mod tests {
         let loaded = Arc::new(Mutex::new(Vec::new()));
         let forwarded = Arc::new(Mutex::new(Vec::new()));
         let aborted = Arc::new(AtomicUsize::new(0));
-        let rescales = Arc::new(Mutex::new(Vec::new()));
         let identity = H3PipelineBackendIdentity {
             kind: super::super::pipeline::H3PipelineBackendKind::SyntheticCpu,
             device_id: "synthetic-cpu-0".into(),
@@ -3323,28 +3291,16 @@ mod tests {
             SyntheticLease,
             SyntheticBlockLoader {
                 loaded: Arc::clone(&loaded),
-                rescales: Arc::clone(&rescales),
             },
             SyntheticExecutor {
                 forwarded: Arc::clone(&forwarded),
                 input: None,
                 aborted: Arc::clone(&aborted),
-                rescales: Arc::clone(&rescales),
             },
         )
         .unwrap();
         let layout = frozen_layout();
         let mut checkpoint = RecordingCheckpoint::default();
-
-        // The env-gated refine prototype retunes the Turbo strength between
-        // its two passes: both the block loader and the resident executor
-        // must hear about it, and nothing else may.
-        assert!(rescales.lock().unwrap().is_empty());
-        denoiser.rescale_turbo_adapter(0.5).unwrap();
-        assert_eq!(
-            *rescales.lock().unwrap(),
-            [("loader", 0.5), ("executor", 0.5)]
-        );
 
         for _ in 0..2 {
             let (video, audio, text, timesteps) = forward_inputs();

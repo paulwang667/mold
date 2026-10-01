@@ -213,15 +213,6 @@ pub(crate) trait H3Ref2VaBackend {
         latents: &StereoLatents,
         checkpoint: &mut dyn H3PipelineCheckpoint,
     ) -> Result<StereoWaveform>;
-
-    /// Run every later `denoise` forward with the Turbo adapter at another
-    /// strength, keeping the transformer resident. Only the env-gated research
-    /// prototype (`MOLD_H3_REFINE_PROTO`, `lora2`) calls this, between its two
-    /// passes; production never does.
-    fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
-        let _ = strength;
-        bail!("this MiniMax H3 Ref2VA backend cannot rescale its Turbo adapter")
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -957,18 +948,13 @@ impl H3RefineSecondPass<'_> {
         let audio_rows = preserve_prefix(&audio_rows, pass1.condition_audio_rows, &renoised_audio)?;
         validate_packed_tensors(&video_rows, &audio_rows, self.text_states, pass2)?;
         let frozen_layout = pass2.layout.freeze(self.device)?;
-        if let Some(strength) = self.refine.lora2 {
-            ensure_ref_identity(backend, self.identity, self.device)?;
-            backend.rescale_turbo_adapter(strength)?;
-        }
         tracing::info!(
-            "H3 refine-proto upscale: latent {}x{} -> {}x{} (x{}), re-noise at grid index {start} sigma_video={sigma_video:.4} sigma_audio={sigma_audio:.4}, lora2={:?}, elapsed_ms={}",
+            "H3 refine-proto upscale: latent {}x{} -> {}x{} (x{}), re-noise at grid index {start} sigma_video={sigma_video:.4} sigma_audio={sigma_audio:.4}, elapsed_ms={}",
             self.pass1_geometry.latent_width,
             self.pass1_geometry.latent_height,
             self.final_geometry.latent_width,
             self.final_geometry.latent_height,
             self.refine.scale,
-            self.refine.lora2,
             upscale_started.elapsed().as_millis()
         );
         progress.stage_done(STAGE, upscale_started.elapsed());
@@ -2063,7 +2049,6 @@ mod tests {
         frame_size: u32,
         /// Packed video rows and the video row timestep of every forward.
         forward_log: Vec<(Tensor, f32)>,
-        rescales: Vec<f32>,
     }
 
     impl SyntheticBackend {
@@ -2090,7 +2075,6 @@ mod tests {
                 expected_latents: [1, 24, 37, 2, 2],
                 frame_size: 32,
                 forward_log: Vec::new(),
-                rescales: Vec::new(),
             }
         }
 
@@ -2400,11 +2384,6 @@ mod tests {
             )
             .map_err(Into::into)
         }
-
-        fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
-            self.rescales.push(strength);
-            Ok(())
-        }
     }
 
     #[test]
@@ -2649,7 +2628,6 @@ mod tests {
         // request with the gate closed must be denoised at 64x64 end to end.
         let (backend, _, staged, observer) = run_refined(None);
         assert_eq!(backend.forward_log.len(), forwards);
-        assert!(backend.rescales.is_empty());
         let rows = backend.forward_log[0].0.dims3().unwrap().1;
         assert!(backend
             .forward_log
@@ -2678,7 +2656,6 @@ mod tests {
         let refine = refine_proto::H3RefineProto {
             scale: 2,
             start: 4,
-            lora2: Some(0.5),
             uncap: false,
         };
         let (backend, prepared, staged, observer) = run_refined(Some(refine));
@@ -2691,7 +2668,6 @@ mod tests {
         let forwards = schedule.counts().transformer_evaluations;
         let tail = forwards - refine.start;
         assert_eq!(backend.forward_log.len(), forwards + tail);
-        assert_eq!(backend.rescales, [0.5]);
 
         // Pass 1 packs 37 generated rows, pass 2 packs the final canvas' 148;
         // the reference prefix is identical.
@@ -2821,17 +2797,6 @@ mod tests {
     }
 
     #[test]
-    fn a_refine_pass_without_lora2_leaves_the_turbo_strength_alone() {
-        let (backend, ..) = run_refined(Some(refine_proto::H3RefineProto {
-            scale: 2,
-            start: 6,
-            lora2: None,
-            uncap: false,
-        }));
-        assert!(backend.rescales.is_empty());
-    }
-
-    #[test]
     fn the_refine_gate_refuses_an_unsplittable_canvas_before_any_media_is_touched() {
         let mut req = request();
         req.width = 96;
@@ -2847,7 +2812,6 @@ mod tests {
             Some(refine_proto::H3RefineProto {
                 scale: 2,
                 start: 4,
-                lora2: None,
                 uncap: false,
             }),
         )

@@ -2907,20 +2907,6 @@ where
     ) -> Result<StereoWaveform> {
         H3Fl2VaBackend::decode_audio(self, latents, checkpoint)
     }
-
-    /// Research prototype (`MOLD_H3_REFINE_PROTO`, `lora2`): between the two
-    /// passes the resident transformer's Turbo deltas move to another
-    /// strength. The transformer must be loaded and still owned (the ledger
-    /// drops it after the last forward of the LAST pass).
-    fn rescale_turbo_adapter(&mut self, strength: f32) -> Result<()> {
-        self.require_ref2va()?;
-        self.validate_continuing_authority()?;
-        self.denoiser
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("private H3 transformer is not resident"))?
-            .rescale_turbo_adapter(strength)?;
-        self.validate_continuing_authority()
-    }
 }
 
 /// Borrow the normalized frames the visual VAE must encode for one reference.

@@ -19,15 +19,13 @@
 //! and mux see the final canvas only.
 //!
 //! ```text
-//! MOLD_H3_REFINE_PROTO=scale=2,start=4,lora2=0.5
+//! MOLD_H3_REFINE_PROTO=scale=2,start=4
 //! ```
 //!
 //! - `scale`: spatial factor, default `2` (at least `2`).
 //! - `start`: index into the frozen sigma grid where pass 2 begins, default
 //!   `4` (sigma 0.923 on the 8-step shift-12 Turbo grid). Must address an
 //!   existing forward; `0` re-denoises from pure noise.
-//! - `lora2`: Turbo LoRA strength for pass 2 only, in `(0, 1]`; absent means
-//!   the request's strength is kept.
 //! - `uncap`: `1`/`true`/`on` lifts the request-side canvas AREA ceilings (the
 //!   compact rule, the family `MAX_PIXELS`, the profile's `max_pixels`) to
 //!   `mold_core::minimax_h3::UNCAP_MAX_PIXELS` (4 Mi) and waives the memory
@@ -35,7 +33,7 @@
 //!   FINAL canvas such as 1920x832, 2560x1088 or 2688x1536 can be asked for.
 //!   `mold-core` cannot see this module, so it re-reads the same variable for
 //!   this one key only (`refine_proto_uncap_from_spec`); this parser stays the
-//!   single owner of `scale`, `start` and `lora2`. Alignment, minimum axis and
+//!   single owner of `scale` and `start`. Alignment, minimum axis and
 //!   aspect rules are unchanged, and pass 1 gets no new restriction.
 //!
 //! A bare `1`/`on`/`true` selects the defaults; empty, `0`, `off` and `false`
@@ -61,7 +59,6 @@ const CANVAS_UNIT: usize = 32;
 pub(crate) struct H3RefineProto {
     pub scale: usize,
     pub start: usize,
-    pub lora2: Option<f32>,
     /// Lift the request-side canvas area ceilings (see the module docs). The
     /// admission code reads it through `mold-core`; it rides here so `parse`
     /// accepts the key and the two readers can be checked against each other.
@@ -114,16 +111,6 @@ impl H3RefineProto {
                         .parse()
                         .with_context(|| format!("{REFINE_PROTO_VARIABLE}: start {value:?}"))?;
                 }
-                "lora2" => {
-                    let strength: f32 = value
-                        .parse()
-                        .with_context(|| format!("{REFINE_PROTO_VARIABLE}: lora2 {value:?}"))?;
-                    ensure!(
-                        strength.is_finite() && strength > 0.0 && strength <= 1.0,
-                        "{REFINE_PROTO_VARIABLE}: lora2 must be in (0, 1]"
-                    );
-                    parsed.lora2 = Some(strength);
-                }
                 "uncap" => {
                     parsed.uncap = match value.to_ascii_lowercase().as_str() {
                         "1" | "true" | "on" => true,
@@ -141,7 +128,6 @@ impl H3RefineProto {
         Self {
             scale: Self::DEFAULT_SCALE,
             start: Self::DEFAULT_START,
-            lora2: None,
             uncap: false,
         }
     }
@@ -327,7 +313,6 @@ mod tests {
                 Some(H3RefineProto {
                     scale: 2,
                     start: 4,
-                    lora2: None,
                     uncap: false,
                 })
             );
@@ -337,11 +322,10 @@ mod tests {
     #[test]
     fn a_key_list_overrides_defaults_and_rejects_anything_unclear() {
         assert_eq!(
-            refine("scale=3, start=2 ,lora2=0.5"),
+            refine("scale=3, start=2"),
             Some(H3RefineProto {
                 scale: 3,
                 start: 2,
-                lora2: Some(0.5),
                 uncap: false,
             })
         );
@@ -350,7 +334,6 @@ mod tests {
             Some(H3RefineProto {
                 scale: 2,
                 start: 6,
-                lora2: None,
                 uncap: false,
             })
         );
@@ -358,9 +341,6 @@ mod tests {
             "scale=1",
             "scale=two",
             "start=-1",
-            "lora2=0",
-            "lora2=1.5",
-            "lora2=nan",
             "scale=2,scale=3",
             "shift=2",
             "scale",
@@ -380,7 +360,7 @@ mod tests {
         for spec in [
             "uncap=1",
             "scale=2,start=4,uncap=1",
-            "uncap=true,lora2=0.5",
+            "uncap=true,start=2",
             "uncap=on",
         ] {
             assert!(refine(spec).unwrap().uncap, "{spec:?}");
