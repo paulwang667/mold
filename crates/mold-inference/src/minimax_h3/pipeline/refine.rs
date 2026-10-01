@@ -204,6 +204,63 @@ mod tests {
         assert!((audio - 0.75).abs() < 1e-6, "{audio}");
     }
 
+    // ----- EXPERIMENT (throwaway): the Ref2VA Turbo 4-step tier. -----
+    // See docs/plans/h3-refine-4step-experiment.md.
+
+    fn plan_4step() -> contract::RefinePlan {
+        contract::RefinePlan::for_model_scale(contract::REF2VA_COMFY_TURBO_4STEP, 2).unwrap()
+    }
+
+    fn euler_schedule_4step() -> H3DualSchedule {
+        H3DualSchedule::new_for_sampler_with_video_shift(
+            5,
+            H3SamplerKind::ComfyEuler,
+            crate::minimax_h3::sampler::H3_VIDEO_SHIFT,
+        )
+        .unwrap()
+    }
+
+    /// Index 2 of the REAL 4-step grid is the same sigma as the 8-step tier's
+    /// index 4: video 0.9231, audio 0.75; the grid is [1, .9730, .9231, .8, 0].
+    #[test]
+    fn the_four_step_plan_start_index_is_the_same_sigma_as_the_eight_step_one() {
+        let schedule = euler_schedule_4step();
+        let plan = plan_4step();
+        assert_eq!(schedule.counts().transformer_evaluations, 4);
+        assert_eq!(plan.start_index, 2);
+        let video = schedule.video_sigmas();
+        for (got, want) in video.iter().zip([1.0, 0.9730, 0.9231, 0.8, 0.0]) {
+            assert!((got - want).abs() < 5e-5, "{video:?}");
+        }
+        assert!((video[plan.start_index] - 0.9231).abs() < 5e-5);
+        assert!((schedule.audio_sigmas()[plan.start_index] - 0.75).abs() < 1e-6);
+        let eight = euler_schedule();
+        assert!(
+            (video[plan.start_index] - eight.video_sigmas()[PLAN.start_index]).abs() < 1e-6,
+            "both tiers re-enter at the same video sigma"
+        );
+    }
+
+    #[test]
+    fn the_four_step_second_pass_is_the_last_two_forwards_and_euler_only() {
+        let euler = euler_schedule_4step();
+        let plan = plan_4step();
+        assert_eq!(
+            pass2_forwards(&plan, &euler, H3SamplerKind::ComfyEuler).unwrap(),
+            2
+        );
+        assert_eq!(plan.pass1_forwards(4), 4);
+        assert_eq!(plan.total_forwards(4), Some(6));
+        assert!(
+            pass2_forwards(&plan, &euler, H3SamplerKind::ComfyResMultistep)
+                .unwrap_err()
+                .to_string()
+                .contains("Euler")
+        );
+        // The 8-step plan does not fit the 4-forward grid (index 4 addresses no forward).
+        assert!(pass2_forwards(&PLAN, &euler, H3SamplerKind::ComfyEuler).is_err());
+    }
+
     #[test]
     fn pass1_geometry_is_the_plans_canvas_with_the_final_clip() {
         let final_geometry = H3Fl2VaGeometry::from_canvas(

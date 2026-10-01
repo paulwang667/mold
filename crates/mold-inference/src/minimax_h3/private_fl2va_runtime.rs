@@ -3702,6 +3702,32 @@ mod tests {
         );
     }
 
+    /// EXPERIMENT (throwaway; docs/plans/h3-refine-4step-experiment.md): the
+    /// 4-step tier's ledger expects `4 + (4 - 2) = 6` forwards.
+    #[test]
+    fn four_step_refine_ledger_expects_six_forwards() {
+        let plan = mold_core::minimax_h3::RefinePlan::for_model_scale(
+            mold_core::minimax_h3::REF2VA_COMFY_TURBO_4STEP,
+            2,
+        )
+        .unwrap();
+        let total = plan.total_forwards(4).unwrap();
+        assert_eq!(total, 6);
+        let mut ledger = H3PrivatePhaseLedger::new(total).unwrap();
+        ledger.qwen_loaded().unwrap();
+        ledger.qwen_dropped().unwrap();
+        ledger.vaes_loaded().unwrap();
+        ledger.conditions_encoded().unwrap();
+        ledger.vaes_parked().unwrap();
+        ledger.transformer_loaded().unwrap();
+        for forward in 1..total {
+            assert!(!ledger.denoise_completed().unwrap(), "forward {forward}");
+        }
+        assert!(ledger.denoise_completed().unwrap());
+        assert_eq!(ledger.state, H3PrivatePhaseState::TransformerDropped);
+        assert!(ledger.denoise_completed().is_err(), "a seventh forward");
+    }
+
     #[test]
     fn every_execution_route_axis_fails_closed_at_binding_and_continuing_validation() {
         let admitted = authority()
