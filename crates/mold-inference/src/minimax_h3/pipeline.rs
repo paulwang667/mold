@@ -1089,6 +1089,7 @@ impl H3VideoEncodeSink {
             .first_frame
             .take()
             .ok_or_else(|| anyhow!("MiniMax H3 visual decoder emitted no frames"))?;
+        let first = thumbnail_source(first);
         let thumbnail_png = video_enc::first_frame_png_bounded(
             std::slice::from_ref(&first),
             SMALL_THUMBNAIL_PNG_MAX_BYTES,
@@ -1107,6 +1108,25 @@ impl H3VideoEncodeSink {
 struct EncodedVideo {
     mp4: Vec<u8>,
     thumbnail_png: Vec<u8>,
+}
+
+/// Largest first-frame area kept at full size for the preview thumbnail: the
+/// admitted compact canvas (1344x768). A larger frame (the refine prototype's
+/// uncapped canvases) is shrunk, aspect preserved, before PNG encoding,
+/// because a full-size PNG of a 3.6 MP frame exceeds
+/// [`SMALL_THUMBNAIL_PNG_MAX_BYTES`] and failed the whole job after the
+/// denoise had been paid for. Frames inside the admitted area are untouched.
+const THUMBNAIL_FULL_SIZE_MAX_PIXELS: u64 = 1344 * 768;
+
+fn thumbnail_source(frame: RgbImage) -> RgbImage {
+    let pixels = u64::from(frame.width()) * u64::from(frame.height());
+    if pixels <= THUMBNAIL_FULL_SIZE_MAX_PIXELS {
+        return frame;
+    }
+    let scale = (THUMBNAIL_FULL_SIZE_MAX_PIXELS as f64 / pixels as f64).sqrt();
+    let width = ((f64::from(frame.width()) * scale).floor() as u32).max(1);
+    let height = ((f64::from(frame.height()) * scale).floor() as u32).max(1);
+    imageops::resize(&frame, width, height, imageops::FilterType::Lanczos3)
 }
 
 /// Solid endpoint placeholder for redacted placement probes.
@@ -1674,6 +1694,24 @@ mod tests {
     use mold_core::{KeyframeCondition, OutputFormat};
 
     use super::*;
+
+    #[test]
+    fn a_frame_beyond_the_admitted_area_is_shrunk_for_the_thumbnail_only() {
+        let admitted = RgbImage::new(1344, 768);
+        assert_eq!(thumbnail_source(admitted.clone()).dimensions(), (1344, 768));
+        let small = RgbImage::new(960, 544);
+        assert_eq!(thumbnail_source(small).dimensions(), (960, 544));
+        for (width, height) in [(1920, 1088), (2560, 1408), (2688, 1536)] {
+            let shrunk = thumbnail_source(RgbImage::new(width, height));
+            let (w, h) = shrunk.dimensions();
+            assert!(u64::from(w) * u64::from(h) <= THUMBNAIL_FULL_SIZE_MAX_PIXELS);
+            let aspect = f64::from(width) / f64::from(height);
+            assert!(
+                (f64::from(w) / f64::from(h) - aspect).abs() < 0.01,
+                "{w}x{h}"
+            );
+        }
+    }
     use crate::progress::{
         is_inference_cancelled, InferenceCancellationToken, InferenceCancelled, ProgressReporter,
     };
