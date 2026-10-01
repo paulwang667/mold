@@ -292,8 +292,12 @@ impl H3BlockLoader for H3PrivateComfyBlockLoader {
         if device_id != self.device_id || execution_fingerprint != self.execution_fingerprint {
             bail!("private H3 Comfy block load differs from the frozen execution route");
         }
-        self.cancellation
-            .run_candle_operation(|| self.inner.load_block(index))
+        let diag_stage = super::diag_timing::host_stage_begin(self.inner.bytes_read());
+        let block = self
+            .cancellation
+            .run_candle_operation(|| self.inner.load_block(index));
+        super::diag_timing::host_stage_end(diag_stage, self.inner.bytes_read());
+        block
     }
 }
 
@@ -351,6 +355,7 @@ impl H3StreamedTransformerExecutor<H3LoadedTransformerBlock> for H3PrivateComfyT
             .step
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("private H3 streamed step was not started"))?;
+        let diag_block = super::diag_timing::block_begin(&self.device);
         step.forward_block(index, block)?;
         // The streamed INT8 block reconstructs bounded device weight chunks.
         // Metal command buffers otherwise retain every completed block's
@@ -360,6 +365,7 @@ impl H3StreamedTransformerExecutor<H3LoadedTransformerBlock> for H3PrivateComfyT
         if streamed_block_requires_synchronization(self.device.location()) {
             self.device.synchronize()?;
         }
+        super::diag_timing::block_end(&self.device, diag_block);
         Ok(())
     }
 

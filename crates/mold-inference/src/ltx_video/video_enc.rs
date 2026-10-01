@@ -616,11 +616,16 @@ impl Mp4StreamEncoder {
         );
 
         let rgb = RgbSliceU8::new(frame.as_raw(), (self.width as usize, self.height as usize));
+        let diag_started = crate::minimax_h3::diag_timing::tick();
         let yuv = YUVBuffer::from_rgb_source(rgb);
+        crate::minimax_h3::diag_timing::sink_yuv(diag_started);
+        let diag_started = crate::minimax_h3::diag_timing::tick();
         let bitstream = self
             .encoder
             .encode(&yuv)
             .context("failed to encode H.264 frame")?;
+        crate::minimax_h3::diag_timing::sink_encode(diag_started);
+        let diag_pack = crate::minimax_h3::diag_timing::tick();
         let is_key = matches!(bitstream.frame_type(), openh264::encoder::FrameType::IDR);
 
         let annex_b = bitstream.to_vec();
@@ -672,6 +677,7 @@ impl Mp4StreamEncoder {
         }
         self.sample_payload_bytes = payload_bytes;
         self.samples.push((frame_nals.into_boxed_slice(), is_key));
+        crate::minimax_h3::diag_timing::sink_pack(diag_pack);
         Ok(())
     }
 

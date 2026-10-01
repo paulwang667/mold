@@ -781,8 +781,7 @@ impl ComfyInt8ConvRotLinear {
         debug_assert_eq!(kind, Int8LinearKind::PortableQuantizeDequantize);
         #[cfg(feature = "cuda")]
         if kind == Int8LinearKind::NativeCudaInt8 {
-            let weight = self.weight.to_device(device)?;
-            let weight_scale = self.weight_scale.to_device(device)?;
+            let (weight, weight_scale) = self.stage_for_native(device)?;
             let mut output_shape = output_shape;
             *output_shape
                 .last_mut()
@@ -855,6 +854,22 @@ impl ComfyInt8ConvRotLinear {
         )
     }
 
+    /// Stage the packed weight and its scales onto the execution device (the
+    /// per-forward host-to-device upload). Diagnostic timing wraps exactly
+    /// this copy; see [`crate::h3_diag`].
+    #[cfg(feature = "cuda")]
+    fn stage_for_native(&self, device: &Device) -> Result<(Tensor, Tensor)> {
+        let started = crate::h3_diag::h2d_begin(device)?;
+        let weight = self.weight.to_device(device)?;
+        let weight_scale = self.weight_scale.to_device(device)?;
+        if started.is_some() {
+            let bytes = weight.elem_count() * weight.dtype().size_in_bytes()
+                + weight_scale.elem_count() * weight_scale.dtype().size_in_bytes();
+            crate::h3_diag::h2d_end(device, started, bytes as u64)?;
+        }
+        Ok((weight, weight_scale))
+    }
+
     /// Rotate one flattened `[rows, in_features]` activation by the regular
     /// 256-wide Hadamard in the activation's own dtype — comfy-kitchen's
     /// `convrot` step, which runs before the dynamic INT8 quantizer.
@@ -924,8 +939,7 @@ impl ComfyInt8ConvRotLinear {
                 {
                     let (flat, mut output_shape) = flattened_input(input, self.in_features)?;
                     let rotated = self.rotated_activation(&flat)?;
-                    let weight = self.weight.to_device(device)?;
-                    let weight_scale = self.weight_scale.to_device(device)?;
+                    let (weight, weight_scale) = self.stage_for_native(device)?;
                     // Narrow inside the kernel when nothing follows the GEMM;
                     // keep F32 when a bias does, so the add happens before
                     // the one narrowing.

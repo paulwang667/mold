@@ -11,6 +11,7 @@ pub(crate) mod campaign_capture;
 pub mod campaign_watch;
 #[cfg(any(feature = "h3", feature = "h3-private-uat"))]
 pub(crate) mod conditioner_cache;
+pub(crate) mod diag_timing;
 pub(crate) mod dtype;
 pub(crate) mod engine;
 #[cfg(any(feature = "h3", feature = "h3-private-uat"))]

@@ -796,6 +796,7 @@ where
         checkpoint: &mut dyn H3PipelineCheckpoint,
     ) -> Result<()> {
         self.validate_runtime_authorities()?;
+        super::diag_timing::sink_begin();
         let checkpoint = Rc::new(RefCell::new(checkpoint));
         let mut decode_sink = H3PipelineDecodeSink {
             sink,
@@ -1045,11 +1046,15 @@ impl DecodeSink for H3PipelineDecodeSink<'_, '_> {
         if batch != 1 || channels != 3 || frames.dtype() != DType::F32 {
             candle_core::bail!("MiniMax H3 decoded frames must be FP32 [1,3,T,H,W]");
         }
+        let diag_chunk = super::diag_timing::sink_chunk_begin(frames);
+        let diag_started = super::diag_timing::tick();
         let values = frames
             .to_device(&Device::Cpu)?
             .flatten_all()?
             .to_vec1::<f32>()?;
+        super::diag_timing::sink_d2h(diag_started);
         for frame_index in 0..count {
+            let diag_started = super::diag_timing::tick();
             let rgb_bytes = height
                 .checked_mul(width)
                 .and_then(|pixels| pixels.checked_mul(3))
@@ -1070,12 +1075,14 @@ impl DecodeSink for H3PipelineDecodeSink<'_, '_> {
                 .map_err(|_| candle_core::Error::Msg("H3 RGB frame height exceeds U32".into()))?;
             let image = RgbImage::from_raw(width, height, rgb)
                 .ok_or_else(|| candle_core::Error::Msg("H3 RGB frame shape overflow".into()))?;
+            super::diag_timing::sink_interleave(diag_started);
             let mut checkpoint = self.checkpoint.borrow_mut();
             self.sink
                 .push(&image, &mut **checkpoint)
                 .map_err(candle_error)?;
             self.next_frame += 1;
         }
+        super::diag_timing::sink_chunk_end(diag_chunk, count);
         Ok(())
     }
 }
