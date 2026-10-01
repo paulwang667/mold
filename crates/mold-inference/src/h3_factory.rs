@@ -5524,6 +5524,54 @@ mod tests {
         );
     }
 
+    /// A refine plan joins the prepared-request identity, and only then: the
+    /// request without one hashes through the unchanged byte stream (the
+    /// FL2VA frozen-plan pin above covers the literal), the plan changes the
+    /// identity, and the prepared validator holds the FINAL canvas to the
+    /// refine rule rather than the compact ceiling.
+    #[test]
+    fn a_refine_plan_joins_the_prepared_request_identity_and_is_validated_against_the_refine_rule()
+    {
+        let reseal = |mut request: H3FactoryPreparedRequestInput| {
+            request.identity_sha256 = expected_prepared_request_identity(&request);
+            request
+        };
+        let plain = ref2va_prepared_request();
+        assert_eq!(plain.refine, None);
+        assert_eq!(
+            plain.identity_sha256,
+            expected_h3_factory_prepared_request_identity(&plain)
+        );
+        validate_prepared_request(&plain).unwrap();
+
+        let planned = reseal(H3FactoryPreparedRequestInput {
+            refine: Some(contract::RefinePlan::PUBLISHED),
+            ..plain.clone()
+        });
+        assert_ne!(planned.identity_sha256, plain.identity_sha256);
+        validate_prepared_request(&planned).expect("1344x768 splits into 672x384");
+        let later = reseal(H3FactoryPreparedRequestInput {
+            refine: Some(contract::RefinePlan {
+                start_index: 5,
+                ..contract::RefinePlan::PUBLISHED
+            }),
+            ..plain.clone()
+        });
+        assert_ne!(later.identity_sha256, planned.identity_sha256);
+        assert!(
+            validate_prepared_request(&later).is_err(),
+            "not the published plan"
+        );
+
+        // A plan on an FL2VA request is refused even when the identity is
+        // honestly resealed.
+        let fl2va = reseal(H3FactoryPreparedRequestInput {
+            refine: Some(contract::RefinePlan::PUBLISHED),
+            ..prepared_request()
+        });
+        assert!(validate_prepared_request(&fl2va).is_err());
+    }
+
     #[test]
     fn ref2va_prepared_request_rejects_every_reference_authority_mutation() {
         let base = ref2va_prepared_request();

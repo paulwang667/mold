@@ -11617,6 +11617,49 @@ mod tests {
         .is_err());
     }
 
+    /// The minted envelope's canvas rule follows the request's refine plan: a
+    /// FINAL canvas above the compact ceiling mints only WITH a plan (and only
+    /// inside the refine rule), the authority remembers the rule it was minted
+    /// under, and the default canvas mints either way.
+    #[cfg(feature = "h3")]
+    #[test]
+    fn public_runtime_authority_holds_a_refine_final_canvas_to_the_refine_rule() {
+        let artifact = artifact_report();
+        let mint = |canvas: (u32, u32), refine: Option<contract::RefinePlan>| {
+            public_runtime_qualification(
+                &artifact,
+                canvas,
+                contract::DEFAULT_COMPACT_FRAMES,
+                contract::COMFY_DEFAULT_STEPS,
+                DEVICE_0,
+                0,
+                Some((8, 9)),
+                &sha('d'),
+                "flash-attention-v2-sm89",
+                &sha('e'),
+                None,
+                Task::Fl2va,
+                &[],
+                refine,
+            )
+        };
+        let plan = Some(contract::RefinePlan::PUBLISHED);
+        assert!(mint((1920, 1088), None).is_err());
+        let authority = mint((1920, 1088), plan).expect("the refine rule admits 1920x1088");
+        authority.revalidate().unwrap();
+        assert_eq!(
+            (
+                authority.record.envelope.width,
+                authority.record.envelope.height
+            ),
+            (1920, 1088)
+        );
+        assert!(mint((2560, 1408), plan).is_err());
+        assert!(mint((1376, 576), plan).is_err());
+        mint((contract::DEFAULT_WIDTH, contract::DEFAULT_HEIGHT), None).unwrap();
+        mint((contract::DEFAULT_WIDTH, contract::DEFAULT_HEIGHT), plan).unwrap();
+    }
+
     #[cfg(feature = "h3")]
     #[test]
     fn public_progress_labels_describe_artifact_verification_without_private_claims() {

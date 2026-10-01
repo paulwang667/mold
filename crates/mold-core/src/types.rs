@@ -3697,7 +3697,7 @@ impl OutputMetadata {
             distill_strength_high: req.distill_strength_high,
             distill_strength_low: req.distill_strength_low,
             turbo_lora_strength: req.turbo_lora_strength,
-            refine: req.refine.clone(),
+            refine: req.refine,
             upscale_model: req.upscale_model.clone(),
             gif_preview: req.gif_preview.then_some(true),
             enable_audio: req.enable_audio,

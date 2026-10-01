@@ -942,6 +942,66 @@ mod tests {
         assert_eq!(keyframe.name.as_deref(), Some("closing.png"));
     }
 
+    #[test]
+    fn refine_widens_the_cli_canvas_ceiling_only_for_a_refine_request() {
+        use minimax_h3::CanvasRule;
+        assert!(validate_dimensions(1920, 1088, CanvasRule::Compact).is_err());
+        validate_dimensions(1920, 1088, CanvasRule::RefineFinal).unwrap();
+        validate_dimensions(1344, 768, CanvasRule::Compact).unwrap();
+        validate_dimensions(1344, 768, CanvasRule::RefineFinal).unwrap();
+        // The refine rule still refuses what it cannot split or hold.
+        assert!(validate_dimensions(1376, 576, CanvasRule::RefineFinal).is_err());
+        assert!(validate_dimensions(2560, 1408, CanvasRule::RefineFinal).is_err());
+    }
+
+    #[test]
+    fn refine_authoring_checks_family_tier_and_canvas_before_any_media() {
+        let author = |model: &str, family: &str, width, height, refine| {
+            prepare_authoring(
+                model,
+                family,
+                None,
+                None,
+                None,
+                width,
+                height,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                refine,
+            )
+            .map(|_| ())
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(author("flux-dev:q8", "flux", None, None, true).contains("--refine"));
+        assert!(author(
+            minimax_h3::REF2VA_COMFY,
+            minimax_h3::FAMILY,
+            Some(1920),
+            Some(1088),
+            true
+        )
+        .contains("--refine runs on"));
+        // Without --refine the same canvas is a dimensions error; with it the
+        // canvas passes and authoring moves on to the (missing) references.
+        let tier = minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P;
+        assert!(
+            author(tier, minimax_h3::FAMILY, Some(1920), Some(1088), false)
+                .contains("dimensions must be")
+        );
+        assert!(
+            author(tier, minimax_h3::FAMILY, Some(1920), Some(1088), true)
+                .contains("at least one ordered --reference")
+        );
+        assert!(
+            author(tier, minimax_h3::FAMILY, Some(1376), Some(576), true)
+                .contains("--refine renders pass 1")
+        );
+    }
+
     /// The authoring path promotes inferred dimensions to explicit values
     /// before `effective_dimensions` runs, so it must apply the same layout
     /// policy: a compact tag renders the source's own aspect at the largest

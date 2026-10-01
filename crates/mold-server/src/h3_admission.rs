@@ -2354,6 +2354,42 @@ mod tests {
         H3PreparedRequestShape::from_prepared_request(&request, 128, 512).unwrap()
     }
 
+    /// The shape's canvas check follows the request's plan: a plain shape is
+    /// held to the family ceiling exactly as before, a refine shape to the
+    /// refine rule, and the plan stays off the wire when absent.
+    #[test]
+    fn a_prepared_shape_is_held_to_the_canvas_rule_of_its_refine_plan() {
+        const GRID: &str = "outside the fixed request grid";
+        let (task, mut shape) = prepared_ref2va_with_visual_and_audio_rows();
+        assert_eq!(shape.refine, None);
+        assert!(!serde_json::to_string(&shape).unwrap().contains("refine"));
+        shape
+            .validate_for(task)
+            .expect("the 1344x768 shape is valid");
+
+        // 1920x1088 exceeds the family ceiling for a plain request ...
+        shape.width = 1920;
+        shape.height = 1088;
+        let plain = shape.validate_for(task).unwrap_err().to_string();
+        assert!(plain.contains(GRID), "{plain}");
+        // ... and passes the canvas clause with a plan (the row clauses that
+        // follow are priced for 1344x768 and refuse for their own reason).
+        shape.refine = Some(minimax_h3::RefinePlan::PUBLISHED);
+        let planned = shape.validate_for(task).unwrap_err().to_string();
+        assert!(!planned.contains(GRID), "{planned}");
+        assert!(serde_json::to_string(&shape)
+            .unwrap()
+            .contains("\"refine\":{\"scale\":2,\"start_index\":4}"));
+        // The refine rule still holds the canvas: over its own ceiling or off
+        // its 64-pixel grid is the same grid refusal.
+        for (width, height) in [(2560, 1408), (1376, 576)] {
+            shape.width = width;
+            shape.height = height;
+            let refused = shape.validate_for(task).unwrap_err().to_string();
+            assert!(refused.contains(GRID), "{width}x{height}: {refused}");
+        }
+    }
+
     fn private_engine_config() -> mold_inference::FrozenEngineConfig {
         let mut config = mold_inference::FrozenEngineConfig::resolve(
             minimax_h3::FL2VA_COMFY,
