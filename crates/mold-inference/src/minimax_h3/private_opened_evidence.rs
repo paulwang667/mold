@@ -2460,6 +2460,7 @@ fn build_canonical_private_fl2va_target_budget(
         waveform_transfer_phase_device_bytes,
         mux_phase_device_bytes: 0,
         predicted_device_peak_bytes,
+        refine: request.refine,
     };
     budget.identity_sha256 = expected_h3_factory_target_budget_identity(&budget);
     Ok(budget)

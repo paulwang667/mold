@@ -502,6 +502,11 @@ pub struct H3FactoryTargetBudgetInput {
     pub waveform_transfer_phase_device_bytes: u64,
     pub mux_phase_device_bytes: u64,
     pub predicted_device_peak_bytes: u64,
+    /// The two-pass refine this budget was derived for, copied from the
+    /// prepared request. It joins the identity ONLY when present, so a budget
+    /// without one hashes byte-identically to before the field existed, and
+    /// validation pins it to the request's own plan.
+    pub refine: Option<contract::RefinePlan>,
 }
 
 /// One authoritative phase budget row from the existing target-budget
@@ -751,6 +756,7 @@ impl H3FactoryTargetBudgetInput {
             waveform_transfer_phase_device_bytes,
             mux_phase_device_bytes,
             predicted_device_peak_bytes,
+            refine,
         } = self;
 
         hash.update(match load_drop_policy {
@@ -894,6 +900,13 @@ impl H3FactoryTargetBudgetInput {
             predicted_device_peak_bytes,
         ] {
             hash.update(value.to_le_bytes());
+        }
+        // Appended ONLY for a refine budget, so every budget without one hashes
+        // byte-identically to before the field existed.
+        if let Some(refine) = refine {
+            hash.update(b"mold.minimax-h3.target-attempt-budget.refine.v1\0");
+            hash.update(refine.scale.to_le_bytes());
+            hash.update((refine.start_index as u64).to_le_bytes());
         }
     }
 }
@@ -3215,6 +3228,9 @@ fn validate_target_budget(
         memory.reference_media_identity_sha256.as_str(),
         expected_reference_media_identity.as_str()
     );
+    // The budget names the plan its request carries, no other: a budget minted
+    // for one render is not a budget for a refine render of the same canvas.
+    expect_eq!("refine", memory.refine, request.refine);
     expect_eq!(
         "reference_normalized_media_host_bytes",
         memory.reference_normalized_media_host_bytes,
@@ -6175,6 +6191,68 @@ mod tests {
         );
     }
 
+    /// The target-budget identity of a request WITHOUT `refine` is a pinned
+    /// literal for both tasks: the hash layout of a budget that carries no
+    /// plan never moves. The literals were computed on the base branch
+    /// `aiva/h3-ref2va-tiers` (commit a5774e5a) by the same fixture, before the
+    /// `refine` field existed.
+    #[test]
+    fn target_budget_identity_without_refine_is_pinned() {
+        let checkpoint = raw_checkpoint();
+        let fl2va = target_budget(&prepared_request(), &checkpoint);
+        let ref2va = target_budget(&ref2va_prepared_request(), &checkpoint);
+        assert_eq!(fl2va.refine, None);
+        assert_eq!(ref2va.refine, None);
+        assert_eq!(
+            expected_h3_factory_target_budget_identity(&fl2va),
+            "3049f15543460e40b49d7ff7324514186aa4b6d733201080166110ca7deaf7f7"
+        );
+        assert_eq!(
+            expected_h3_factory_target_budget_identity(&ref2va),
+            "23e6181e4f67d9309114341c29ded68cca0b966820e0edf98980822251fc1694"
+        );
+    }
+
+    /// A refine plan joins the target-budget identity, and only then: the
+    /// plan changes the identity, two plans differing in start index differ,
+    /// and validation holds the budget's plan to the request's own.
+    #[test]
+    fn a_refine_plan_joins_the_target_budget_identity_and_must_match_the_request() {
+        let checkpoint = raw_checkpoint();
+        let plain_request = ref2va_prepared_request();
+        let plain = target_budget(&plain_request, &checkpoint);
+        let planned_request = |plan: contract::RefinePlan| {
+            let mut request = H3FactoryPreparedRequestInput {
+                refine: Some(plan),
+                ..plain_request.clone()
+            };
+            request.identity_sha256 = expected_prepared_request_identity(&request);
+            request
+        };
+        let published = planned_request(contract::RefinePlan::PUBLISHED);
+        let later = planned_request(contract::RefinePlan {
+            start_index: 5,
+            ..contract::RefinePlan::PUBLISHED
+        });
+        let with_plan = target_budget(&published, &checkpoint);
+        let with_later_plan = target_budget(&later, &checkpoint);
+        assert_eq!(with_plan.refine, Some(contract::RefinePlan::PUBLISHED));
+        assert_ne!(with_plan.identity_sha256, plain.identity_sha256);
+        assert_ne!(with_later_plan.identity_sha256, with_plan.identity_sha256);
+        assert_ne!(with_later_plan.identity_sha256, plain.identity_sha256);
+
+        let validate = |budget: &H3FactoryTargetBudgetInput,
+                        request: &H3FactoryPreparedRequestInput| {
+            check_budget(budget, request, &checkpoint)
+        };
+        validate(&with_plan, &published).expect("a budget naming its request's plan validates");
+        // Honestly resealed, a budget without the plan (or with another one)
+        // is still not the budget of this request.
+        assert!(validate(&plain, &published).is_err());
+        assert!(validate(&with_later_plan, &published).is_err());
+        assert!(validate(&with_plan, &plain_request).is_err());
+    }
+
     fn raw_checkpoint() -> H3FactoryRawCheckpointInput {
         let blocks = (0_u16..50)
             .map(|index| H3FactoryBlockMemoryInput {
@@ -6807,6 +6885,7 @@ mod tests {
             waveform_transfer_phase_device_bytes,
             mux_phase_device_bytes: 0,
             predicted_device_peak_bytes,
+            refine: request.refine,
         };
         budget.identity_sha256 = expected_h3_factory_target_budget_identity(&budget);
         budget
