@@ -2041,16 +2041,18 @@ where
         if expected_denoise_forwards != retention.denoise_forward_count()? {
             bail!("private H3 prepared denoise count differs from retained factory authority")
         }
-        // Research prototype (`MOLD_H3_REFINE_PROTO`, off by default): the
-        // env-gated second pass runs the tail of the same grid again on the
+        // A refine render runs the tail of the same grid again on the
         // still-resident transformer, so the ledger drops it only after the
         // last forward of BOTH passes. Admission's own count (checked above)
         // stays the schedule's.
-        let ledger_denoise_forwards =
-            match super::pipeline::refine_proto::H3RefineProto::from_environment()? {
-                Some(refine) => refine.total_forwards(expected_denoise_forwards)?,
-                None => expected_denoise_forwards,
-            };
+        let ledger_denoise_forwards = match prepared.refine() {
+            Some(plan) => plan
+                .total_forwards(expected_denoise_forwards)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("private H3 refine start index addresses no forward")
+                })?,
+            None => expected_denoise_forwards,
+        };
         let (qwen_execution, qwen_artifacts) = attempt.qwen_projections();
         let block_execution = attempt.block_projection();
         let continuing_execution = attempt.block_projection();
@@ -3672,15 +3674,14 @@ mod tests {
         );
     }
 
-    /// The env-gated refine prototype runs the schedule and then its tail on
-    /// the SAME resident transformer: the ledger must keep it until the last
-    /// forward of the second pass, and expect exactly `n + (n - start)`.
+    /// A refine render runs the schedule and then its tail on the SAME
+    /// resident transformer: the ledger must keep it until the last forward of
+    /// the second pass, and expect exactly `n + (n - start)`.
     #[test]
-    fn refine_prototype_ledger_keeps_the_transformer_until_the_second_pass_ends() {
-        let refine = super::super::pipeline::refine_proto::H3RefineProto::parse("scale=2,start=4")
-            .unwrap()
+    fn refine_ledger_keeps_the_transformer_until_the_second_pass_ends() {
+        let total = mold_core::minimax_h3::RefinePlan::PUBLISHED
+            .total_forwards(8)
             .unwrap();
-        let total = refine.total_forwards(8).unwrap();
         assert_eq!(total, 12);
         let mut ledger = H3PrivatePhaseLedger::new(total).unwrap();
         ledger.qwen_loaded().unwrap();

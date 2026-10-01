@@ -30,6 +30,10 @@ pub(crate) struct H3PreparedRef2VaRequest {
     prompt: String,
     seed: u64,
     grid_points: usize,
+    /// The two-pass refine this request asked for, derived once from
+    /// `GenerateRequest.refine` by [`contract::RefinePlan`]. `geometry` is the
+    /// FINAL canvas either way.
+    refine: Option<contract::RefinePlan>,
 }
 
 impl H3PreparedRef2VaRequest {
@@ -51,6 +55,10 @@ impl H3PreparedRef2VaRequest {
 
     pub(crate) const fn geometry(&self) -> &H3Fl2VaGeometry {
         &self.geometry
+    }
+
+    pub(crate) const fn refine(&self) -> Option<contract::RefinePlan> {
+        self.refine
     }
 
     pub(crate) fn reference_fingerprint(&self) -> &str {
@@ -312,6 +320,15 @@ fn prepare_request_with_authority(
         .collect::<Vec<_>>();
     let reference_fingerprint = generation_reference_fingerprint(&metadata);
     let geometry = H3Fl2VaGeometry::from_request(req, mode, 0)?;
+    // The door admits only the published scale; a request that asks for a
+    // refine this build has no plan for must not quietly render one pass.
+    let refine = contract::RefinePlan::for_request(req);
+    if req.refine.is_some() && refine.is_none() {
+        bail!(
+            "MiniMax H3 Ref2VA preparation has no refine plan for {:?}",
+            req.refine
+        );
+    }
     phase_boundary(&mut control, H3PipelinePhase::Validate, true)?;
     Ok(H3PreparedRef2VaRequest {
         geometry,
@@ -320,6 +337,7 @@ fn prepare_request_with_authority(
         prompt: req.prompt.clone(),
         seed: req.seed.unwrap_or_else(rand_seed),
         grid_points: usize::try_from(req.steps).context("H3 grid points do not fit usize")?,
+        refine,
     })
 }
 
@@ -330,33 +348,22 @@ pub(crate) fn execute_staged(
     progress: &ProgressReporter,
     observer: &mut dyn H3PipelineObserver,
 ) -> Result<H3StagedAvOutput> {
-    // Research prototype gate (`MOLD_H3_REFINE_PROTO`, pipeline/refine_proto.rs);
-    // `None` in production.
-    let refine = refine_proto::H3RefineProto::from_environment()?;
-    execute_staged_with(prepared, bindings, backend, progress, observer, refine)
-}
-
-fn execute_staged_with(
-    prepared: &H3PreparedRef2VaRequest,
-    bindings: &[GenerationReferenceBinding],
-    backend: &mut dyn H3Ref2VaBackend,
-    progress: &ProgressReporter,
-    observer: &mut dyn H3PipelineObserver,
-    refine: Option<refine_proto::H3RefineProto>,
-) -> Result<H3StagedAvOutput> {
+    // The request's own plan, never the environment's.
+    let refine = prepared.refine;
     validate_reference_bindings(prepared, bindings)?;
     let frozen_identity = backend.identity();
     frozen_identity.validate(backend.device())?;
     let device = backend.device().clone();
     let mut control = PipelineControl { progress, observer };
 
-    // With the gate closed `geometry` is `prepared.geometry` itself. Everything
-    // the gate needs to refuse is refused here, before any media is decoded or
+    // Without a plan `geometry` is `prepared.geometry` itself. Everything a
+    // plan needs to refuse is refused here, before any media is decoded or
     // model loaded.
     let geometry = match &refine {
-        Some(refine) => {
+        Some(plan) => {
             let sampler_kind = backend.sampler_kind();
-            refine.pass2_forwards(
+            refine::pass2_forwards(
+                plan,
                 &H3DualSchedule::new_for_sampler_with_video_shift(
                     prepared.grid_points,
                     sampler_kind,
@@ -364,7 +371,7 @@ fn execute_staged_with(
                 )?,
                 sampler_kind,
             )?;
-            refine.pass1_geometry(&prepared.geometry)?
+            refine::pass1_geometry(plan, &prepared.geometry)?
         }
         None => prepared.geometry.clone(),
     };
@@ -430,7 +437,7 @@ fn execute_staged_with(
         );
     }
     let frozen_layout = packed.layout.freeze(&device)?;
-    // Prototype only: the FINAL canvas must fit the admitted row ceiling, which
+    // A refine request's FINAL canvas must fit the admitted row ceiling, which
     // admission priced at the final dims, so refuse before any forward is paid.
     let final_packed = match &refine {
         Some(_) => {
@@ -616,10 +623,10 @@ fn execute_staged_with(
     )?;
     let mut sampler = H3DualSampler::new(sampler_kind);
     let counts = schedule.counts();
-    // Forwards of the prototype's second pass; zero in production, where the
-    // reported total is the schedule's own count.
+    // Forwards of the second pass; zero without a plan, where the reported
+    // total is the schedule's own count.
     let pass2_forwards = match &refine {
-        Some(refine) => refine.pass2_forwards(&schedule, sampler_kind)?,
+        Some(plan) => refine::pass2_forwards(plan, &schedule, sampler_kind)?,
         None => 0,
     };
     let reported_forwards = counts.transformer_evaluations + pass2_forwards;
@@ -650,20 +657,31 @@ fn execute_staged_with(
     // RES history is denoise-only workspace. Release previous clean estimates
     // and the carried audio state before transformer teardown and VAE decode.
     drop(sampler);
+    // Recorded while `geometry` is still pass 1's.
+    let refine_provenance = refine.as_ref().map(|plan| H3RefineProvenance {
+        scale: plan.scale,
+        start_index: plan.start_index,
+        pass1_width: geometry.width,
+        pass1_height: geometry.height,
+        pass1_forwards: plan.pass1_forwards(counts.transformer_evaluations),
+        pass2_forwards,
+        sigma_video: schedule.video_sigmas()[plan.start_index],
+        sigma_audio: schedule.audio_sigmas()[plan.start_index],
+    });
     let (video_rows, audio_rows, packed, geometry) = match (&refine, final_packed) {
-        (Some(refine), Some(final_packed)) => {
+        (Some(plan), Some(final_packed)) => {
             tracing::info!(
-                "H3 refine-proto pass 1: {}x{} pixels={} rows={} sigma=1.0000..0.0000 forwards={} elapsed_ms={}{}",
+                "H3 refine pass 1: {}x{} pixels={} rows={} sigma=1.0000..0.0000 forwards={} elapsed_ms={}{}",
                 geometry.width,
                 geometry.height,
                 geometry.width * geometry.height,
                 packed.layout.seq_len(),
                 counts.transformer_evaluations,
                 pass1_started.elapsed().as_millis(),
-                refine_proto::free_device_memory_note(&device)
+                refine::free_device_memory_note(&device)
             );
             let (video_rows, audio_rows, final_packed) = H3RefineSecondPass {
-                refine,
+                plan,
                 seed: prepared.seed,
                 schedule: &schedule,
                 sampler_kind,
@@ -776,13 +794,14 @@ fn execute_staged_with(
             },
             device_id: frozen_identity.device_id,
             execution_fingerprint: frozen_identity.execution_fingerprint,
+            refine: refine_provenance,
         },
     })
 }
 
-/// What one denoise pass borrows. Production runs exactly one pass with
-/// `first_evaluation == 0` and `completed_before == 0`; the env-gated refine
-/// prototype runs a second one that re-enters the same grid mid-way.
+/// What one denoise pass borrows. A single-pass render runs exactly one with
+/// `first_evaluation == 0` and `completed_before == 0`; a refine render runs a
+/// second one that re-enters the same grid at the plan's start index.
 struct H3DenoisePass<'a> {
     identity: &'a H3PipelineBackendIdentity,
     device: &'a Device,
@@ -865,11 +884,10 @@ fn run_denoise_pass(
     Ok((video_rows, audio_rows))
 }
 
-/// RESEARCH PROTOTYPE (`MOLD_H3_REFINE_PROTO`, see `refine_proto.rs`): the
-/// pass that turns pass 1's clean small-canvas latents into final-canvas
-/// denoising. Never constructed when the gate is closed.
+/// The pass that turns pass 1's clean small-canvas latents into final-canvas
+/// denoising (see `refine.rs`). Never constructed without a [`contract::RefinePlan`].
 struct H3RefineSecondPass<'a> {
-    refine: &'a refine_proto::H3RefineProto,
+    plan: &'a contract::RefinePlan,
     seed: u64,
     schedule: &'a H3DualSchedule,
     sampler_kind: H3SamplerKind,
@@ -897,7 +915,7 @@ impl H3RefineSecondPass<'_> {
         audio_rows: Tensor,
     ) -> Result<(Tensor, Tensor, H3RefPackedSequence)> {
         const STAGE: &str = "Refine: latent upscale";
-        let start = self.refine.start;
+        let start = self.plan.start_index;
         let (pass1, pass2) = (self.pass1_packed, &self.final_packed);
         // The reference blocks are canvas-independent: same rows, same
         // positions (each is area-normalised on its own dims), so the prefix
@@ -925,7 +943,8 @@ impl H3RefineSecondPass<'_> {
         )?;
         let clean_audio =
             audio_rows.narrow(1, pass1.condition_audio_rows, pass1.generated_audio_rows)?;
-        let upsampled = refine_proto::upsample_video_latent(&clean_video, self.refine.scale)?;
+        let upsampled =
+            refine::upsample_video_latent(&clean_video, usize::try_from(self.plan.scale)?)?;
         if upsampled.dims() != self.final_geometry.generated_video_shape() {
             bail!(
                 "MiniMax H3 refine upsample produced {:?}, expected {:?}",
@@ -934,12 +953,11 @@ impl H3RefineSecondPass<'_> {
             );
         }
         let (video_noise, audio_noise) =
-            refine_proto::draw_refine_noise(self.seed, self.final_geometry, self.device)?;
+            refine::draw_refine_noise(self.seed, self.final_geometry, self.device)?;
         let sigma_video = self.schedule.video_sigmas()[start];
         let sigma_audio = self.schedule.audio_sigmas()[start];
-        let renoised_video = refine_proto::renoise_at_sigma(&upsampled, &video_noise, sigma_video)?;
-        let renoised_audio =
-            refine_proto::renoise_at_sigma(&clean_audio, &audio_noise, sigma_audio)?;
+        let renoised_video = refine::renoise_at_sigma(&upsampled, &video_noise, sigma_video)?;
+        let renoised_audio = refine::renoise_at_sigma(&clean_audio, &audio_noise, sigma_audio)?;
         let video_rows = preserve_prefix(
             &video_rows,
             pass1.condition_video_rows,
@@ -949,12 +967,12 @@ impl H3RefineSecondPass<'_> {
         validate_packed_tensors(&video_rows, &audio_rows, self.text_states, pass2)?;
         let frozen_layout = pass2.layout.freeze(self.device)?;
         tracing::info!(
-            "H3 refine-proto upscale: latent {}x{} -> {}x{} (x{}), re-noise at grid index {start} sigma_video={sigma_video:.4} sigma_audio={sigma_audio:.4}, elapsed_ms={}",
+            "H3 refine upscale: latent {}x{} -> {}x{} (x{}), re-noise at grid index {start} sigma_video={sigma_video:.4} sigma_audio={sigma_audio:.4}, elapsed_ms={}",
             self.pass1_geometry.latent_width,
             self.pass1_geometry.latent_height,
             self.final_geometry.latent_width,
             self.final_geometry.latent_height,
-            self.refine.scale,
+            self.plan.scale,
             upscale_started.elapsed().as_millis()
         );
         progress.stage_done(STAGE, upscale_started.elapsed());
@@ -981,13 +999,13 @@ impl H3RefineSecondPass<'_> {
             audio_rows,
         )?;
         tracing::info!(
-            "H3 refine-proto pass 2: {}x{} pixels={} rows={} sigma={sigma_video:.4}..0.0000 forwards={pass2_forwards} elapsed_ms={}{}",
+            "H3 refine pass 2: {}x{} pixels={} rows={} sigma={sigma_video:.4}..0.0000 forwards={pass2_forwards} elapsed_ms={}{}",
             self.final_geometry.width,
             self.final_geometry.height,
             self.final_geometry.width * self.final_geometry.height,
             pass2.layout.seq_len(),
             pass2_started.elapsed().as_millis(),
-            refine_proto::free_device_memory_note(self.device)
+            refine::free_device_memory_note(self.device)
         );
         Ok((video_rows, audio_rows, self.final_packed))
     }
@@ -2591,31 +2609,32 @@ mod tests {
     }
 
     fn run_refined(
-        refine: Option<refine_proto::H3RefineProto>,
+        refine: Option<contract::RefinePlan>,
     ) -> (
         SyntheticBackend,
         H3PreparedRef2VaRequest,
         H3StagedAvOutput,
         RecordingObserver,
     ) {
-        let prepared = prepare(&refine_request());
-        // Pass 1 packs 37 generated rows (32x32) under the gate, else 148.
+        let mut prepared = prepare(&refine_request());
+        assert_eq!(prepared.refine(), None, "no refine block, no plan");
+        prepared.refine = refine;
+        // Pass 1 packs 37 generated rows (32x32) under a plan, else 148.
         let mut backend = refine_backend(if refine.is_some() { 37 } else { 37 * 4 });
         let mut observer = RecordingObserver::default();
-        let staged = execute_staged_with(
+        let staged = execute_staged(
             &prepared,
             &bindings(&prepared),
             &mut backend,
             &ProgressReporter::default(),
             &mut observer,
-            refine,
         )
         .unwrap();
         (backend, prepared, staged, observer)
     }
 
     #[test]
-    fn a_closed_gate_runs_one_pass_on_the_request_canvas() {
+    fn a_request_without_a_plan_runs_one_pass_on_the_request_canvas() {
         let prepared = prepare(&refine_request());
         let forwards = H3DualSchedule::new_for_sampler_with_video_shift(
             prepared.grid_points,
@@ -2626,8 +2645,12 @@ mod tests {
         .counts()
         .transformer_evaluations;
         // The synthetic backend's default sizing is the 32x32 canvas; a 64x64
-        // request with the gate closed must be denoised at 64x64 end to end.
+        // request without a plan must be denoised at 64x64 end to end.
         let (backend, _, staged, observer) = run_refined(None);
+        assert_eq!(staged.provenance.refine, None);
+        assert!(!serde_json::to_string(&staged.provenance)
+            .unwrap()
+            .contains("refine"));
         assert_eq!(backend.forward_log.len(), forwards);
         let rows = backend.forward_log[0].0.dims3().unwrap().1;
         assert!(backend
@@ -2653,8 +2676,8 @@ mod tests {
     }
 
     #[test]
-    fn the_refine_gate_runs_pass_one_small_then_the_tail_of_the_grid_at_the_final_canvas() {
-        let refine = refine_proto::H3RefineProto { scale: 2, start: 4 };
+    fn a_refine_plan_runs_pass_one_small_then_the_tail_of_the_grid_at_the_final_canvas() {
+        let refine = contract::RefinePlan::PUBLISHED;
         let (backend, prepared, staged, observer) = run_refined(Some(refine));
         let schedule = H3DualSchedule::new_for_sampler_with_video_shift(
             prepared.grid_points,
@@ -2663,7 +2686,7 @@ mod tests {
         )
         .unwrap();
         let forwards = schedule.counts().transformer_evaluations;
-        let tail = forwards - refine.start;
+        let tail = forwards - refine.start_index;
         assert_eq!(backend.forward_log.len(), forwards + tail);
 
         // Pass 1 packs 37 generated rows, pass 2 packs the final canvas' 148;
@@ -2680,7 +2703,7 @@ mod tests {
             let evaluation = if index < forwards {
                 index
             } else {
-                index - forwards + refine.start
+                index - forwards + refine.start_index
             };
             assert_eq!(
                 *timestep,
@@ -2703,7 +2726,7 @@ mod tests {
             .all(|pair| pair[0] == pair[1]));
 
         // Pass 2 starts from the upsampled pass-1 latent re-noised at sigma_k
-        // with fresh noise from the prototype's own streams. The zero-velocity
+        // with fresh noise from the refine pass's own streams. The zero-velocity
         // synthetic transformer leaves pass 1's end state equal to its initial
         // noise, which is replayed here from the documented draw order.
         let mut noise = H3RequestNoise::new(prepared.seed);
@@ -2732,13 +2755,12 @@ mod tests {
         let pass1_noise = noise
             .draw("target-video", 0, &[1, 24, 37, 2, 2], &Device::Cpu)
             .unwrap();
-        let upsampled = refine_proto::upsample_video_latent(&pass1_noise, 2).unwrap();
+        let upsampled = refine::upsample_video_latent(&pass1_noise, 2).unwrap();
         let (fresh, _) =
-            refine_proto::draw_refine_noise(prepared.seed, &prepared.geometry, &Device::Cpu)
-                .unwrap();
-        let sigma = schedule.video_sigmas()[refine.start];
+            refine::draw_refine_noise(prepared.seed, &prepared.geometry, &Device::Cpu).unwrap();
+        let sigma = schedule.video_sigmas()[refine.start_index];
         let expected = patchify_h3_video(
-            &refine_proto::renoise_at_sigma(&upsampled, &fresh, sigma).unwrap(),
+            &refine::renoise_at_sigma(&upsampled, &fresh, sigma).unwrap(),
             VIDEO_PATCH,
         )
         .unwrap();
@@ -2777,6 +2799,27 @@ mod tests {
             (64, 64)
         );
         assert_eq!(staged.provenance.transformer_evaluations, forwards);
+        assert_eq!(
+            staged.provenance.requested_grid_points,
+            prepared.grid_points
+        );
+        // Both passes are on the record, in the plan's own terms.
+        let record = staged.provenance.refine.as_ref().expect("a refine record");
+        assert_eq!(record.plan(), refine);
+        assert_eq!((record.pass1_width, record.pass1_height), (32, 32));
+        assert_eq!(record.pass1_forwards, forwards);
+        assert_eq!(record.pass2_forwards, tail);
+        assert_eq!(
+            record.sigma_video,
+            schedule.video_sigmas()[refine.start_index]
+        );
+        assert_eq!(
+            record.sigma_audio,
+            schedule.audio_sigmas()[refine.start_index]
+        );
+        assert!(serde_json::to_string(&staged.provenance)
+            .unwrap()
+            .contains("\"start_index\":4"));
 
         // One Denoise progress line across both passes.
         let denoise: Vec<_> = observer
@@ -2794,23 +2837,59 @@ mod tests {
     }
 
     #[test]
-    fn the_refine_gate_refuses_an_unsplittable_canvas_before_any_media_is_touched() {
+    fn a_refine_plan_refuses_an_unsplittable_canvas_before_any_media_is_touched() {
         let mut req = request();
         req.width = 96;
         req.height = 96;
-        let prepared = prepare(&req);
+        let mut prepared = prepare(&req);
+        prepared.refine = Some(contract::RefinePlan::PUBLISHED);
         let mut backend = SyntheticBackend::new();
-        let error = execute_staged_with(
+        let error = execute_staged(
             &prepared,
             &bindings(&prepared),
             &mut backend,
             &ProgressReporter::default(),
             &mut NoopH3PipelineObserver,
-            Some(refine_proto::H3RefineProto { scale: 2, start: 4 }),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("multiple of 32"), "{error}");
+        assert!(error.to_string().contains("does not split"), "{error}");
         assert!(backend.decoded_order.is_empty());
+    }
+
+    #[test]
+    fn preparation_derives_the_plan_from_the_request_and_never_from_the_environment() {
+        let single = prepare(&request());
+        assert_eq!(single.refine(), None);
+
+        let mut req = request();
+        req.model = contract::REF2VA_COMFY_TURBO_8STEP_768P.into();
+        req.steps = contract::steps_floor_for_model(&req.model);
+        req.width = 1344;
+        req.height = 768;
+        req.refine = Some(mold_core::RefineRequest {
+            scale: contract::H3_REFINE_SCALE,
+        });
+        let refined = prepare(&req);
+        assert_eq!(refined.refine(), Some(contract::RefinePlan::PUBLISHED));
+        // The prepared geometry is the FINAL canvas, not pass 1's.
+        assert_eq!(
+            (refined.geometry.width, refined.geometry.height),
+            (1344, 768)
+        );
+
+        // A refine block the door refuses never reaches a plan: preparation
+        // runs the same contract, so it cannot quietly render one pass.
+        req.refine = Some(mold_core::RefineRequest { scale: 3 });
+        let error = prepare_request(
+            &req,
+            &ProgressReporter::default(),
+            &mut NoopH3PipelineObserver,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("MINIMAX_H3_REFINE_SCALE"),
+            "{error}"
+        );
     }
 
     #[test]

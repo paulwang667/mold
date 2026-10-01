@@ -411,9 +411,9 @@ impl H3DualSchedule {
     /// forward, so `steps_from(0)` is `steps()` and every later start is a
     /// suffix of it.
     ///
-    /// Used only by the env-gated research prototype that re-enters the grid
-    /// mid-way (`pipeline/refine_proto.rs`). `start` must address an existing
-    /// forward.
+    /// Used by the refine render's second pass, which re-enters the grid at
+    /// the plan's start index (`pipeline/refine.rs`). `start` must address an
+    /// existing forward.
     pub fn steps_from(&self, start: usize) -> Result<H3DualScheduleIter<'_>> {
         if start >= self.video.evaluations() {
             bail!(
@@ -1379,7 +1379,7 @@ mod tests {
             assert_eq!(tail.len(), full.len() - start);
             assert_eq!(tail.collect::<Vec<_>>(), full[start..].to_vec());
         }
-        // The prototype's default re-entry point sits on the shift-12 ladder.
+        // The refine plan's re-entry point sits on the shift-12 ladder.
         assert!((schedule.video_sigmas()[4] - 0.9231).abs() < 1e-3);
         let first = schedule.steps_from(4).unwrap().next().unwrap();
         assert_eq!(first.evaluation_index, 4);

@@ -3680,6 +3680,7 @@ fn prepare_reviewed_h3_private_fl2va_attempt(
             .request
             .denoise_forward_count,
         sampler: frozen_factory.quantization().sampler_kind(),
+        refine: prepared.factory_attempt_input().request.refine,
         predicted_device_peak_bytes: prepared.predicted_device_peak_bytes(),
         predicted_host_increment_bytes: prepared.predicted_host_increment_bytes(),
         media,
@@ -4781,6 +4782,7 @@ fn private_run_output(
         || provenance.device_id != owner.device_id
         || provenance.execution_fingerprint != owner.execution_fingerprint
         || provenance.mode != expected_mode
+        || provenance.refine.as_ref().map(|refine| refine.plan()) != owner.refine
         || provenance.seed != owner.media.seed
         || provenance.width != usize::try_from(owner.media.width)?
         || provenance.height != usize::try_from(owner.media.height)?
@@ -4901,6 +4903,10 @@ pub struct H3PrivateFl2VaOwnerFacts {
     /// reviewed Turbo tier). The terminal provenance gate compares against
     /// this, never a constant — a Turbo render legitimately executes Euler.
     pub(crate) sampler: H3SamplerKind,
+    /// The refine plan admission froze into the prepared request, `None` for a
+    /// single-pass render. The terminal gate requires the executed provenance
+    /// to name exactly this plan (or none).
+    pub refine: Option<contract::RefinePlan>,
     pub predicted_device_peak_bytes: u64,
     pub predicted_host_increment_bytes: u64,
     pub media: H3PrivateFl2VaMediaContract,
@@ -9661,6 +9667,7 @@ mod tests {
             requested_grid_points: contract::COMFY_DEFAULT_STEPS,
             transformer_evaluations: contract::COMFY_DEFAULT_STEPS - 1,
             sampler: H3SamplerKind::ComfyResMultistep,
+            refine: None,
             predicted_device_peak_bytes: 7,
             predicted_host_increment_bytes: 8,
             media: media(),

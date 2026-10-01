@@ -621,6 +621,16 @@ impl H3PrivatePreparedTaskRequest {
             Self::Ref2va(prepared) => prepared.grid_points(),
         }
     }
+
+    /// The two-pass refine plan this preparation renders with. Only Ref2VA
+    /// has one; the retained prepared-request identity carries the same plan.
+    pub(crate) fn refine(&self) -> Option<contract::RefinePlan> {
+        match self {
+            Self::Fl2va(_) => None,
+            #[cfg(feature = "mp4")]
+            Self::Ref2va(prepared) => prepared.refine(),
+        }
+    }
 }
 
 /// Opaque, one-shot prepared attempt. The concrete normalized CPU tensors and
@@ -900,7 +910,7 @@ fn ref2va_prepared_request_input(
         reference_fingerprint: prepared.reference_fingerprint().into(),
         endpoints: Vec::new(),
         references,
-        refine: contract::RefinePlan::for_request(request),
+        refine: prepared.refine(),
         rows: H3FactoryPreparedRowsInput {
             qwen_output_text_rows,
             qwen_vision_rows,

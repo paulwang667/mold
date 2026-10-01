@@ -7,7 +7,7 @@
 //! attention, and admission gates permit a runnable family.
 
 pub(crate) mod ref2va;
-pub(crate) mod refine_proto;
+pub(crate) mod refine;
 
 use std::io::Cursor;
 
@@ -133,8 +133,8 @@ impl H3Fl2VaGeometry {
     }
 
     /// The geometry of an explicit canvas. `from_request` is this with the
-    /// request's own canvas; the env-gated refine prototype also asks for the
-    /// smaller pass-1 canvas.
+    /// request's own canvas; a refine render also asks for the smaller pass-1
+    /// canvas.
     fn from_canvas(
         mode: Mode,
         width: usize,
@@ -504,6 +504,43 @@ pub(crate) struct H3PipelineProvenance {
     pub noise_draws: Vec<H3NoiseDrawMetadata>,
     pub device_id: String,
     pub execution_fingerprint: String,
+    /// Both passes of a refine render. `width` / `height` are the FINAL canvas;
+    /// `requested_grid_points` / `transformer_evaluations` / `noise_draws`
+    /// keep their pass-1 meaning (the schedule's own count and the draws that
+    /// seeded pass 1), because admission freezes exactly those and the terminal
+    /// gate compares against them. Absent for a single-pass render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refine: Option<H3RefineProvenance>,
+}
+
+/// What a refine render did, pass by pass. Every figure comes from the
+/// [`contract::RefinePlan`] and the frozen schedule it ran on.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct H3RefineProvenance {
+    pub scale: u32,
+    /// Grid index pass 2 re-entered the frozen schedule at.
+    pub start_index: usize,
+    pub pass1_width: usize,
+    pub pass1_height: usize,
+    pub pass1_forwards: usize,
+    pub pass2_forwards: usize,
+    /// The sigmas the upscaled latents were re-noised to.
+    pub sigma_video: f32,
+    pub sigma_audio: f32,
+}
+
+// Sigmas are finite by construction (the schedule validates its grid), so
+// equality is reflexive.
+impl Eq for H3RefineProvenance {}
+
+impl H3RefineProvenance {
+    /// The plan this record says ran.
+    pub(crate) fn plan(&self) -> contract::RefinePlan {
+        contract::RefinePlan {
+            scale: self.scale,
+            start_index: self.start_index,
+        }
+    }
 }
 
 /// Payload-free Ref2VA provenance. It intentionally cannot represent media
@@ -941,6 +978,7 @@ pub(crate) fn execute_staged(
             },
             device_id: frozen_identity.device_id,
             execution_fingerprint: frozen_identity.execution_fingerprint,
+            refine: None,
         },
     })
 }
@@ -1111,8 +1149,8 @@ struct EncodedVideo {
 }
 
 /// Largest first-frame area kept at full size for the preview thumbnail: the
-/// admitted compact canvas (1344x768). A larger frame (the refine prototype's
-/// uncapped canvases) is shrunk, aspect preserved, before PNG encoding,
+/// admitted compact canvas (1344x768). A larger frame (a refine render's final
+/// canvas, up to 1920x1088) is shrunk, aspect preserved, before PNG encoding,
 /// because a full-size PNG of a 3.6 MP frame exceeds
 /// [`SMALL_THUMBNAIL_PNG_MAX_BYTES`] and failed the whole job after the
 /// denoise had been paid for. Frames inside the admitted area are untouched.
