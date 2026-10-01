@@ -764,7 +764,9 @@ impl ComfyInt8ConvRotLinear {
         let input_dtype = input.dtype();
         ensure_floating(input_dtype, "INT8 ConvRot activation")?;
         let (flat, output_shape) = flattened_input(input, self.in_features)?;
+        let diag_span = crate::h3_diag::span_begin(device)?;
         let rotated = self.rotated_activation(&flat)?;
+        crate::h3_diag::span_end(device, diag_span, 7)?;
         // The H3 rule: a bias sends the whole linear to the portable arm,
         // because the kernel folds none and this path adds it only there.
         let kind = if bias.is_some() {

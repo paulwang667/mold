@@ -71,16 +71,11 @@ pub fn take_totals() -> H2dTotals {
 /// 1 q/k/v reshape + q/k norm + rotary, 2 attention kernel, 3 output
 /// projection, 4 fc1, 5 gate activation, 6 fc2. Weight uploads that happen
 /// inside a span are subtracted from it (they are reported as `h2d_ms`).
-pub const SPAN_COUNT: usize = 7;
-static SPAN_NS: [AtomicU64; SPAN_COUNT] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+pub const SPAN_COUNT: usize = 12;
+/// Slots 7..=11 nest inside the linear spans above: 7 Hadamard rotation,
+/// 8 row-wise quantize, 9 cuBLASLt INT8 GEMM, 10 dequantize, 11 Turbo LoRA
+/// delta. Only slots 0..=6 are mutually exclusive.
+static SPAN_NS: [AtomicU64; SPAN_COUNT] = [const { AtomicU64::new(0) }; SPAN_COUNT];
 
 pub fn span_begin(device: &Device) -> Result<Option<(Instant, u64)>> {
     if !enabled() {
@@ -106,4 +101,18 @@ pub fn take_spans() -> [u64; SPAN_COUNT] {
         out[slot] = value.swap(0, Ordering::Relaxed);
     }
     out
+}
+
+#[cfg(feature = "cuda")]
+pub fn span_begin_cuda(device: &candle::CudaDevice) -> Result<Option<(Instant, u64)>> {
+    span_begin(&Device::Cuda(device.clone()))
+}
+
+#[cfg(feature = "cuda")]
+pub fn span_end_cuda(
+    device: &candle::CudaDevice,
+    started: Option<(Instant, u64)>,
+    slot: usize,
+) -> Result<()> {
+    span_end(&Device::Cuda(device.clone()), started, slot)
 }

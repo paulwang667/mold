@@ -261,7 +261,12 @@ pub(super) fn apply_optional_turbo_delta(
 ) -> candle::Result<Tensor> {
     match delta {
         None => Ok(base),
-        Some(delta) => delta.apply(input, &base),
+        Some(delta) => {
+            let diag_span = crate::h3_diag::span_begin(input.device())?;
+            let applied = delta.apply(input, &base)?;
+            crate::h3_diag::span_end(input.device(), diag_span, 11)?;
+            Ok(applied)
+        }
     }
 }
 

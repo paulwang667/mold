@@ -264,6 +264,7 @@ impl NativeInt8Linear {
             "h3-int8-linear",
             kernels::INT8_LINEAR,
         )?;
+        let diag_span = crate::h3_diag::span_begin_cuda(device)?;
         let mut builder = quantize.builder();
         builder.arg(&input);
         builder.arg(&quantized);
@@ -276,7 +277,9 @@ impl NativeInt8Linear {
         };
         // SAFETY: Kernel arguments and launch geometry match the compiled signature.
         unsafe { builder.launch(cfg) }.w()?;
+        crate::h3_diag::span_end_cuda(device, diag_span, 8)?;
 
+        let diag_span = crate::h3_diag::span_begin_cuda(device)?;
         let (activation_ptr, activation_read) = quantized.device_ptr(&stream);
         let (weight_ptr, weight_read) = weight.device_ptr(&stream);
         let (accumulator_ptr, accumulator_write) = accumulator.device_ptr_mut(&stream);
@@ -313,6 +316,7 @@ impl NativeInt8Linear {
         drop(accumulator_write);
         drop(weight_read);
         drop(activation_read);
+        crate::h3_diag::span_end_cuda(device, diag_span, 9)?;
 
         let dequantize_name = match O::DTYPE {
             DType::F32 => "h3_dequantize_int8_linear_f32",
@@ -327,6 +331,7 @@ impl NativeInt8Linear {
             "h3-int8-linear",
             kernels::INT8_LINEAR,
         )?;
+        let diag_span = crate::h3_diag::span_begin_cuda(device)?;
         let mut builder = dequantize.builder();
         builder.arg(&accumulator);
         builder.arg(&input_scales);
@@ -340,6 +345,7 @@ impl NativeInt8Linear {
         let cfg = LaunchConfig::for_num_elems((self.rows * self.columns) as u32);
         // SAFETY: Kernel arguments and launch geometry match the compiled signature.
         unsafe { builder.launch(cfg) }.w()?;
+        crate::h3_diag::span_end_cuda(device, diag_span, 10)?;
 
         Ok((
             CudaStorage::wrap_cuda_slice(output, device.clone()),

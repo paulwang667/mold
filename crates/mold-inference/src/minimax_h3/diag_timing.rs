@@ -222,7 +222,7 @@ impl ForwardDiag {
         let h2d = mold_candle::h3_diag::take_totals();
         let spans = mold_candle::h3_diag::take_spans();
         let gpu_ns = forward.block_ns.saturating_sub(h2d.nanos);
-        let span_sum: u64 = spans.iter().sum();
+        let span_sum: u64 = spans[..7].iter().sum();
         let rest_ns = gpu_ns.saturating_sub(span_sum);
         let other_ns = total_ns
             .saturating_sub(forward.host_stage_ns)
@@ -258,7 +258,9 @@ impl ForwardDiag {
         tracing::info!(
             target: "mold::minimax_h3::diag",
             "H3 diag spans {}/{} rows={} qkv_ms={:.1} prep_ms={:.1} attn_ms={:.1} out_ms={:.1} \
-             fc1_ms={:.1} act_ms={:.1} fc2_ms={:.1} rest_ms={:.1} gpu_ms={:.1}",
+             fc1_ms={:.1} act_ms={:.1} fc2_ms={:.1} rest_ms={:.1} gpu_ms={:.1} \
+             inner_rotate_ms={:.1} inner_quant_ms={:.1} inner_gemm_ms={:.1} inner_dequant_ms={:.1} \
+             inner_turbo_ms={:.1}",
             forward.index,
             total_label,
             forward.rows,
@@ -271,6 +273,11 @@ impl ForwardDiag {
             ms(spans[6]),
             ms(rest_ns),
             ms(gpu_ns),
+            ms(spans[7]),
+            ms(spans[8]),
+            ms(spans[9]),
+            ms(spans[10]),
+            ms(spans[11]),
         );
         tracing::info!(
             target: "mold::minimax_h3::diag",
