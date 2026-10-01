@@ -734,9 +734,14 @@ fn open_h3_comfy_int8_checkpoint(
         content_sha256,
         block_content_sha256,
     } = match lookup_cached_opened_hashes(&canonical_path, &identity) {
-        Some(hashes) => hashes,
+        Some(hashes) => {
+            tracing::info!(target: "mold::minimax_h3::diag", "H3 diag transformer hash cache=hit");
+            hashes
+        }
         None => {
+            let diag_started = std::time::Instant::now();
             let hashes = hash_open_file(&mut file, &parsed, config.num_layers, cancellation)?;
+            tracing::info!(target: "mold::minimax_h3::diag", "H3 diag transformer hash cache=miss bytes={} elapsed_ms={}", parsed.file_len, diag_started.elapsed().as_millis());
             store_cached_opened_hashes(&canonical_path, identity.clone(), hashes.clone());
             hashes
         }
@@ -1284,6 +1289,9 @@ fn hash_open_file(
         block_ranges.push(ranges);
     }
     let mut block_digests = (0..block_count).map(|_| Sha256::new()).collect::<Vec<_>>();
+    let mut diag_read = std::time::Duration::ZERO;
+    let mut diag_full = std::time::Duration::ZERO;
+    let mut diag_blocks = std::time::Duration::ZERO;
     let mut verified = 0u64;
     let mut buffer = vec![0u8; FILE_READ_CHUNK_BYTES];
     while verified < parsed.file_len {
@@ -1296,13 +1304,18 @@ fn hash_open_file(
                         "H3 Comfy hash read size does not fit this platform",
                     )
                 })?;
+        let diag_t0 = std::time::Instant::now();
         file.read_exact(&mut buffer[..remaining]).map_err(|error| {
             failure(
                 H3ComfyCheckpointErrorCode::Io,
                 format!("failed to hash H3 Comfy checkpoint: {error}"),
             )
         })?;
+        let diag_t1 = std::time::Instant::now();
         digest.update(&buffer[..remaining]);
+        let diag_t2 = std::time::Instant::now();
+        diag_read += diag_t1 - diag_t0;
+        diag_full += diag_t2 - diag_t1;
         let chunk_end = verified + remaining as u64;
         for (block_digest, ranges) in block_digests.iter_mut().zip(&block_ranges) {
             for [start, end] in ranges {
@@ -1317,8 +1330,10 @@ fn hash_open_file(
                 }
             }
         }
+        diag_blocks += diag_t2.elapsed();
         verified += remaining as u64;
     }
+    tracing::info!(target: "mold::minimax_h3::diag", "H3 diag transformer hash split read_ms={} sha_full_ms={} sha_blocks_ms={}", diag_read.as_millis(), diag_full.as_millis(), diag_blocks.as_millis());
     cancellation_boundary_inspection(cancellation)?;
     Ok(H3ComfyOpenedHashes {
         content_sha256: hex_digest(digest.finalize()),

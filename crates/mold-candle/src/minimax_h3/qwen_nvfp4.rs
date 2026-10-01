@@ -785,6 +785,7 @@ impl OpenedH3QwenNvfp4AwqArtifact {
             }
         };
         if lookup_full_authentication(&self.path, &self.identity) {
+            tracing::info!(target: "mold::minimax_h3::diag", "H3 diag qwen hash cache=hit");
             checkpoint(self.identity.len, self.identity.len)?;
             self.revalidate("after full artifact authentication")?;
             return Ok(());
@@ -795,17 +796,28 @@ impl OpenedH3QwenNvfp4AwqArtifact {
         let mut digest = Sha256::new();
         let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
         let mut completed = 0_u64;
+        let diag_started = std::time::Instant::now();
+        let mut diag_read = std::time::Duration::ZERO;
+        let mut diag_hash = std::time::Duration::ZERO;
+        let mut diag_callback = std::time::Duration::ZERO;
         while completed < self.identity.len {
             let remaining = self.identity.len - completed;
             let length = usize::try_from(remaining.min(READ_CHUNK_BYTES as u64))
                 .expect("the read length is bounded to one MiB");
+            let diag_t0 = std::time::Instant::now();
             self.file
                 .read_exact(&mut buffer[..length])
                 .map_err(|error| H3QwenNvfp4AwqError::Io(error.to_string()))?;
+            let diag_t1 = std::time::Instant::now();
             digest.update(&buffer[..length]);
+            let diag_t2 = std::time::Instant::now();
             completed += length as u64;
             checkpoint(completed, self.identity.len)?;
+            diag_read += diag_t1 - diag_t0;
+            diag_hash += diag_t2 - diag_t1;
+            diag_callback += diag_t2.elapsed();
         }
+        tracing::info!(target: "mold::minimax_h3::diag", "H3 diag qwen hash cache=miss bytes={} elapsed_ms={} read_ms={} sha_ms={} callback_ms={}", self.identity.len, diag_started.elapsed().as_millis(), diag_read.as_millis(), diag_hash.as_millis(), diag_callback.as_millis());
         self.revalidate("after full artifact authentication")?;
         let actual = hex_digest(digest.finalize());
         if actual != H3_QWEN_NVFP4_AWQ_SHA256 {

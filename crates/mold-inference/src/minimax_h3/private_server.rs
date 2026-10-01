@@ -2230,6 +2230,7 @@ fn prepare_reviewed_h3_private_fl2va_admission(
     progress.checkpoint()?;
 
     timeline.enter(admission_phase::CHECKPOINTS);
+    let diag_open_started = std::time::Instant::now();
     let transformer_cancellation = H3PrivatePreparationCancellation { progress };
     let opened_transformer = open_h3_comfy_published_int8_checkpoint(
         storage.transformer_path(),
@@ -2238,10 +2239,13 @@ fn prepare_reviewed_h3_private_fl2va_admission(
         &transformer_cancellation,
     )
     .map_err(|error| anyhow!(error.to_string()))?;
+    tracing::info!(target: "mold::minimax_h3::diag", "H3 diag open transformer elapsed_ms={}", diag_open_started.elapsed().as_millis());
+    let diag_vae_started = std::time::Instant::now();
     let vae_plan = storage.vae_plan(paths.staging_root)?;
     let mut vae_observer = H3PrivatePreparationVaeObserver::new(progress);
     let opened_vae = open_h3_comfy_vae_authority(&vae_plan, &mut vae_observer);
     let opened_vae = vae_observer.finish(opened_vae)?;
+    tracing::info!(target: "mold::minimax_h3::diag", "H3 diag open vae elapsed_ms={}", diag_vae_started.elapsed().as_millis());
 
     // The qualification above was minted at this tier's reviewed step count;
     // validating the prepared request against the baseline 21-step envelope
@@ -2380,6 +2384,7 @@ fn prepare_reviewed_h3_private_fl2va_admission(
         qwen_policy_identity,
     )?;
     let mut checkpoint = H3PrivatePreparationCheckpoint { progress };
+    let diag_qwen_started = std::time::Instant::now();
     let opened_qwen = open_authorized_private_qwen_authority(
         storage.qwen_weights_path(),
         &qwen_support,
@@ -2387,6 +2392,7 @@ fn prepare_reviewed_h3_private_fl2va_admission(
         &base_factory_authority,
         &mut checkpoint,
     )?;
+    tracing::info!(target: "mold::minimax_h3::diag", "H3 diag open qwen elapsed_ms={}", diag_qwen_started.elapsed().as_millis());
     timeline.enter(admission_phase::ATTEMPT);
     let prepared_attempt = build_private_fl2va_admission_attempt(
         &execution_fingerprint,
