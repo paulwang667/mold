@@ -1573,6 +1573,8 @@ impl H3ComfyInt8Attention {
                 qkv_workspace.max(kernel_peak).max(output_projection_peak),
             );
         }
+        let diag_device = hidden.device().clone();
+        let diag_span = crate::h3_diag::span_begin(&diag_device)?;
         let qkv = apply_optional_turbo_delta(
             self.qkv_delta.as_ref(),
             hidden,
@@ -1583,6 +1585,8 @@ impl H3ComfyInt8Attention {
                 H3_COMFY_PORTABLE_ROW_CHUNK,
             )?,
         )?;
+        crate::h3_diag::span_end(&diag_device, diag_span, 0)?;
+        let diag_span = crate::h3_diag::span_begin(&diag_device)?;
         let q = qkv.narrow(2, 0, self.inner_dim)?;
         let k = qkv.narrow(2, self.inner_dim, self.inner_dim)?;
         let v = qkv.narrow(2, 2 * self.inner_dim, self.inner_dim)?;
@@ -1602,10 +1606,14 @@ impl H3ComfyInt8Attention {
         k = self.k_norm.forward(&k)?;
         q = apply_h3_rotary(&q, rotary.0, rotary.1, rotary.2)?;
         k = apply_h3_rotary(&k, rotary.0, rotary.1, rotary.2)?;
+        crate::h3_diag::span_end(&diag_device, diag_span, 1)?;
+        let diag_span = crate::h3_diag::span_begin(&diag_device)?;
         let output = execute_h3_attention(attention_plan, &q, &k, &v)
             .map_err(|error| candle::Error::Msg(error.to_string()))?
             .reshape((batch, seq_len, self.inner_dim))?;
-        apply_optional_turbo_delta(
+        crate::h3_diag::span_end(&diag_device, diag_span, 2)?;
+        let diag_span = crate::h3_diag::span_begin(&diag_device)?;
+        let projected = apply_optional_turbo_delta(
             self.out_delta.as_ref(),
             &output,
             self.out.forward_reference(
@@ -1614,7 +1622,9 @@ impl H3ComfyInt8Attention {
                 hidden.dtype(),
                 H3_COMFY_PORTABLE_ROW_CHUNK,
             )?,
-        )
+        )?;
+        crate::h3_diag::span_end(&diag_device, diag_span, 3)?;
+        Ok(projected)
     }
 }
 
@@ -1672,6 +1682,8 @@ impl H3ComfyInt8Mlp {
                 .ok_or_else(|| candle::Error::Msg("MiniMax H3 FFN workspace overflows".into()))?;
             super::private_runtime_observation::observe_ffn(fc1.max(retained_fc2));
         }
+        let diag_device = hidden.device().clone();
+        let diag_span = crate::h3_diag::span_begin(&diag_device)?;
         let projected = apply_optional_turbo_delta(
             self.fc1_delta.as_ref(),
             hidden,
@@ -1682,10 +1694,14 @@ impl H3ComfyInt8Mlp {
                 H3_COMFY_PORTABLE_ROW_CHUNK,
             )?,
         )?;
+        crate::h3_diag::span_end(&diag_device, diag_span, 4)?;
+        let diag_span = crate::h3_diag::span_begin(&diag_device)?;
         let gate = projected.narrow(D::Minus1, 0, self.width)?;
         let up = projected.narrow(D::Minus1, self.width, self.width)?;
         let gated = silu(&gate)?.broadcast_mul(&up)?;
-        apply_optional_turbo_delta(
+        crate::h3_diag::span_end(&diag_device, diag_span, 5)?;
+        let diag_span = crate::h3_diag::span_begin(&diag_device)?;
+        let result = apply_optional_turbo_delta(
             self.fc2_delta.as_ref(),
             &gated,
             self.fc2.forward_reference(
@@ -1694,7 +1710,9 @@ impl H3ComfyInt8Mlp {
                 hidden.dtype(),
                 H3_COMFY_PORTABLE_ROW_CHUNK,
             )?,
-        )
+        )?;
+        crate::h3_diag::span_end(&diag_device, diag_span, 6)?;
+        Ok(result)
     }
 }
 

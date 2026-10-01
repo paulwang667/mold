@@ -66,3 +66,44 @@ pub fn take_totals() -> H2dTotals {
         fences: SYNCS.swap(0, Ordering::Relaxed),
     }
 }
+
+/// Fenced per-op spans inside one block forward. Slots: 0 qkv projection,
+/// 1 q/k/v reshape + q/k norm + rotary, 2 attention kernel, 3 output
+/// projection, 4 fc1, 5 gate activation, 6 fc2. Weight uploads that happen
+/// inside a span are subtracted from it (they are reported as `h2d_ms`).
+pub const SPAN_COUNT: usize = 7;
+static SPAN_NS: [AtomicU64; SPAN_COUNT] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+pub fn span_begin(device: &Device) -> Result<Option<(Instant, u64)>> {
+    if !enabled() {
+        return Ok(None);
+    }
+    fence(device)?;
+    Ok(Some((Instant::now(), H2D_NS.load(Ordering::Relaxed))))
+}
+
+pub fn span_end(device: &Device, started: Option<(Instant, u64)>, slot: usize) -> Result<()> {
+    if let Some((at, h2d_before)) = started {
+        fence(device)?;
+        let h2d = H2D_NS.load(Ordering::Relaxed).saturating_sub(h2d_before);
+        let ns = (at.elapsed().as_nanos() as u64).saturating_sub(h2d);
+        SPAN_NS[slot].fetch_add(ns, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+pub fn take_spans() -> [u64; SPAN_COUNT] {
+    let mut out = [0u64; SPAN_COUNT];
+    for (slot, value) in SPAN_NS.iter().enumerate() {
+        out[slot] = value.swap(0, Ordering::Relaxed);
+    }
+    out
+}
