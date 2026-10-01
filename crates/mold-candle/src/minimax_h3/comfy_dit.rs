@@ -546,15 +546,19 @@ impl H3ComfyOpenedInt8Checkpoint {
             turbo.as_deref(),
         )?;
         cancellation_boundary(cancellation.as_ref())?;
+        let identity = transformer.streamed_identity();
+        let host_cache = host_block_cache_wanted(device)
+            .then(|| H3ComfyInt8HostCache::new(identity.block_count()));
         let loader = H3ComfyInt8BlockLoader {
             config: self.config,
             mode,
             precision,
             source: self.source,
             vb,
-            identity: transformer.streamed_identity(),
+            identity,
             cancellation,
             turbo,
+            host_cache,
         };
         Ok((transformer, loader))
     }
@@ -1407,7 +1411,9 @@ impl H3ComfyOpenedSource {
             .checked_add(self.header.header_len)
             .and_then(|value| value.checked_add(tensor.data_offsets[0]))
             .ok_or_else(|| candle::Error::Msg("H3 Comfy tensor offset overflows".into()))?;
-        let mut bytes = vec![0u8; len];
+        // Capacity is reserved, never zero-filled: every byte is written by the
+        // read below and the final length is checked against the header.
+        let mut bytes = Vec::with_capacity(len);
         let mut file = self
             .file
             .lock()
@@ -1416,16 +1422,22 @@ impl H3ComfyOpenedSource {
         file.seek(SeekFrom::Start(data_start)).map_err(|error| {
             candle::Error::Msg(format!("failed to seek H3 Comfy tensor {name:?}: {error}"))
         })?;
-        let mut offset = 0usize;
-        while offset < bytes.len() {
+        while bytes.len() < len {
             cancellation_boundary(cancellation)?;
-            let end = (offset + FILE_READ_CHUNK_BYTES).min(bytes.len());
-            file.read_exact(&mut bytes[offset..end]).map_err(|error| {
-                candle::Error::Msg(format!("failed to read H3 Comfy tensor {name:?}: {error}"))
-            })?;
+            let chunk = (len - bytes.len()).min(FILE_READ_CHUNK_BYTES);
+            let read = (&mut *file)
+                .take(chunk as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|error| {
+                    candle::Error::Msg(format!("failed to read H3 Comfy tensor {name:?}: {error}"))
+                })?;
+            if read != chunk {
+                return Err(candle::Error::Msg(format!(
+                    "failed to read H3 Comfy tensor {name:?}: failed to fill whole buffer"
+                )));
+            }
             self.runtime_bytes_read
-                .fetch_add((end - offset) as u64, Ordering::Relaxed);
-            offset = end;
+                .fetch_add(read as u64, Ordering::Relaxed);
         }
         self.verify_identity(&file)?;
         cancellation_boundary(cancellation)?;
@@ -1481,8 +1493,9 @@ impl H3ComfyOpenedSource {
         if header.dtype != "I8" {
             candle::bail!("H3 Comfy tensor {name:?} is not exact I8 storage")
         }
+        // The read buffer becomes the tensor storage: one host copy per tensor.
         let bytes = self.read_tensor_bytes(name, cancellation)?;
-        Tensor::from_raw_buffer(&bytes, DType::U8, &header.shape, &Device::Cpu)
+        Tensor::from_vec(bytes, header.shape.as_slice(), &Device::Cpu)
     }
 
     fn load_f32_cpu(
@@ -1568,6 +1581,36 @@ pub struct H3ComfyInt8BlockLoader {
     /// Device-resident Turbo deltas for all fifty main blocks, shared with the
     /// resident core that carries the token-refiner deltas.
     turbo: Option<Arc<H3TurboLoraRuntime>>,
+    /// Packed host linears of every block already read by this loader. `None`
+    /// means the cache is off and each load re-reads the checkpoint.
+    host_cache: Option<H3ComfyInt8HostCache>,
+}
+
+/// The four packed linears of one main block in `qkv, out, fc1, fc2` order.
+type H3ComfyInt8PackedLinears = [H3ComfyInt8ConvRotLinear; 4];
+
+/// Per-loader resident copy of the packed INT8 block weights and scales.
+///
+/// The entries are CPU tensors, so the cache costs anonymous host memory
+/// (the sum of every block's `encoded_host_bytes`) and no device memory: the
+/// device still holds exactly one staged block. It lives and dies with the
+/// owning loader, which is one generation job; nothing here is global.
+struct H3ComfyInt8HostCache {
+    blocks: Vec<Option<H3ComfyInt8PackedLinears>>,
+}
+
+impl H3ComfyInt8HostCache {
+    fn new(block_count: usize) -> Self {
+        Self {
+            blocks: (0..block_count).map(|_| None).collect(),
+        }
+    }
+}
+
+/// The cache pays off only where the packed bytes are staged to a separate
+/// device. Unified-memory devices would hold the same pages twice.
+fn host_block_cache_wanted(device: &Device) -> bool {
+    device.is_cuda()
 }
 
 impl fmt::Debug for H3ComfyInt8BlockLoader {
@@ -1632,9 +1675,55 @@ impl H3ComfyInt8BlockLoader {
         )
     }
 
+    /// Turn the host cache on regardless of device so CPU tests can exercise it.
+    #[cfg(test)]
+    pub(crate) fn force_host_block_cache(&mut self) {
+        let block_count = self.block_count();
+        self.host_cache
+            .get_or_insert_with(|| H3ComfyInt8HostCache::new(block_count));
+    }
+
+    /// Packed host linears for one block: from the resident cache when this
+    /// loader has it on and has seen the block, otherwise read from the opened
+    /// checkpoint (and remembered when the cache is on).
+    fn packed_linears(&mut self, index: usize) -> candle::Result<H3ComfyInt8PackedLinears> {
+        if let Some(hit) = self
+            .host_cache
+            .as_ref()
+            .and_then(|cache| cache.blocks.get(index))
+            .and_then(Option::as_ref)
+        {
+            return Ok(hit.clone());
+        }
+        let prefix = format!("blocks.{index}");
+        let linear = |suffix: &str| -> candle::Result<H3ComfyInt8ConvRotLinear> {
+            let layer = format!("{prefix}.{suffix}");
+            H3ComfyInt8ConvRotLinear::new(
+                self.source
+                    .load_raw_int8(&format!("{layer}.weight"), self.cancellation.as_ref())?,
+                self.source
+                    .load_f32_cpu(&format!("{layer}.weight_scale"), self.cancellation.as_ref())?,
+            )
+        };
+        let linears = [
+            linear("attn.qkv_proj")?,
+            linear("attn.out_proj")?,
+            linear("mlp.fc1")?,
+            linear("mlp.fc2")?,
+        ];
+        if let Some(slot) = self
+            .host_cache
+            .as_mut()
+            .and_then(|cache| cache.blocks.get_mut(index))
+        {
+            *slot = Some(linears.clone());
+        }
+        Ok(linears)
+    }
+
     /// Load exactly one indexed main block. A second live block is rejected so
-    /// neither compressed host weights nor protected device tensors can grow
-    /// with the fifty-block stack.
+    /// device tensors cannot grow with the fifty-block stack. Host weights grow
+    /// with it only through the loader's optional resident cache (CUDA).
     pub fn load_block(&mut self, index: usize) -> candle::Result<H3LoadedTransformerBlock> {
         cancellation_boundary(self.cancellation.as_ref())?;
         if index >= self.block_count() {
@@ -1647,20 +1736,12 @@ impl H3ComfyInt8BlockLoader {
             candle::bail!("MiniMax H3 Comfy INT8 loader permits exactly one live main block")
         }
         let prefix = format!("blocks.{index}");
-        let linear = |suffix: &str| -> candle::Result<H3ComfyInt8ConvRotLinear> {
-            let layer = format!("{prefix}.{suffix}");
-            H3ComfyInt8ConvRotLinear::new(
-                self.source
-                    .load_raw_int8(&format!("{layer}.weight"), self.cancellation.as_ref())?,
-                self.source
-                    .load_f32_cpu(&format!("{layer}.weight_scale"), self.cancellation.as_ref())?,
-            )
-        };
+        let [qkv, out, fc1, fc2] = self.packed_linears(index)?;
         let matrices = H3ComfyInt8BlockMatrices {
-            qkv: linear("attn.qkv_proj")?,
-            out: linear("attn.out_proj")?,
-            fc1: linear("mlp.fc1")?,
-            fc2: linear("mlp.fc2")?,
+            qkv,
+            out,
+            fc1,
+            fc2,
             turbo: self
                 .turbo
                 .as_ref()
@@ -4064,6 +4145,118 @@ mod tests {
         drop(block1);
         assert_eq!(loader.live_block_count(), 0);
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    fn open_runtime_loader(label: &str) -> candle::Result<(H3ComfyInt8BlockLoader, PathBuf)> {
+        let (config, header, data) = runtime_fixture();
+        let path = write_fixture(&header, &data, label);
+        let opened = open_h3_comfy_int8_checkpoint(
+            &path,
+            config,
+            H3TransformerTask::T2VaFl2Va,
+            None,
+            None,
+            &H3ComfyNeverCancel,
+        )
+        .map_err(|error| candle::Error::Msg(error.to_string()))?;
+        let (_transformer, loader) = opened.load(&Device::Cpu)?;
+        Ok((loader, path))
+    }
+
+    fn packed_fingerprint(
+        linears: &H3ComfyInt8PackedLinears,
+    ) -> candle::Result<Vec<(Vec<Vec<u8>>, Vec<Vec<f32>>)>> {
+        linears
+            .iter()
+            .map(|linear| {
+                Ok((
+                    linear.weight().to_vec2::<u8>()?,
+                    linear.weight_scale().to_vec2::<f32>()?,
+                ))
+            })
+            .collect()
+    }
+
+    /// File bytes read by one `load_block`, then the block dropped.
+    fn bytes_read_by_load(loader: &mut H3ComfyInt8BlockLoader, index: usize) -> u64 {
+        let before = loader.bytes_read();
+        drop(loader.load_block(index).unwrap());
+        loader.bytes_read() - before
+    }
+
+    #[test]
+    fn host_block_cache_is_off_by_default_on_cpu_and_rereads_every_load() -> candle::Result<()> {
+        let (mut loader, path) = open_runtime_loader("host-cache-off")?;
+        assert!(loader.host_cache.is_none());
+        let first = bytes_read_by_load(&mut loader, 0);
+        let second = bytes_read_by_load(&mut loader, 0);
+        assert_eq!(first, second);
+        assert!(first >= loader.block_memory(0)?.encoded_host_bytes);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn host_block_cache_serves_packed_linears_without_file_reads() -> candle::Result<()> {
+        let (mut cached, cached_path) = open_runtime_loader("host-cache-on")?;
+        let (mut cold, cold_path) = open_runtime_loader("host-cache-cold")?;
+        cached.force_host_block_cache();
+        let packed = |loader: &H3ComfyInt8BlockLoader, index| {
+            loader.block_memory(index).unwrap().encoded_host_bytes
+        };
+
+        // The cold load reads the packed linears plus the block's dense
+        // tensors; a hit reads the dense tensors only.
+        let uncached_load = bytes_read_by_load(&mut cold, 0);
+        let first = bytes_read_by_load(&mut cached, 0);
+        assert_eq!(first, uncached_load);
+        for _ in 0..3 {
+            let before = cached.bytes_read();
+            let again = cached.load_block(0)?;
+            assert_eq!(again.index(), 0);
+            assert_eq!(cached.live_block_count(), 1);
+            assert!(cached.load_block(1).is_err());
+            drop(again);
+            assert_eq!(cached.live_block_count(), 0);
+            assert_eq!(
+                cached.bytes_read() - before,
+                uncached_load - packed(&cached, 0)
+            );
+        }
+
+        let hit = cached.packed_linears(0)?;
+        let reference = cold.packed_linears(0)?;
+        assert_eq!(packed_fingerprint(&hit)?, packed_fingerprint(&reference)?);
+
+        // A block the cache has not seen still reads its packed linears once.
+        let miss = bytes_read_by_load(&mut cached, 1);
+        assert!(miss >= packed(&cached, 1));
+        assert_eq!(
+            bytes_read_by_load(&mut cached, 1),
+            miss - packed(&cached, 1)
+        );
+
+        let _ = std::fs::remove_file(cached_path);
+        let _ = std::fs::remove_file(cold_path);
+        Ok(())
+    }
+
+    #[test]
+    fn host_block_cache_belongs_to_one_loader() -> candle::Result<()> {
+        let (mut first, first_path) = open_runtime_loader("host-cache-owner-a")?;
+        let (mut second, second_path) = open_runtime_loader("host-cache-owner-b")?;
+        first.force_host_block_cache();
+        second.force_host_block_cache();
+        let cold = bytes_read_by_load(&mut first, 0);
+        assert!(bytes_read_by_load(&mut first, 0) < cold);
+        assert_eq!(
+            bytes_read_by_load(&mut second, 0),
+            cold,
+            "a second loader must not see the first loader's cache"
+        );
+        let _ = std::fs::remove_file(first_path);
+        let _ = std::fs::remove_file(second_path);
         Ok(())
     }
 
