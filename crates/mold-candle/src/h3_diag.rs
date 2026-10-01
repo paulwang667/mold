@@ -116,3 +116,39 @@ pub fn span_end_cuda(
 ) -> Result<()> {
     span_end(&Device::Cuda(device.clone()), started, slot)
 }
+
+/// Experiment (`MOLD_H3_POOL_THRESHOLD=1`): keep freed blocks in the CUDA
+/// default memory pool instead of returning them to the driver at every
+/// synchronization point. Applied once per process, before the first native
+/// INT8 op allocates.
+#[cfg(feature = "cuda")]
+pub fn apply_pool_threshold(device: &candle::CudaDevice) {
+    use candle::cuda_backend::cudarc::driver::sys;
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    if !std::env::var("MOLD_H3_POOL_THRESHOLD").is_ok_and(|value| value == "1") {
+        return;
+    }
+    ONCE.call_once(|| {
+        let context = device.cuda_stream().context().clone();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        let mut threshold = u64::MAX;
+        // SAFETY: plain driver calls on a live device; `threshold` outlives them.
+        let status = unsafe {
+            let got = sys::cuDeviceGetDefaultMemPool(&mut pool, context.cu_device());
+            if got != sys::CUresult::CUDA_SUCCESS {
+                got
+            } else {
+                sys::cuMemPoolSetAttribute(
+                    pool,
+                    sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                    (&mut threshold as *mut u64).cast(),
+                )
+            }
+        };
+        tracing::info!(
+            target: "mold::minimax_h3::diag",
+            "H3 diag mempool release threshold set to max status={status:?}"
+        );
+    });
+}

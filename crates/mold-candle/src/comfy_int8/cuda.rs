@@ -236,6 +236,7 @@ impl NativeInt8Linear {
         }
 
         let device = input.device();
+        crate::h3_diag::apply_pool_threshold(device);
         let input = input.as_cuda_slice::<I>()?.slice(input_start..input_end);
         let weight = weight
             .as_cuda_slice::<u8>()?
