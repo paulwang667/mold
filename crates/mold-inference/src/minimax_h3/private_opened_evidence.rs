@@ -2891,6 +2891,128 @@ mod tests {
         (prepared, frozen)
     }
 
+    /// The prepared-request input a refine request produces through the REAL
+    /// preparation path (`prepare_resolved_request` ->
+    /// `ref2va_prepared_request_input`), for a tier and canvas. The input's
+    /// `canonical_model` is the BASE partition, never the tier tag, so nothing
+    /// downstream may derive the tier's refine plan from it.
+    #[cfg(feature = "mp4")]
+    fn refine_prepared_pair(
+        model: &str,
+        width: u32,
+        height: u32,
+    ) -> (
+        super::super::pipeline::ref2va::H3PreparedRef2VaRequest,
+        H3FactoryPreparedRequestInput,
+    ) {
+        use mold_core::{
+            GenerationReference, GenerationReferenceAuthority, GenerationReferenceKind,
+            GenerationReferenceProvenance,
+        };
+
+        let mut request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "model": model,
+            "prompt": "a reviewed reference scene",
+            "width": width,
+            "height": height,
+            "steps": contract::steps_floor_for_model(model),
+            "guidance": 0.0,
+            "strength": 1.0,
+            "batch_size": 1,
+            "output_format": "mp4",
+            "frames": 124,
+            "fps": contract::FIXED_FPS,
+            "seed": 42,
+            "refine": {"scale": 2}
+        }))
+        .unwrap();
+        request.references = Some(vec![GenerationReference::Image {
+            media: GenerationReferenceAuthority::Descriptor,
+            provenance: GenerationReferenceProvenance {
+                name: Some("portrait.png".to_string()),
+                sha256: Some(sha256(b"reference-bytes")),
+                crop: None,
+            },
+            mime_type: "image/png".into(),
+            width: 640,
+            height: 640,
+        }]);
+        let mut observer = super::super::pipeline::NoopH3PipelineObserver;
+        let prepared = super::super::pipeline::ref2va::prepare_resolved_request(
+            &request,
+            &ProgressReporter::default(),
+            &mut observer,
+        )
+        .unwrap();
+        let decoded = vec![super::super::pipeline::ref2va::H3DecodedReferenceFacts {
+            index: 1,
+            kind: GenerationReferenceKind::Image,
+            width: Some(4_000),
+            height: Some(3_000),
+            frame_count: None,
+            fps: None,
+            audio: None,
+        }];
+        let references = ref2va_factory_references(prepared.references(), &decoded).unwrap();
+        let frozen = ref2va_prepared_request_input(&request, &prepared, references, 96).unwrap();
+        (prepared, frozen)
+    }
+
+    /// EXPERIMENT (4-step refine): a refine request on EACH refine tier, run
+    /// through the real preparation, yields a prepared-request authority that
+    /// the factory validator and the runtime evidence validator both accept.
+    /// The 4-step tier (5 grid points, start index 2, 4 + 2 forwards) used to
+    /// be refused as "prepared request authority is internally inconsistent"
+    /// because the validator looked the plan up from `canonical_model`, which
+    /// is the base partition.
+    #[cfg(feature = "mp4")]
+    #[test]
+    fn refine_prepared_authority_is_accepted_on_every_refine_tier() {
+        for (model, grid_points, start_index, forwards) in [
+            (contract::REF2VA_COMFY_TURBO_4STEP, 5, 2, 4),
+            (contract::REF2VA_COMFY_TURBO_8STEP_768P, 9, 4, 8),
+        ] {
+            let (prepared, frozen) = refine_prepared_pair(model, 1344, 576);
+            let plan = prepared.refine().expect("a refine plan");
+            assert_eq!(plan.start_index, start_index, "{model}");
+            assert_eq!(frozen.grid_points, grid_points, "{model}");
+            assert_eq!(frozen.denoise_forward_count, forwards, "{model}");
+            assert_eq!(frozen.refine, Some(plan), "{model}");
+            assert_eq!(frozen.canonical_model, contract::REF2VA_COMFY);
+            assert_eq!(
+                plan.total_forwards(forwards as usize),
+                Some(forwards as usize + (forwards as usize - start_index)),
+                "{model}"
+            );
+            crate::h3_factory::validate_prepared_request(&frozen)
+                .unwrap_or_else(|error| panic!("{model}: {error}"));
+            validate_prepared_ref2va_runtime_request(&prepared, &frozen)
+                .unwrap_or_else(|error| panic!("{model}: {error}"));
+        }
+    }
+
+    /// A plan that belongs to another grid is still refused: the 8-step plan
+    /// on a 5-point grid, the 4-step plan on a 9-point grid, a late index.
+    #[cfg(feature = "mp4")]
+    #[test]
+    fn refine_prepared_authority_refuses_a_plan_from_another_grid() {
+        let reseal = |frozen: &mut H3FactoryPreparedRequestInput| {
+            frozen.identity_sha256 = expected_h3_factory_prepared_request_identity(frozen);
+        };
+        let (_, four) = refine_prepared_pair(contract::REF2VA_COMFY_TURBO_4STEP, 1344, 576);
+        let mut crossed = four.clone();
+        crossed.refine = Some(contract::RefinePlan::PUBLISHED);
+        reseal(&mut crossed);
+        assert!(crate::h3_factory::validate_prepared_request(&crossed).is_err());
+        let mut late = four;
+        late.refine = Some(contract::RefinePlan {
+            start_index: 3,
+            ..contract::RefinePlan::PUBLISHED
+        });
+        reseal(&mut late);
+        assert!(crate::h3_factory::validate_prepared_request(&late).is_err());
+    }
+
     #[test]
     fn opened_authorities_and_prepared_attempt_are_single_consumption() {
         trait AmbiguousIfClone<Marker> {

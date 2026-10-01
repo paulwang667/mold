@@ -35,7 +35,12 @@ The other 4-step tier (`...-turbo-4step-r21`, rank-21 resize) is NOT enabled.
   tier's grid points) all read it. `H3_REFINE_START_INDEX` still means the
   8-step tier; `RefinePlan::PUBLISHED` is still the 8-step plan.
 - `mold-inference::h3_factory`: the prepared-request validator holds the plan to
-  the plan of the request's own tier (`canonical_model`), not to `PUBLISHED`.
+  `RefinePlan::for_grid_points_scale(request.grid_points, ..)` (9 points -> 4,
+  5 points -> 2). A prepared request carries its grid but NOT the tier tag: its
+  `canonical_model` is the base partition (`REF2VA_COMFY`), so a lookup by
+  model there refused every real 4-step refine request ("prepared request
+  authority is internally inconsistent"). `refine_start_index_for_grid_points`
+  is derived from the same tier table as `refine_start_index_for_model`.
 - `mold-server::h3_admission`: the prepared shape carries no model, so it checks
   `RefinePlan::is_tier_plan` (any tier's plan); the model-aware comparison
   already happened at the request door.

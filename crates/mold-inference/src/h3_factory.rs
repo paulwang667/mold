@@ -2090,7 +2090,7 @@ fn validate_prepared_references(
     Ok(totals)
 }
 
-fn validate_prepared_request(request: &H3FactoryPreparedRequestInput) -> Result<()> {
+pub(crate) fn validate_prepared_request(request: &H3FactoryPreparedRequestInput) -> Result<()> {
     for (value, label) in [
         (&request.identity_sha256, "H3 prepared request"),
         (&request.prompt_sha256, "H3 prepared prompt"),
@@ -2228,10 +2228,12 @@ fn validate_prepared_request(request: &H3FactoryPreparedRequestInput) -> Result<
         || !request.height.is_multiple_of(contract::DIMENSION_ALIGNMENT)
         || pixel_count > contract::request_max_pixels(canvas_rule)
         || request.refine.is_some_and(|plan| {
-            // The plan is the one this request's TIER runs (EXPERIMENT: the
-            // 4-step tier re-enters at index 2, the 8-step tier at index 4).
+            // The plan is the one this request's grid runs (EXPERIMENT: the
+            // 4-step tier's 5 points re-enter at index 2, the 8-step tier's 9
+            // at index 4). `canonical_model` is the BASE partition here, never
+            // the tier tag, so the tier is read off `grid_points`.
             Some(plan)
-                != contract::RefinePlan::for_model_scale(&request.canonical_model, plan.scale)
+                != contract::RefinePlan::for_grid_points_scale(request.grid_points, plan.scale)
                 || request.task != Task::Ref2va
                 || !contract::is_admitted_refine_final_canvas(request.width, request.height)
         })
@@ -5563,55 +5565,55 @@ mod tests {
         );
         validate_prepared_request(&plain).unwrap();
 
-        // The plan is the one the request's TIER runs, so the canonical model
-        // is the tier tag (EXPERIMENT: the 8-step and 4-step tiers differ).
-        let planned = reseal(H3FactoryPreparedRequestInput {
-            canonical_model: contract::REF2VA_COMFY_TURBO_8STEP_768P.into(),
+        // The plan is the one the request's GRID runs (a prepared request
+        // carries `grid_points`, not the tier tag; `canonical_model` is the
+        // base partition). The 8-step tier is 9 points / 8 forwards.
+        let eight_step = |request: H3FactoryPreparedRequestInput| H3FactoryPreparedRequestInput {
+            grid_points: 9,
+            denoise_forward_count: 8,
+            ..request
+        };
+        let planned = reseal(eight_step(H3FactoryPreparedRequestInput {
             refine: Some(contract::RefinePlan::PUBLISHED),
             ..plain.clone()
-        });
+        }));
         assert_ne!(planned.identity_sha256, plain.identity_sha256);
         validate_prepared_request(&planned).expect("1344x768 splits into 672x384");
-        let later = reseal(H3FactoryPreparedRequestInput {
-            canonical_model: contract::REF2VA_COMFY_TURBO_8STEP_768P.into(),
+        let later = reseal(eight_step(H3FactoryPreparedRequestInput {
             refine: Some(contract::RefinePlan {
                 start_index: 5,
                 ..contract::RefinePlan::PUBLISHED
             }),
             ..plain.clone()
-        });
+        }));
         assert_ne!(later.identity_sha256, planned.identity_sha256);
         assert!(
             validate_prepared_request(&later).is_err(),
             "not the tier's plan"
         );
 
-        // EXPERIMENT (throwaway): the 4-step tier's plan (index 2) validates on
-        // the 4-step tag only; the 8-step plan on the 4-step tag, and the
-        // 4-step plan on the 8-step tag, are refused even when resealed.
+        // EXPERIMENT (throwaway): the 4-step tier (5 points, 4 forwards -- the
+        // fixture's own grid) re-enters at index 2. The 8-step plan on that
+        // grid, and the 4-step plan on the 9-point grid, are refused even when
+        // resealed.
         let plan4 =
             contract::RefinePlan::for_model_scale(contract::REF2VA_COMFY_TURBO_4STEP, 2).unwrap();
         let planned4 = reseal(H3FactoryPreparedRequestInput {
-            canonical_model: contract::REF2VA_COMFY_TURBO_4STEP.into(),
             refine: Some(plan4),
             ..plain.clone()
         });
         assert_ne!(planned4.identity_sha256, planned.identity_sha256);
         validate_prepared_request(&planned4).expect("the 4-step tier's own plan");
-        for (model, plan) in [
-            (
-                contract::REF2VA_COMFY_TURBO_4STEP,
-                contract::RefinePlan::PUBLISHED,
-            ),
-            (contract::REF2VA_COMFY_TURBO_8STEP_768P, plan4),
-        ] {
-            let crossed = reseal(H3FactoryPreparedRequestInput {
-                canonical_model: model.into(),
-                refine: Some(plan),
-                ..plain.clone()
-            });
-            assert!(validate_prepared_request(&crossed).is_err(), "{model}");
-        }
+        let crossed_eight = reseal(H3FactoryPreparedRequestInput {
+            refine: Some(contract::RefinePlan::PUBLISHED),
+            ..plain.clone()
+        });
+        assert!(validate_prepared_request(&crossed_eight).is_err());
+        let crossed_four = reseal(eight_step(H3FactoryPreparedRequestInput {
+            refine: Some(plan4),
+            ..plain.clone()
+        }));
+        assert!(validate_prepared_request(&crossed_four).is_err());
 
         // A plan on an FL2VA request is refused even when the identity is
         // honestly resealed.
@@ -6255,18 +6257,19 @@ mod tests {
         let checkpoint = raw_checkpoint();
         let plain_request = ref2va_prepared_request();
         let plain = target_budget(&plain_request, &checkpoint);
-        let planned_request_on = |model: &str, plan: contract::RefinePlan| {
+        // The plan is validated against the request's grid (9 points for the
+        // 8-step tier, the fixture's own 5 for the 4-step tier).
+        let planned_request_on = |grid_points: u32, plan: contract::RefinePlan| {
             let mut request = H3FactoryPreparedRequestInput {
-                canonical_model: model.into(),
+                grid_points,
+                denoise_forward_count: grid_points - 1,
                 refine: Some(plan),
                 ..plain_request.clone()
             };
             request.identity_sha256 = expected_prepared_request_identity(&request);
             request
         };
-        let planned_request = |plan: contract::RefinePlan| {
-            planned_request_on(contract::REF2VA_COMFY_TURBO_8STEP_768P, plan)
-        };
+        let planned_request = |plan: contract::RefinePlan| planned_request_on(9, plan);
         let published = planned_request(contract::RefinePlan::PUBLISHED);
         let later = planned_request(contract::RefinePlan {
             start_index: 5,
@@ -6294,7 +6297,7 @@ mod tests {
         // identity and validates against its own request.
         let plan4 =
             contract::RefinePlan::for_model_scale(contract::REF2VA_COMFY_TURBO_4STEP, 2).unwrap();
-        let request4 = planned_request_on(contract::REF2VA_COMFY_TURBO_4STEP, plan4);
+        let request4 = planned_request_on(5, plan4);
         let budget4 = target_budget(&request4, &checkpoint);
         assert_eq!(budget4.refine, Some(plan4));
         assert_ne!(budget4.identity_sha256, with_plan.identity_sha256);

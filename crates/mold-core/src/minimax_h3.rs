@@ -666,6 +666,23 @@ pub const REFINE_FINAL_ALIGNMENT: u32 = H3_REFINE_SCALE * VIDEO_ROW_STRIDE;
 /// is not admitted.
 pub const REFINE_MAX_PIXELS: u64 = 1920 * 1088;
 
+/// The refine models, in one place: every reader that must go from a tier to
+/// its grid or plan iterates this, so a tier cannot be enabled in one reader and
+/// forgotten in another.
+const REFINE_MODELS: [&str; 2] = [REF2VA_COMFY_TURBO_8STEP_768P, REF2VA_COMFY_TURBO_4STEP];
+
+/// The re-entry index for a prepared request's sigma-grid length. A prepared
+/// request (the factory/admission authority) carries its `grid_points` but NOT
+/// the tier tag -- its `canonical_model` is the base partition -- so the tier
+/// is recovered from the grid the tier owns: 9 points -> 4, 5 points -> 2.
+/// Agrees with [`refine_start_index_for_model`] by construction.
+pub fn refine_start_index_for_grid_points(grid_points: u32) -> Option<u32> {
+    REFINE_MODELS
+        .into_iter()
+        .find(|model| steps_floor_for_model(model) == grid_points)
+        .and_then(refine_start_index_for_model)
+}
+
 /// Whether a model identity can run `refine`: the Ref2VA Turbo tiers
 /// [`refine_start_index_for_model`] names (8-step 768p; plus the 4-step tier in
 /// this EXPERIMENT branch). They are the tiers whose sampler is an Euler
@@ -738,6 +755,15 @@ impl RefinePlan {
     /// a model that cannot refine.
     pub fn for_model_scale(model: &str, scale: u32) -> Option<Self> {
         let start_index = usize::try_from(refine_start_index_for_model(model)?).ok()?;
+        (scale == H3_REFINE_SCALE).then_some(Self { scale, start_index })
+    }
+
+    /// The plan a prepared request's grid length runs, for a `scale`: the
+    /// published scale and [`refine_start_index_for_grid_points`]. This is the
+    /// tier-correct plan wherever only `grid_points` is known (the prepared
+    /// request authority); `None` for another scale or a grid no tier refines on.
+    pub fn for_grid_points_scale(grid_points: u32, scale: u32) -> Option<Self> {
+        let start_index = usize::try_from(refine_start_index_for_grid_points(grid_points)?).ok()?;
         (scale == H3_REFINE_SCALE).then_some(Self { scale, start_index })
     }
 
@@ -4771,6 +4797,37 @@ mod tests {
         let mut r21 = refine_request_4step();
         r21.model = REF2VA_COMFY_TURBO_4STEP_R21.to_string();
         assert_eq!(refine_code(&r21), "MINIMAX_H3_REFINE_TIER");
+    }
+
+    #[test]
+    fn the_refine_plan_follows_the_grid_a_prepared_request_carries() {
+        // A prepared request has grid_points but no tier tag.
+        assert_eq!(refine_start_index_for_grid_points(9), Some(4));
+        assert_eq!(refine_start_index_for_grid_points(5), Some(2));
+        for grid_points in [0, 1, 2, 3, 4, 6, 8, 10, 21] {
+            assert_eq!(refine_start_index_for_grid_points(grid_points), None);
+        }
+        for model in REFINE_MODELS {
+            assert_eq!(
+                refine_start_index_for_grid_points(steps_floor_for_model(model)),
+                refine_start_index_for_model(model),
+                "{model}"
+            );
+            assert_eq!(
+                RefinePlan::for_grid_points_scale(steps_floor_for_model(model), 2),
+                RefinePlan::for_model_scale(model, 2),
+                "{model}"
+            );
+        }
+        // Every refine-capable reviewed model is in REFINE_MODELS.
+        for model in REVIEWED_COMPACT_MODELS {
+            assert_eq!(
+                refine_start_index_for_model(model).is_some(),
+                REFINE_MODELS.contains(model),
+                "{model}"
+            );
+        }
+        assert_eq!(RefinePlan::for_grid_points_scale(5, 3), None);
     }
 
     #[test]
