@@ -260,7 +260,7 @@ impl ForwardDiag {
             "H3 diag spans {}/{} rows={} qkv_ms={:.1} prep_ms={:.1} attn_ms={:.1} out_ms={:.1} \
              fc1_ms={:.1} act_ms={:.1} fc2_ms={:.1} rest_ms={:.1} gpu_ms={:.1} \
              inner_rotate_ms={:.1} inner_quant_ms={:.1} inner_gemm_ms={:.1} inner_dequant_ms={:.1} \
-             inner_turbo_ms={:.1}",
+             inner_turbo_ms={:.1} inner_alloc_ms={:.1} inner_free_ms={:.1}",
             forward.index,
             total_label,
             forward.rows,
@@ -278,6 +278,8 @@ impl ForwardDiag {
             ms(spans[9]),
             ms(spans[10]),
             ms(spans[11]),
+            ms(spans[12]),
+            ms(spans[13]),
         );
         tracing::info!(
             target: "mold::minimax_h3::diag",

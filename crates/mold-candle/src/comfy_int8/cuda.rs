@@ -244,12 +244,14 @@ impl NativeInt8Linear {
         let stream = device.cuda_stream();
         // SAFETY: Every allocation is fully written by the queued kernel/GEMM
         // before it is read or wrapped as the returned Candle storage.
+        let diag_span = crate::h3_diag::span_begin_cuda(device)?;
         let quantized = unsafe { stream.alloc::<i8>(self.rows * self.inner) }.w()?;
         let input_scales = unsafe { stream.alloc::<f32>(self.rows) }.w()?;
         let mut accumulator = unsafe { stream.alloc::<i32>(self.rows * self.columns) }.w()?;
         let mut workspace =
             unsafe { stream.alloc::<u8>(NATIVE_INT8_CUBLAS_WORKSPACE_BYTES) }.w()?;
         let output = unsafe { stream.alloc::<O>(self.rows * self.columns) }.w()?;
+        crate::h3_diag::span_end_cuda(device, diag_span, 12)?;
 
         let quantize_name = match I::DTYPE {
             DType::F32 => "h3_quantize_int8_rowwise_f32",
@@ -346,6 +348,13 @@ impl NativeInt8Linear {
         // SAFETY: Kernel arguments and launch geometry match the compiled signature.
         unsafe { builder.launch(cfg) }.w()?;
         crate::h3_diag::span_end_cuda(device, diag_span, 10)?;
+
+        let diag_span = crate::h3_diag::span_begin_cuda(device)?;
+        drop(quantized);
+        drop(input_scales);
+        drop(accumulator);
+        drop(workspace);
+        crate::h3_diag::span_end_cuda(device, diag_span, 13)?;
 
         Ok((
             CudaStorage::wrap_cuda_slice(output, device.clone()),
