@@ -4,9 +4,10 @@ Status: plan, 2026-10-01. Branch `aiva/h3-refine`, based on the research
 prototype `aiva/h3-refine-proto` (env-gated; measurements in "Evidence").
 Phases 1 and 2 landed together on this branch (2026-10-01): the contract, door
 rules, canvas-rule split, capability advertisement, plan-driven pipeline, ledger
-and two-pass provenance exist and the environment gate is gone. The memory
-waivers in `private_server.rs` (marked `PHASE-3`) and the open bitrate question
-remain; phases 3 to 6 are untouched.
+and two-pass provenance exist and the environment gate is gone. Phase 3a
+removed the memory waivers in `private_server.rs`: strict admission applies to a
+refine request exactly as to any other. The open bitrate question and the rest
+of phases 3 to 6 remain.
 
 Fork-only: this does not target upstream `utensils/mold`, so the upstream
 reviewed-IDs-only / qualification-record rules bind only where they already bind
@@ -110,9 +111,14 @@ pulled the subject back to the left bias).
 - Add `RefinePlan` and both passes' row counts to the prepared-request input;
   the hash gains the new bytes ONLY when `refine` is present. A test pins the
   no-refine identity as byte-identical to before.
-- The prototype waives the extrapolated memory refusals under `uncap`; the
-  product removes the waiver. Phase 3 first measures the PEAK (not the
-  free-at-end figure) for 1344×768, 1536×640, 1920×1088 and re-derives
+- The prototype waived the extrapolated memory refusals under `uncap`; the
+  waivers are gone (phase 3a). A 2560×1408 refine render on a 46 GB L20 ran with
+  zero waiver log lines, i.e. the strict checks already accepted the whole
+  phase-1 range (final canvas <= 1920×1088), so the waivers were never
+  exercised. Neither memory gate takes a refine argument any more; a refine
+  request whose predicted peak exceeds the sample is refused with the same typed
+  headroom shortfall as any other request. Phase 3 still measures the PEAK (not
+  the free-at-end figure) for 1344×768, 1536×640, 1920×1088 and may re-derive
   `public_ref2va_runtime_bounds_for_shape` for the refine range from those,
   with a margin. Measured so far (free VRAM at the end of pass 2, 46 GB L20):
   1920×1088 ≈ 23 GB used, 2560×1408 ≈ 33 GB used.
@@ -140,7 +146,7 @@ pulled the subject back to the left bias).
 |---|---|---|
 | 1 | Contract: `RefineRequest`, `OutputMetadata`, door rules, canvas rule split, generation-profile/capability advertisement, generated files, TS types, CLI flag, delete the env gate | `cargo check` of the touched crates; unit tests for every rule; no-refine requests unchanged |
 | 2 | Pipeline: `refine.rs`, plan-driven `execute_staged`, ledger, two-pass provenance, bitrate decision | synthetic-backend tests for gated and closed paths; release-contract script passes unmodified |
-| 3 | Admission, budget, identity: prepared-request + target-budget identity (version-gated), row caps, remove waivers, measure peaks and re-derive bounds | identity byte-equality test; measured peak table committed to `docs/qualification/minimax-h3.md` |
+| 3 | Admission, budget, identity: prepared-request + target-budget identity (version-gated), row caps, (waivers removed, 3a) measure peaks and re-derive bounds | identity byte-equality test; measured peak table committed to `docs/qualification/minimax-h3.md` |
 | 4 | CI + qualification: CUDA-host server tests, runtime-identity re-capture, docs, changelog | CI contracts green; recorded captures |
 | 5 | aiva: config, final-canvas selection, artifact fingerprint, cost model, run card, draft tier, meta | aiva four gates; no-refine artifacts unchanged |
 | 6 | Validation: multi-seed, second character/scene, identity and temporal stability, A/B vs post-hoc SR, learned upscaler decision | written verdict, kept in memory and qualification doc |

@@ -1843,8 +1843,9 @@ What was measured by the research prototype (single character/scene, seed
   These are not peaks.
 
 Open until phase 3: the measured PEAK table for 1344x768, 1536x640 and
-1920x1088, and the Ref2VA runtime bounds re-derived for the refine range. Until
-then admission waives the extrapolated memory refusals for a request that
-carries a plan (each waiver is marked `PHASE-3` in `private_server.rs`), and
-private-UAT builds, which validate against external campaign records under the
-compact rule, refuse refine at the envelope.
+1920x1088, and the Ref2VA runtime bounds possibly re-derived for the refine
+range. Admission applies the strict memory checks to a refine request exactly as
+to any other (the phase-1 waivers are removed; a 2560x1408 render on a 46 GB L20
+logged no waiver, so none was ever exercised), and private-UAT builds, which
+validate against external campaign records under the compact rule, refuse
+refine at the envelope.

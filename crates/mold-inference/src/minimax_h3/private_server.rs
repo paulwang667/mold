@@ -729,51 +729,6 @@ fn precheck_private_h3_admission_capacity(
     compute_capability: Option<(u16, u16)>,
     available_device_bytes: u64,
     available_host_headroom_bytes: u64,
-    refine: Option<contract::RefinePlan>,
-) -> Result<()> {
-    let strict = precheck_private_h3_admission_capacity_strict(
-        bounds,
-        compute_capability,
-        available_device_bytes,
-        available_host_headroom_bytes,
-    );
-    // PHASE-3: remove (plan docs/plans/h3-refine-productization.md)
-    waive_memory_shortfall_for_refine("admission floor", refine, strict)
-}
-
-/// PHASE-3: remove (plan docs/plans/h3-refine-productization.md).
-///
-/// The linear workspace grants are extrapolated from a 1344x768 measurement, so
-/// at a multi-megapixel FINAL canvas they can exceed a card the render would in
-/// fact fit (or, honestly, not). Until phase 3 measures the peak and re-derives
-/// the bounds for the refine range, a memory shortfall of a request that
-/// carries a [`contract::RefinePlan`] is logged with both numbers and waived; a
-/// real OOM then surfaces from the device. A request without one gets the
-/// result as-is.
-#[cfg(feature = "mp4")]
-fn waive_memory_shortfall_for_refine(
-    what: &str,
-    refine: Option<contract::RefinePlan>,
-    outcome: Result<()>,
-) -> Result<()> {
-    match outcome {
-        Err(error) if refine.is_some() => {
-            tracing::warn!(
-                target: "mold::minimax_h3::refine",
-                "H3 refine: waiving {what} memory refusal ({error:#}); the run may OOM on the device"
-            );
-            Ok(())
-        }
-        other => other,
-    }
-}
-
-#[cfg(feature = "mp4")]
-fn precheck_private_h3_admission_capacity_strict(
-    bounds: &H3PrivateRuntimeBoundRecord,
-    compute_capability: Option<(u16, u16)>,
-    available_device_bytes: u64,
-    available_host_headroom_bytes: u64,
 ) -> Result<()> {
     let device_floor = private_h3_admission_device_floor_bytes(bounds)?;
     let host_floor = private_h3_admission_host_floor_bytes(bounds)?;
@@ -893,37 +848,6 @@ fn precheck_private_h3_record_canvas(
 /// nothing here may route through the fatal-CUDA quarantine.
 #[cfg(feature = "mp4")]
 fn check_private_h3_target_budget_fits(
-    predicted_device_peak_bytes: u64,
-    predicted_host_increment_bytes: u64,
-    compute_capability: Option<(u16, u16)>,
-    available_device_bytes: u64,
-    available_host_headroom_bytes: u64,
-    refine: Option<contract::RefinePlan>,
-) -> Result<()> {
-    let strict = check_private_h3_target_budget_fits_strict(
-        predicted_device_peak_bytes,
-        predicted_host_increment_bytes,
-        compute_capability,
-        available_device_bytes,
-        available_host_headroom_bytes,
-    );
-    // PHASE-3: remove (plan docs/plans/h3-refine-productization.md)
-    if strict.is_ok() || refine.is_none() {
-        return strict;
-    }
-    tracing::warn!(
-        target: "mold::minimax_h3::refine",
-        predicted_device_peak_bytes,
-        predicted_host_increment_bytes,
-        available_device_bytes,
-        available_host_headroom_bytes,
-        "H3 refine: predicted target budget exceeds the admission sample"
-    );
-    waive_memory_shortfall_for_refine("target budget", refine, strict)
-}
-
-#[cfg(feature = "mp4")]
-fn check_private_h3_target_budget_fits_strict(
     predicted_device_peak_bytes: u64,
     predicted_host_increment_bytes: u64,
     compute_capability: Option<(u16, u16)>,
@@ -1711,10 +1635,6 @@ impl H3PrivateFl2VaAdmissionEvidence {
         available_device_bytes: u64,
         available_host_headroom_bytes: u64,
     ) -> Result<()> {
-        // PHASE-3: remove (plan docs/plans/h3-refine-productization.md).
-        // A request that carries a refine plan has the four memory-vs-sample
-        // comparisons below waived, exactly as admission waived them.
-        let refine_waiver = contract::RefinePlan::for_request(request).is_some();
         self.validate_resolved_request(request)?;
         self.base_factory_authority.validate_engine_seam(
             &self.canonical_model,
@@ -1806,24 +1726,19 @@ impl H3PrivateFl2VaAdmissionEvidence {
             ),
             (
                 "available device bytes >= predicted device peak",
-                // PHASE-3: remove (waived for a refine request; see
-                // `waive_memory_shortfall_for_refine`).
-                refine_waiver || available_device_bytes >= self.predicted_device_peak_bytes,
+                available_device_bytes >= self.predicted_device_peak_bytes,
             ),
             (
                 "available host headroom >= predicted host increment",
-                refine_waiver
-                    || available_host_headroom_bytes >= self.predicted_host_increment_bytes,
+                available_host_headroom_bytes >= self.predicted_host_increment_bytes,
             ),
             (
                 "admitted available device bytes >= predicted device peak",
-                refine_waiver
-                    || self.admitted_available_device_bytes >= self.predicted_device_peak_bytes,
+                self.admitted_available_device_bytes >= self.predicted_device_peak_bytes,
             ),
             (
                 "admitted host headroom >= predicted host increment",
-                refine_waiver
-                    || self.admitted_host_headroom_bytes >= self.predicted_host_increment_bytes,
+                self.admitted_host_headroom_bytes >= self.predicted_host_increment_bytes,
             ),
             (
                 "prepared request identity",
@@ -2134,7 +2049,6 @@ fn prepare_reviewed_h3_private_fl2va_admission(
         compute_capability,
         available_device_bytes,
         available_host_headroom_bytes,
-        contract::RefinePlan::for_request(request),
     )?;
     // The prepared request is built BEFORE that artifact pass for the same
     // reason the capacity floors are checked before it: the conditioner
@@ -2504,7 +2418,6 @@ fn prepare_reviewed_h3_private_fl2va_admission(
         compute_capability,
         available_device_bytes,
         available_host_headroom_bytes,
-        contract::RefinePlan::for_request(request),
     )?;
     let budget_echo = H3FactoryExecutionBudgetEchoInput {
         prepared_attempt_identity_sha256: prepared_attempt.identity_sha256.clone(),
@@ -10215,7 +10128,6 @@ mod tests {
                 Some((8, 9)),
                 SM89_CAMPAIGN_DEVICE_SAMPLE_BYTES,
                 SM89_CAMPAIGN_HOST_SAMPLE_BYTES,
-                None,
             )
             .unwrap();
             // Pin the derived floors so any re-derivation of the ceilings is
@@ -11084,24 +10996,21 @@ mod tests {
                 bounds,
                 Some((8, 9)),
                 device_floor.saturating_sub(1),
-                u64::MAX,
-                None
+                u64::MAX
             )
             .is_err());
             assert!(precheck_private_h3_admission_capacity(
                 bounds,
                 Some((8, 9)),
                 u64::MAX,
-                host_floor.saturating_sub(1),
-                None
+                host_floor.saturating_sub(1)
             )
             .is_err());
             assert!(precheck_private_h3_admission_capacity(
                 bounds,
                 Some((8, 9)),
                 device_floor,
-                host_floor,
-                None
+                host_floor
             )
             .is_ok());
 
@@ -11110,11 +11019,10 @@ mod tests {
                 bounds,
                 None,
                 unified_floor.saturating_sub(1),
-                1,
-                None
+                1
             )
             .is_err());
-            precheck_private_h3_admission_capacity(bounds, None, unified_floor, 1, None).unwrap();
+            precheck_private_h3_admission_capacity(bounds, None, unified_floor, 1).unwrap();
         }
     }
 
@@ -11131,7 +11039,6 @@ mod tests {
             Some((8, 9)),
             9_000_000_000,
             7_000_000_000,
-            None,
         )
         .unwrap();
 
@@ -11141,7 +11048,6 @@ mod tests {
             Some((8, 9)),
             9_000_000_000,
             7_000_000_000,
-            None,
         )
         .unwrap_err()
         .to_string();
@@ -11156,7 +11062,6 @@ mod tests {
             Some((8, 9)),
             9_000_000_000,
             7_000_000_000,
-            None,
         )
         .unwrap_err()
         .to_string();
@@ -11165,22 +11070,14 @@ mod tests {
         assert!(host.contains("host"), "{host}");
         assert!(!host.contains("device"), "{host}");
 
-        check_private_h3_target_budget_fits(
-            9_000_000_000,
-            7_000_000_000,
-            None,
-            9_000_000_000,
-            1,
-            None,
-        )
-        .unwrap();
+        check_private_h3_target_budget_fits(9_000_000_000, 7_000_000_000, None, 9_000_000_000, 1)
+            .unwrap();
         let metal = check_private_h3_target_budget_fits(
             9_000_000_001,
             7_000_000_000,
             None,
             9_000_000_000,
             1,
-            None,
         )
         .unwrap_err()
         .to_string();
@@ -11210,7 +11107,6 @@ mod tests {
             Some((8, 9)),
             u64::MAX,
             host_floor.saturating_sub(1),
-            None,
         )
         .unwrap_err();
         assert!(!floor_error.to_string().contains("device"), "{floor_error}");
@@ -11229,7 +11125,6 @@ mod tests {
             Some((8, 9)),
             9_000_000_000,
             12_659_979_674,
-            None,
         )
         .unwrap_err()
         .downcast::<H3PrivateHostHeadroomShortfall>()
@@ -11243,11 +11138,60 @@ mod tests {
         // A device shortfall must NOT be classified as one, or a reclaim would
         // evict the cache for memory eviction cannot supply.
         let device_error =
-            precheck_private_h3_admission_capacity(&bounds, Some((8, 9)), 0, u64::MAX, None)
-                .unwrap_err();
+            precheck_private_h3_admission_capacity(&bounds, Some((8, 9)), 0, u64::MAX).unwrap_err();
         assert!(device_error
             .downcast::<H3PrivateHostHeadroomShortfall>()
             .is_err());
+    }
+
+    /// A refine request is admitted by the SAME memory gates as every other
+    /// request: neither gate takes a refine argument, so a final canvas the
+    /// sample cannot hold is refused with the typed shortfall, device and host
+    /// alike, and the sample that exactly covers the floor passes.
+    #[cfg(all(feature = "mp4", feature = "h3"))]
+    #[test]
+    fn a_refine_request_is_refused_by_the_strict_memory_gates_like_any_other() {
+        let canvas = (1920, 1088);
+        assert!(contract::is_admitted_refine_final_canvas(
+            canvas.0, canvas.1
+        ));
+        let bounds = public_runtime_bounds_for_shape(canvas, contract::DEFAULT_COMPACT_FRAMES);
+        let device_floor = private_h3_admission_device_floor_bytes(&bounds).unwrap();
+        let host_floor = private_h3_admission_host_floor_bytes(&bounds).unwrap();
+
+        precheck_private_h3_admission_capacity(&bounds, Some((8, 9)), device_floor, host_floor)
+            .unwrap();
+        let device = precheck_private_h3_admission_capacity(
+            &bounds,
+            Some((8, 9)),
+            device_floor - 1,
+            u64::MAX,
+        )
+        .unwrap_err()
+        .downcast::<H3PrivateDeviceHeadroomShortfall>()
+        .expect("a refine canvas below the device floor is a typed device shortfall");
+        assert_eq!(device.required_device_bytes, device_floor);
+        assert_eq!(device.available_device_bytes, device_floor - 1);
+        let host =
+            precheck_private_h3_admission_capacity(&bounds, Some((8, 9)), u64::MAX, host_floor - 1)
+                .unwrap_err()
+                .downcast::<H3PrivateHostHeadroomShortfall>()
+                .expect("a refine canvas below the host floor is a typed host shortfall");
+        assert_eq!(host.required_host_bytes, host_floor);
+
+        // The exact target budget: a predicted peak above the sample refuses.
+        let peak = 40_000_000_000;
+        check_private_h3_target_budget_fits(peak, 1, Some((8, 9)), peak, 1).unwrap();
+        let device = check_private_h3_target_budget_fits(peak, 1, Some((8, 9)), peak - 1, 1)
+            .unwrap_err()
+            .downcast::<H3PrivateDeviceHeadroomShortfall>()
+            .expect("a refine predicted peak above the sample is a typed device shortfall");
+        assert_eq!(device.required_device_bytes, peak);
+        assert_eq!(device.available_device_bytes, peak - 1);
+        check_private_h3_target_budget_fits(1, 9, Some((8, 9)), u64::MAX, 8)
+            .unwrap_err()
+            .downcast::<H3PrivateHostHeadroomShortfall>()
+            .expect("a refine predicted host increment above the headroom is typed");
     }
 
     /// #1272's rule, applied to the whole memory boundary: a budget refusal is
@@ -11285,7 +11229,6 @@ mod tests {
                 Some((8, 9)),
                 device_floor.saturating_sub(1),
                 u64::MAX,
-                None,
             )
             .unwrap_err(),
         );
@@ -11302,8 +11245,7 @@ mod tests {
                     &bounds,
                     Some((8, 9)),
                     u64::MAX,
-                    host_floor.saturating_sub(1),
-                    None,
+                    host_floor.saturating_sub(1)
                 )
                 .unwrap_err(),
             )
@@ -11317,7 +11259,6 @@ mod tests {
                 None,
                 unified_floor.saturating_sub(1),
                 0,
-                None,
             )
             .unwrap_err(),
         );
@@ -11331,7 +11272,6 @@ mod tests {
                 Some((8, 9)),
                 9_000_000_000,
                 7_000_000_000,
-                None,
             )
             .unwrap_err(),
         );
@@ -11346,8 +11286,7 @@ mod tests {
                     7_000_000_001,
                     Some((8, 9)),
                     9_000_000_000,
-                    7_000_000_000,
-                    None,
+                    7_000_000_000
                 )
                 .unwrap_err(),
             )
@@ -11362,7 +11301,6 @@ mod tests {
                 None,
                 9_000_000_000,
                 1,
-                None,
             )
             .unwrap_err(),
         );
