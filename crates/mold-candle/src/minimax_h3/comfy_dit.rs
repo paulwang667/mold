@@ -8,7 +8,9 @@
 //! sizes and content digests are pinned to the Comfy-Org repository revision
 //! below. Header inspection remains payload-free; the additive INT8 primitive
 //! fully authenticates and retains one opened descriptor before loading
-//! protected resident tensors or one CPU-packed main block at a time.
+//! protected resident tensors and then stages one main block at a time to the
+//! execution device; on CUDA the loader keeps the CPU-packed copies it has
+//! read for its own lifetime.
 //!
 //! Neither path registers an inference engine, capability, catalog entry, or
 //! download. Header candidates therefore remain non-executable, and the

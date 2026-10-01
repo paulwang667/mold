@@ -40,6 +40,12 @@ pub(crate) const H3_TINY_MATH_MAX_PACKED_ROWS: u64 = 4_096;
 /// of artifact FILE bytes and a 5.2 GB file-backed VAE mapping as anonymous
 /// demand.
 ///
+/// The denoise phase is a second candidate for that peak: the CUDA block loader
+/// keeps every packed transformer block resident (~19.3 GB for the 50-block
+/// INT8 checkpoint) plus its read staging, which the exact per-attempt budget
+/// charges as `denoise_block_host_bytes`. This advisory figure has not been
+/// re-derived for it.
+///
 /// That arithmetic no longer refuses a 32 GiB host outright: 22.75 GB plus the
 /// 8 GiB minimum floor is ~31.3 GB against 34.36 GB, so a 32 GiB box is now
 /// marginal rather than impossible. It is not enough to lower this tier on.

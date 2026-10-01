@@ -151,6 +151,28 @@ pulled the subject back to the left bias).
 | 5 | aiva: config, final-canvas selection, artifact fingerprint, cost model, run card, draft tier, meta | aiva four gates; no-refine artifacts unchanged |
 | 6 | Validation: multi-seed, second character/scene, identity and temporal stability, A/B vs post-hoc SR, learned upscaler decision | written verdict, kept in memory and qualification doc |
 
+**Phase 3c: host block cache.** Measured on an L20 with the 8-step refine
+(50 INT8 blocks, 19.3 GB per forward), each forward spent about 11.1 s in host
+staging (`H3ComfyInt8BlockLoader::load_block`: per tensor a zero-filled `Vec`,
+a locked seek+read, then `from_raw_buffer` copying the bytes again), 2.2 s on
+H2D, and 11.7 s (pass 1) / 37.9 s (pass 2) of GPU compute, all serialized, so
+the GPU was about 46% busy in pass 1 and system CPU time was about 14 s per
+forward. The same 12 forwards (8 + 4) re-read identical bytes.
+
+- Reads reserve capacity instead of zero-filling, and the raw I8 buffer becomes
+  the tensor storage: one host copy per packed tensor.
+- On CUDA each loader keeps the four packed linears of every block it has read
+  (per loader, so per job; CPU and Metal are unchanged). Forwards after the
+  first skip the packed reads; the block's small dense tensors are still read
+  through the var builder.
+- The device contract is untouched: one staged block, no extra device buffer.
+  The host contract is not: the ledger's denoise phase now charges every
+  block's `encoded_host_bytes` plus two copies of the largest tensor
+  (`denoise_block_host_bytes`), under strict admission with no waiver. The
+  budget and attempt identities change by design.
+- Output stays bit-identical. The new timings are to be recorded on the CUDA
+  host.
+
 ## Evidence the prototype produced (single character/scene, seed 20260930 unless noted)
 
 - Sharpness (Laplacian variance) at one output size: +53% (1344×576) and +69%

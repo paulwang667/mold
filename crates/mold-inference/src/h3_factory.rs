@@ -230,6 +230,30 @@ pub struct H3FactoryBlockMemoryInput {
     pub content_sha256: String,
 }
 
+/// Anonymous host bytes the transformer block loader holds during denoise.
+///
+/// The CUDA loader keeps the packed linears of every block it has read, so by
+/// the end of the first forward the whole checkpoint's `encoded_host_bytes`
+/// are resident, not one block's. On top of that sits the tensor currently
+/// being read, charged as two copies of the largest one (the read `Vec`, and
+/// the dense path's `from_raw_buffer` copy). The device contract is separate
+/// and unchanged: one staged block at a time.
+pub(crate) fn denoise_block_host_bytes(blocks: &[H3FactoryBlockMemoryInput]) -> Result<u64> {
+    let resident = checked_u64_sum(
+        blocks.iter().map(|block| block.encoded_host_bytes),
+        "H3 resident block cache bytes",
+    )?;
+    let staging = blocks
+        .iter()
+        .map(|block| block.max_host_read_staging_bytes)
+        .max()
+        .unwrap_or(0);
+    staging
+        .checked_mul(2)
+        .and_then(|staging| staging.checked_add(resident))
+        .ok_or_else(|| anyhow!("H3 denoise block host bytes overflow"))
+}
+
 /// Raw opened-checkpoint authority. This is a distinct typed domain from the
 /// logical transformer component aggregate retained by the backend plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -386,7 +410,10 @@ pub struct H3FactoryTargetBudgetInput {
     pub vae_peak_host_mapped_file_bytes: u64,
     pub vae_peak_staging_disk_bytes: u64,
     pub max_host_read_staging_bytes: u64,
-    pub max_streamed_block_host_overlap_bytes: u64,
+    /// Anonymous host bytes of the block loader during denoise: every block's
+    /// packed linears kept resident plus the in-flight read staging. See
+    /// [`denoise_block_host_bytes`].
+    pub denoise_block_host_bytes: u64,
     pub fixed_transformer_load_host_staging_bytes: u64,
     pub encoded_video_host_bytes_bound: u64,
     pub thumbnail_host_bytes_bound: u64,
@@ -672,7 +699,7 @@ impl H3FactoryTargetBudgetInput {
             vae_peak_host_mapped_file_bytes,
             vae_peak_staging_disk_bytes,
             max_host_read_staging_bytes,
-            max_streamed_block_host_overlap_bytes,
+            denoise_block_host_bytes,
             fixed_transformer_load_host_staging_bytes,
             encoded_video_host_bytes_bound,
             thumbnail_host_bytes_bound,
@@ -798,7 +825,7 @@ impl H3FactoryTargetBudgetInput {
             vae_peak_host_mapped_file_bytes,
             vae_peak_staging_disk_bytes,
             max_host_read_staging_bytes,
-            max_streamed_block_host_overlap_bytes,
+            denoise_block_host_bytes,
             fixed_transformer_load_host_staging_bytes,
             encoded_video_host_bytes_bound,
             thumbnail_host_bytes_bound,
@@ -2421,24 +2448,7 @@ fn validate_target_budget(
         .map(|block| block.max_host_read_staging_bytes)
         .max()
         .unwrap_or(0);
-    // The one live packed block, plus the tensor currently being read held
-    // twice: `read_tensor_bytes`' `Vec` and the `from_raw_buffer` CPU copy it
-    // is turned into (`comfy_dit.rs:1373-1407`, `:1451-1462`). Charging one
-    // copy undercounted every block load by its largest tensor.
-    let max_streamed_block_host_overlap = checkpoint
-        .blocks
-        .iter()
-        .map(|block| {
-            block
-                .max_host_read_staging_bytes
-                .checked_mul(2)
-                .and_then(|staging| staging.checked_add(block.encoded_host_bytes))
-                .ok_or_else(|| anyhow!("H3 streamed block host overlap overflow"))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
+    let denoise_block_host = denoise_block_host_bytes(&checkpoint.blocks)?;
     // One dense non-block tensor at a time reaches host memory during the
     // fixed transformer load, and it lands on the device before the next is
     // read (`comfy_dit.rs:1410-1447`: read `Vec` -> `from_raw_buffer` CPU copy
@@ -2460,9 +2470,11 @@ fn validate_target_budget(
     //
     // * `artifact_host_bytes` — the sum of every artifact's FILE size. Nothing
     //   in this pipeline holds a whole artifact in host RAM: the Qwen and the
-    //   transformer stream through bounded `Vec`s with seek+read_exact
-    //   (`qwen_nvfp4.rs:820-856`, `comfy_dit.rs:1373-1407`), and the VAEs are
-    //   mmap'd. Charging ~42 GB of file bytes as anonymous demand is the #1108
+    //   transformer stream through bounded `Vec`s
+    //   (`qwen_nvfp4.rs:820-856`, `comfy_dit.rs` `read_tensor_bytes`), and the
+    //   VAEs are mmap'd. The transformer's packed blocks are anonymous memory
+    //   the loader caches itself and are charged under `denoise_block_host_bytes`,
+    //   not by file size. Charging ~42 GB of file bytes as anonymous demand is the #1108
     //   LTX-2 bug class verbatim.
     // * `vae_peak_host_mapped_file_bytes` — a genuine mapping
     //   (`visual_weights.rs:178`, `audio_weights.rs:413`), but file-backed and
@@ -2636,7 +2648,7 @@ fn validate_target_budget(
             memory.packed_layout_host_bytes,
             memory.text_modality_tags_host_bytes,
             memory.schedule_host_bytes,
-            memory.max_streamed_block_host_overlap_bytes,
+            memory.denoise_block_host_bytes,
         ],
         "H3 denoise host phase",
     )?;
@@ -3165,9 +3177,9 @@ fn validate_target_budget(
         max_host_staging
     );
     expect_eq!(
-        "max_streamed_block_host_overlap_bytes",
-        memory.max_streamed_block_host_overlap_bytes,
-        max_streamed_block_host_overlap
+        "denoise_block_host_bytes",
+        memory.denoise_block_host_bytes,
+        denoise_block_host
     );
     expect_eq!(
         "fixed_transformer_load_host_staging_bytes",
@@ -6169,12 +6181,17 @@ mod tests {
     /// digest hashes carries different — and now correct — numbers. Deliberate
     /// and FL2VA-wide; the backend-plan digest is untouched because none of it
     /// reaches that domain.
+    ///
+    /// Re-pinned again (663903cd… → 3c824233…): the denoise-phase host demand
+    /// became the block loader's resident cache of every packed block plus the
+    /// read staging, instead of one block's, so the fixture budget carries a
+    /// larger `denoise_block_host_bytes` and `denoise_phase_host_bytes`.
     #[test]
     fn fl2va_frozen_plan_identity_is_pinned() {
         let attempt = prepared_attempt();
         assert_eq!(
             expected_h3_factory_prepared_attempt_identity(&attempt),
-            "663903cd23e888ccada69086d5156b8dc42bce3c13cccd2828f1abae0eca1209"
+            "3c8242334e7853457e3949ff11b95a4801e1fda0b5baa57e673642b319914c2c"
         );
 
         // Through the production builder: the frozen authority must preserve
@@ -6191,11 +6208,37 @@ mod tests {
         );
     }
 
+    /// The block loader's host cache holds every block, so the denoise charge
+    /// is the SUM of the packed bytes plus two copies of the largest tensor in
+    /// flight; a bigger block anywhere raises it, and the device-side facts do
+    /// not enter.
+    #[test]
+    fn denoise_block_host_bytes_charges_every_block_and_the_largest_read() {
+        let block = |index: u16, encoded: u64, staging: u64| H3FactoryBlockMemoryInput {
+            index,
+            encoded_host_bytes: encoded,
+            protected_device_bytes: 7,
+            max_device_weight_staging_bytes: 9,
+            max_host_read_staging_bytes: staging,
+            content_sha256: String::new(),
+        };
+        let blocks = [block(0, 100, 10), block(1, 300, 40), block(2, 200, 20)];
+        assert_eq!(denoise_block_host_bytes(&blocks).unwrap(), 600 + 2 * 40);
+        assert_eq!(
+            denoise_block_host_bytes(&blocks[..1]).unwrap(),
+            100 + 2 * 10
+        );
+        let overflowing = [block(0, u64::MAX, 1), block(1, 1, 1)];
+        assert!(denoise_block_host_bytes(&overflowing).is_err());
+    }
+
     /// The target-budget identity of a request WITHOUT `refine` is a pinned
     /// literal for both tasks: the hash layout of a budget that carries no
     /// plan never moves. The literals were computed on the base branch
     /// `aiva/h3-ref2va-tiers` (commit a5774e5a) by the same fixture, before the
-    /// `refine` field existed.
+    /// `refine` field existed. Both were recomputed when the denoise-phase
+    /// host demand started charging the resident block cache; the layout
+    /// itself is unchanged.
     #[test]
     fn target_budget_identity_without_refine_is_pinned() {
         let checkpoint = raw_checkpoint();
@@ -6205,11 +6248,11 @@ mod tests {
         assert_eq!(ref2va.refine, None);
         assert_eq!(
             expected_h3_factory_target_budget_identity(&fl2va),
-            "3049f15543460e40b49d7ff7324514186aa4b6d733201080166110ca7deaf7f7"
+            "8cff6ac28153999046c5e024c20350ca5f587d6743110bc15ee696b6bf379258"
         );
         assert_eq!(
             expected_h3_factory_target_budget_identity(&ref2va),
-            "23e6181e4f67d9309114341c29ded68cca0b966820e0edf98980822251fc1694"
+            "9c45ce443d9e504e6cacf77860eff3097b89410ed9cfebc369e151b2c8be800f"
         );
     }
 
@@ -6512,12 +6555,14 @@ mod tests {
             .map(|block| block.max_host_read_staging_bytes)
             .max()
             .unwrap();
-        let max_streamed_block_host_overlap_bytes = checkpoint
+        // Every block's packed linears stay resident, plus two copies of the
+        // largest tensor in flight.
+        let denoise_block_host_bytes = checkpoint
             .blocks
             .iter()
-            .map(|block| block.encoded_host_bytes + 2 * block.max_host_read_staging_bytes)
-            .max()
-            .unwrap();
+            .map(|block| block.encoded_host_bytes)
+            .sum::<u64>()
+            + 2 * max_host_read_staging_bytes;
         let fixed_transformer_load_host_staging_bytes = 2 * checkpoint
             .fixed_transformer_max_host_read_staging_bytes
             + checkpoint.fixed_transformer_max_device_weight_staging_bytes;
@@ -6601,7 +6646,7 @@ mod tests {
             packed_layout_host_bytes,
             text_modality_tags_host_bytes,
             schedule_host_bytes,
-            max_streamed_block_host_overlap_bytes,
+            denoise_block_host_bytes,
         ]);
         let visual_decode_phase_host_bytes = sum(&[
             attempt_host_bytes,
@@ -6806,7 +6851,7 @@ mod tests {
             vae_peak_host_mapped_file_bytes: 2_000,
             vae_peak_staging_disk_bytes: 3_000,
             max_host_read_staging_bytes,
-            max_streamed_block_host_overlap_bytes,
+            denoise_block_host_bytes,
             fixed_transformer_load_host_staging_bytes,
             encoded_video_host_bytes_bound: 5_000,
             thumbnail_host_bytes_bound: 1_000,
@@ -8399,7 +8444,7 @@ mod tests {
             vae_peak_host_mapped_file_bytes,
             vae_peak_staging_disk_bytes,
             max_host_read_staging_bytes,
-            max_streamed_block_host_overlap_bytes,
+            denoise_block_host_bytes,
             fixed_transformer_load_host_staging_bytes,
             encoded_video_host_bytes_bound,
             thumbnail_host_bytes_bound,
@@ -8584,7 +8629,8 @@ mod tests {
 
         // The Qwen is dropped before conditions are encoded, so its ~20 GB of
         // packed CPU parameters belong to no later phase. Denoise additionally
-        // holds exactly one live packed block, never the whole checkpoint.
+        // holds the block loader's resident packed cache: every block, once
+        // read.
         assert_eq!(
             budget.denoise_phase_host_bytes,
             attempt_host
@@ -8593,7 +8639,7 @@ mod tests {
                 + budget.packed_layout_host_bytes
                 + budget.text_modality_tags_host_bytes
                 + budget.schedule_host_bytes
-                + budget.max_streamed_block_host_overlap_bytes
+                + budget.denoise_block_host_bytes
         );
 
         // A larger file-backed VAE mapping is reclaimable page cache that
@@ -8741,7 +8787,7 @@ mod tests {
             text_modality_tags_host_bytes,
             noise_cpu_staging_host_bytes,
             max_host_read_staging_bytes,
-            max_streamed_block_host_overlap_bytes,
+            denoise_block_host_bytes,
             fixed_transformer_load_host_staging_bytes,
             waveform_host_bytes,
             predicted_host_increment_bytes,

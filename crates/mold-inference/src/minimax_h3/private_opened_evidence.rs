@@ -41,14 +41,15 @@ use super::vae_runtime::{
     FrozenH3ComfyVaeLoadPlan, H3AuthenticatedComfyVaeAuthority, H3ComfyVaeArtifactRole,
 };
 use crate::h3_factory::{
-    expected_h3_factory_prepared_attempt_identity, expected_h3_factory_prepared_request_identity,
-    expected_h3_factory_raw_checkpoint_identity, expected_h3_factory_reference_media_identity,
-    expected_h3_factory_target_budget_identity, H3FactoryArtifactHostInput,
-    H3FactoryArtifactHostRole, H3FactoryBlockMemoryInput, H3FactoryEndpointAnchor,
-    H3FactoryEndpointInput, H3FactoryEndpointPreprocess, H3FactoryExecutionBudgetEchoInput,
-    H3FactoryPreparedAttemptInput, H3FactoryPreparedRequestInput, H3FactoryPreparedRowsInput,
-    H3FactoryRawCheckpointInput, H3FactoryTargetBudgetInput, H3FactoryTargetDenoiseCopyPolicy,
-    H3FactoryTargetLoadDropPolicy, H3FactoryTurboAdapterAuthority,
+    denoise_block_host_bytes, expected_h3_factory_prepared_attempt_identity,
+    expected_h3_factory_prepared_request_identity, expected_h3_factory_raw_checkpoint_identity,
+    expected_h3_factory_reference_media_identity, expected_h3_factory_target_budget_identity,
+    H3FactoryArtifactHostInput, H3FactoryArtifactHostRole, H3FactoryBlockMemoryInput,
+    H3FactoryEndpointAnchor, H3FactoryEndpointInput, H3FactoryEndpointPreprocess,
+    H3FactoryExecutionBudgetEchoInput, H3FactoryPreparedAttemptInput,
+    H3FactoryPreparedRequestInput, H3FactoryPreparedRowsInput, H3FactoryRawCheckpointInput,
+    H3FactoryTargetBudgetInput, H3FactoryTargetDenoiseCopyPolicy, H3FactoryTargetLoadDropPolicy,
+    H3FactoryTurboAdapterAuthority,
 };
 #[cfg(feature = "mp4")]
 use crate::h3_factory::{
@@ -1545,9 +1546,9 @@ fn raw_checkpoint_input(
         raw_content_sha256: transformer.content_sha256().into(),
         verified_file_bytes: evidence.verified_file_bytes,
         raw_header_identity_sha256: transformer.candidate().header_identity_sha256.clone(),
-        // The parsed header stays resident for the whole stream lifetime; the
-        // tensor payload does not (comfy_dit.rs:1373-1407 reads it through a
-        // bounded buffer), so this is the checkpoint's only host residency.
+        // The parsed header stays resident for the whole stream lifetime. The
+        // packed block payload becomes resident only through the block loader's
+        // cache, which `denoise_block_host_bytes` charges to the denoise phase.
         retained_header_host_bytes: evidence.header_bytes,
         opened_checkpoint_identity_sha256: transformer.checkpoint_identity_sha256().into(),
         quantization_policy_identity_sha256: transformer
@@ -1875,24 +1876,7 @@ fn build_canonical_private_fl2va_target_budget(
         .map(|block| block.protected_device_bytes)
         .max()
         .unwrap_or(0);
-    // The one live packed block, plus the tensor being read held twice: the
-    // `Vec` from `read_tensor_bytes` and the `from_raw_buffer` CPU copy built
-    // from it (`comfy_dit.rs:1373-1407`, `:1451-1462`). Both are alive until
-    // the loaded tensor replaces them.
-    let max_streamed_block_host_overlap_bytes = checkpoint
-        .blocks
-        .iter()
-        .map(|block| {
-            block
-                .max_host_read_staging_bytes
-                .checked_mul(2)
-                .and_then(|staging| staging.checked_add(block.encoded_host_bytes))
-                .ok_or_else(|| anyhow!("private H3 streamed host overlap overflow"))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
+    let denoise_block_host_bytes = denoise_block_host_bytes(&checkpoint.blocks)?;
     // One dense non-block tensor at a time reaches host memory during the fixed
     // transformer load and lands on the device before the next is read
     // (`comfy_dit.rs:1410-1447`): the read `Vec`, its `from_raw_buffer` CPU
@@ -2172,7 +2156,7 @@ fn build_canonical_private_fl2va_target_budget(
         packed_layout_host_bytes,
         text_modality_tags_host_bytes,
         schedule_host_bytes,
-        max_streamed_block_host_overlap_bytes,
+        denoise_block_host_bytes,
     ])?;
     let visual_decode_phase_host_bytes = checked_sum([
         attempt_host_bytes,
@@ -2389,7 +2373,7 @@ fn build_canonical_private_fl2va_target_budget(
         vae_peak_host_mapped_file_bytes: vae_memory.peak_host_mapped_file_bytes,
         vae_peak_staging_disk_bytes: vae_memory.peak_staging_disk_bytes,
         max_host_read_staging_bytes,
-        max_streamed_block_host_overlap_bytes,
+        denoise_block_host_bytes,
         fixed_transformer_load_host_staging_bytes,
         encoded_video_host_bytes_bound: bounds.encoded_video_host_bytes_bound,
         thumbnail_host_bytes_bound: bounds.thumbnail_host_bytes_bound,
