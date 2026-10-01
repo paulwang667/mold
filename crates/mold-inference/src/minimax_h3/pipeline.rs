@@ -1123,23 +1123,28 @@ impl H3VideoEncodeSink {
                 self.expected_frames
             );
         }
+        let diag_finish = super::diag_timing::tick();
         let first = self
             .first_frame
             .take()
             .ok_or_else(|| anyhow!("MiniMax H3 visual decoder emitted no frames"))?;
+        let diag_thumbnail = super::diag_timing::tick();
         let first = thumbnail_source(first);
         let thumbnail_png = video_enc::first_frame_png_bounded(
             std::slice::from_ref(&first),
             SMALL_THUMBNAIL_PNG_MAX_BYTES,
         )?;
-        Ok(EncodedVideo {
+        super::diag_timing::sink_thumbnail(diag_thumbnail);
+        let encoded = EncodedVideo {
             mp4: self
                 .encoder
                 .take()
                 .expect("encoder is present until finish")
                 .finish()?,
             thumbnail_png,
-        })
+        };
+        super::diag_timing::sink_finish(diag_finish);
+        Ok(encoded)
     }
 }
 

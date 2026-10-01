@@ -934,6 +934,8 @@ where
         layout: &H3FrozenPackedLayout,
         checkpoint: &mut dyn H3PipelineCheckpoint,
     ) -> Result<H3TransformerOutput> {
+        let diag =
+            super::diag_timing::ForwardDiag::begin(input.video_rows.device(), layout.seq_len());
         let control = H3StreamPipelineControl::new(checkpoint);
         self.stream.prepare(&control, |_| {})?;
         if let Err(error) = control
@@ -956,7 +958,10 @@ where
             return Err(error);
         }
         match control.with_checkpoint(|checkpoint| self.executor.finish_step(checkpoint)) {
-            Ok(output) => Ok(output),
+            Ok(output) => {
+                diag.finish();
+                Ok(output)
+            }
             Err(error) => {
                 self.executor.abort_step();
                 Err(error)
