@@ -583,6 +583,11 @@ pub(crate) struct H3PreparedRequestShape {
     pub reference_shapes: Vec<GenerationReferencePreparedShape>,
     pub reference_fingerprint: String,
     pub conditioning_fingerprint: String,
+    /// The two-pass refine this request renders with; `width` / `height` /
+    /// `rows` are the FINAL canvas either way. Skipped on the wire when absent
+    /// so a shape without it serializes exactly as it did before the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refine: Option<minimax_h3::RefinePlan>,
     pub rows: H3PreparedRows,
 }
 
@@ -730,6 +735,7 @@ impl H3PreparedRequestShape {
                 reference_shapes,
                 reference_fingerprint,
                 conditioning_fingerprint,
+                refine: minimax_h3::RefinePlan::for_request(request),
                 rows: H3PreparedRows {
                     qwen_output_text_rows,
                     qwen_vision_rows,
@@ -748,7 +754,14 @@ impl H3PreparedRequestShape {
             || self.height == 0
             || !self.width.is_multiple_of(minimax_h3::DIMENSION_ALIGNMENT)
             || !self.height.is_multiple_of(minimax_h3::DIMENSION_ALIGNMENT)
-            || u64::from(self.width) * u64::from(self.height) > minimax_h3::request_max_pixels()
+            || u64::from(self.width) * u64::from(self.height)
+                > minimax_h3::request_max_pixels(minimax_h3::CanvasRule::for_plan(
+                    self.refine.as_ref(),
+                ))
+            || self.refine.is_some_and(|plan| {
+                plan != minimax_h3::RefinePlan::PUBLISHED
+                    || !minimax_h3::is_admitted_refine_final_canvas(self.width, self.height)
+            })
             || !(minimax_h3::MIN_ASPECT_RATIO..=minimax_h3::MAX_ASPECT_RATIO)
                 .contains(&(self.width as f64 / self.height as f64))
             || !minimax_h3::valid_frame_count(self.frames)

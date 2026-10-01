@@ -1785,6 +1785,17 @@ impl CollectionRef {
     }
 }
 
+/// The `refine` request block: render in two passes, the first on a canvas
+/// `1/scale` of the requested canvas in each axis. Today only `scale == 2` is
+/// admitted (and only on the MiniMax H3 Ref2VA Turbo 8-step 768p tier); the
+/// start point and the second pass's LoRA strength are not request fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RefineRequest {
+    /// Spatial ratio between the final canvas and pass 1's canvas. Must be `2`.
+    #[schema(example = 2)]
+    pub scale: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GenerateRequest {
     #[schema(example = "a cat sitting on a windowsill at sunset")]
@@ -2183,6 +2194,15 @@ pub struct GenerateRequest {
     /// not ignored, everywhere else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turbo_lora_strength: Option<f64>,
+    /// Opt-in two-pass "refine" render (MiniMax H3 Ref2VA Turbo 8-step 768p
+    /// only): pass 1 runs the whole distilled schedule on a canvas `1/scale`
+    /// the size of the requested `width` x `height` in each axis, the latent is
+    /// upscaled, re-noised part-way up the sigma grid and finished by the
+    /// schedule's tail on the requested (final) canvas. Absent renders in one
+    /// pass exactly as before. Rejected, not ignored, everywhere else; the
+    /// geometry is owned by `minimax_h3::RefinePlan`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refine: Option<RefineRequest>,
     /// Optional per-component device placement override. `None` preserves
     /// the engine's VRAM-aware auto-placement end-to-end. See §3 of the
     /// 2026-04-19 model-ui-overhaul design doc.
@@ -3439,6 +3459,10 @@ pub struct OutputMetadata {
     pub distill_strength_low: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turbo_lora_strength: Option<f64>,
+    /// The two-pass refine request this render ran with (MiniMax H3 only);
+    /// absent for the ordinary single-pass render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refine: Option<RefineRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frames: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3673,6 +3697,7 @@ impl OutputMetadata {
             distill_strength_high: req.distill_strength_high,
             distill_strength_low: req.distill_strength_low,
             turbo_lora_strength: req.turbo_lora_strength,
+            refine: req.refine.clone(),
             upscale_model: req.upscale_model.clone(),
             gif_preview: req.gif_preview.then_some(true),
             enable_audio: req.enable_audio,
@@ -7474,6 +7499,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "a cat on Mars".to_string(),
             negative_prompt: None,
             model: "flux-schnell".to_string(),
@@ -7732,6 +7758,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "a cat".to_string(),
             negative_prompt: Some("blurry, low quality".to_string()),
             model: "sd15:fp16".to_string(),
@@ -7818,6 +7845,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "test".to_string(),
@@ -8107,6 +8135,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "flux-schnell:q8".to_string(),
@@ -8444,6 +8473,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "flux-dev:q8".to_string(),
@@ -8697,6 +8727,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "a cat".to_string(),
             negative_prompt: Some("blurry, ugly".to_string()),
             model: "sd15:fp16".to_string(),
@@ -8780,6 +8811,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "sd15:fp16".to_string(),
@@ -8866,6 +8898,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "video".to_string(),
             negative_prompt: Some("blur".to_string()),
             model: "ltx-2.3-22b-distilled:fp8".to_string(),
@@ -9670,6 +9703,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "test".to_string(),
@@ -9759,6 +9793,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "qwen-image-edit-2511:q4".to_string(),
@@ -9861,6 +9896,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "test".to_string(),
@@ -9948,6 +9984,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "test".to_string(),
@@ -10056,6 +10093,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "test".to_string(),
             negative_prompt: None,
             model: "test".to_string(),
@@ -14920,6 +14958,35 @@ mod mesh_reference_contract_tests {
             metadata.image_role,
             Some(GenerationImageReferenceRole::Left)
         );
+    }
+
+    #[test]
+    fn refine_round_trips_mirrors_into_metadata_and_is_absent_when_unset() {
+        let json = serde_json::json!({"prompt": "p", "model": "m", "width": 64, "height": 64, "steps": 1, "refine": {"scale": 2}});
+        let req: GenerateRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.refine, Some(RefineRequest { scale: 2 }));
+        let back = serde_json::to_value(&req).unwrap();
+        assert_eq!(back["refine"], serde_json::json!({"scale": 2}));
+        let metadata = OutputMetadata::from_generate_request(&req, 1, None, "test");
+        assert_eq!(metadata.refine, Some(RefineRequest { scale: 2 }));
+        assert_eq!(
+            serde_json::to_value(&metadata).unwrap()["refine"],
+            serde_json::json!({"scale": 2})
+        );
+        let plain: GenerateRequest = serde_json::from_value(
+            serde_json::json!({"prompt": "p", "model": "m", "width": 64, "height": 64, "steps": 1}),
+        )
+        .unwrap();
+        assert_eq!(plain.refine, None);
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("refine")
+            .is_none());
+        let plain_metadata = OutputMetadata::from_generate_request(&plain, 1, None, "test");
+        assert!(serde_json::to_value(&plain_metadata)
+            .unwrap()
+            .get("refine")
+            .is_none());
     }
 
     #[test]

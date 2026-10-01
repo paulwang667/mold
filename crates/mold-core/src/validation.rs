@@ -758,11 +758,7 @@ pub fn max_pixels_for_family_composed(
     match (family, composition) {
         (Some("ltx2"), Ltx2SpatialComposition::TiledTwoStage) => LTX2_COMPOSED_MAX_PIXELS,
         (Some("ltx2"), Ltx2SpatialComposition::SinglePass) => LTX2_MAX_PIXELS,
-        (Some(family), _) if crate::minimax_h3::is_family(family) => {
-            // `request_max_pixels` is `MAX_PIXELS` unless the research-prototype
-            // `MOLD_H3_REFINE_PROTO=...,uncap=1` gate is set.
-            crate::minimax_h3::request_max_pixels()
-        }
+        (Some(family), _) if crate::minimax_h3::is_family(family) => crate::minimax_h3::MAX_PIXELS,
         (Some("qwen-image21"), _) => QWEN_IMAGE21_MAX_PIXELS,
         _ => MAX_PIXELS,
     }
@@ -888,6 +884,27 @@ fn validate_generation_dimensions_with_alignment(
     composition: Ltx2SpatialComposition,
     alignment: u32,
 ) -> Result<(), String> {
+    validate_generation_dimensions_with_limit(
+        width,
+        height,
+        family,
+        composition,
+        alignment,
+        max_pixels_for_family_composed(family, composition),
+    )
+}
+
+/// [`validate_generation_dimensions_with_alignment`] with the total-pixel
+/// ceiling named by the caller. Only a MiniMax H3 refine request passes a
+/// ceiling other than its family's.
+fn validate_generation_dimensions_with_limit(
+    width: u32,
+    height: u32,
+    family: Option<&str>,
+    composition: Ltx2SpatialComposition,
+    alignment: u32,
+    limit: u64,
+) -> Result<(), String> {
     if width == 0 || height == 0 {
         return Err("width and height must be > 0".to_string());
     }
@@ -934,7 +951,6 @@ fn validate_generation_dimensions_with_alignment(
         }
     }
 
-    let limit = max_pixels_for_family_composed(family, composition);
     let pixels = width as u64 * height as u64;
     if pixels > limit {
         return Err(format!(
@@ -3109,13 +3125,27 @@ fn validate_generate_request_after_activation_with(
     // the engine letterboxes the SOURCE to; they never describe an output.
     let canvasless = audio_only || family == Some(crate::manifest::HUNYUAN3D_FAMILY);
     if !canvasless {
-        validate_generation_dimensions_for_model(
-            &req.model,
-            req.width,
-            req.height,
-            family,
-            composition,
-        )?;
+        if req.refine.is_some() && family.is_some_and(crate::minimax_h3::is_family) {
+            // The FINAL canvas of a refine request is held to the refine rule,
+            // not the family ceiling; the H3 contract below owns the rest of
+            // that rule (tier, scale, alignment, pass-1 canvas).
+            validate_generation_dimensions_with_limit(
+                req.width,
+                req.height,
+                family,
+                composition,
+                dimension_alignment_for_model(&req.model, family),
+                crate::minimax_h3::request_max_pixels(crate::minimax_h3::CanvasRule::RefineFinal),
+            )?;
+        } else {
+            validate_generation_dimensions_for_model(
+                &req.model,
+                req.width,
+                req.height,
+                family,
+                composition,
+            )?;
+        }
     }
     validate_family_video_timing_constraints(req.frames, req.fps, family)?;
     if composition == Ltx2SpatialComposition::TiledTwoStage {
@@ -3173,6 +3203,13 @@ fn validate_generate_request_after_activation_with(
         return Err(
             "turbo_lora_strength is a MiniMax H3 Turbo control and is not supported for this model"
                 .to_string(),
+        );
+    }
+    // The two-pass refine is an H3 control too; the H3 contract owns its tier
+    // and canvas rules. Rejected, not ignored, off-family.
+    if req.refine.is_some() && !family.is_some_and(crate::minimax_h3::is_family) {
+        return Err(
+            "refine is a MiniMax H3 Ref2VA control and is not supported for this model".to_string(),
         );
     }
     if family.is_some_and(crate::minimax_h3::is_family) {
@@ -5129,6 +5166,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "a red apple".to_string(),
             negative_prompt: None,
             model: "test-model".to_string(),
@@ -5310,6 +5348,58 @@ mod tests {
                 "the door must report the shared rule verbatim"
             );
         }
+    }
+
+    /// The family-wide pixel ceiling does not bind a refine request's FINAL
+    /// canvas (the refine rule does), and the same canvas without `refine`
+    /// stays refused exactly as before.
+    #[test]
+    fn h3_post_activation_checks_a_refine_final_canvas_against_the_refine_rule() {
+        let mut req = valid_h3_request(crate::minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P);
+        req.steps = crate::minimax_h3::steps_floor_for_model(&req.model);
+        req.references = Some(vec![crate::GenerationReference::Image {
+            media: crate::GenerationReferenceAuthority::Inline { data: png_bytes() },
+            provenance: crate::GenerationReferenceProvenance {
+                name: Some("reference.png".to_string()),
+                sha256: None,
+                crop: None,
+            },
+            mime_type: "image/png".to_string(),
+            width: 1920,
+            height: 1080,
+        }]);
+        req.width = 1920;
+        req.height = 1088;
+        let family = Some(crate::minimax_h3::FAMILY);
+        let plain = validate_generate_request_after_activation(&req, family).unwrap_err();
+        assert!(plain.contains("exceeds"), "{plain}");
+
+        req.refine = Some(crate::RefineRequest { scale: 2 });
+        validate_generate_request_after_activation(&req, family)
+            .expect("the final canvas is held to the refine rule");
+
+        req.width = 2560;
+        req.height = 1408;
+        let too_big = validate_generate_request_after_activation(&req, family).unwrap_err();
+        assert!(too_big.contains("exceeds"), "{too_big}");
+
+        req.width = 1920;
+        req.height = 1088;
+        req.model = crate::minimax_h3::REF2VA_COMFY.to_string();
+        req.steps = crate::minimax_h3::COMFY_DEFAULT_STEPS;
+        let wrong_tier = validate_generate_request_after_activation(&req, family).unwrap_err();
+        assert!(wrong_tier.contains("refine runs on"), "{wrong_tier}");
+    }
+
+    /// `refine` is an H3 control: rejected — never ignored — off the family.
+    #[test]
+    fn refine_is_rejected_off_the_h3_family() {
+        let mut req = valid_req();
+        req.refine = Some(crate::RefineRequest { scale: 2 });
+        let err = validate_generate_request(&req).unwrap_err();
+        assert!(err.contains("refine"), "{err}");
+        req.refine = None;
+        assert!(validate_generate_request(&req).is_ok());
     }
 
     #[test]

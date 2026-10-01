@@ -132,6 +132,7 @@ fn generate_request_placement_round_trips() {
         distill_strength_high: None,
         distill_strength_low: None,
         turbo_lora_strength: None,
+        refine: None,
         prompt: "a cat".into(),
         negative_prompt: None,
         model: "flux-dev:q4".into(),

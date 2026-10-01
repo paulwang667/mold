@@ -10,8 +10,8 @@ use mold_core::generation_profile::{
     MeshWorkflowMode, NamedViewsProfile, OffBucketPolicy, OutputCapabilitiesProfile,
     ProfileProvenance, PromptCapabilitiesProfile, PromptRequirement, ProvenanceKind,
     RecipeSelector, ReferenceCanvasRule, ReferenceImagesProfile, ReferenceSourceRelation,
-    ResolutionDomain, ResolutionPreset, ResolutionProfile, TemporalProfile,
-    TransparencyCapabilitiesProfile, WanRecipeCapabilitiesProfile,
+    RefineCapabilitiesProfile, ResolutionDomain, ResolutionPreset, ResolutionProfile,
+    TemporalProfile, TransparencyCapabilitiesProfile, WanRecipeCapabilitiesProfile,
 };
 use mold_core::manifest::known_manifests;
 use mold_core::{
@@ -135,6 +135,7 @@ fn render_typescript_contract() -> String {
     declaration!(ImageInputFormat);
     declaration!(ReferenceImagesProfile);
     declaration!(TransparencyCapabilitiesProfile);
+    declaration!(RefineCapabilitiesProfile);
     declaration!(Scheduler);
     declaration!(GenerationCapabilitiesProfile);
     declaration!(GenerationRecipeProfile);

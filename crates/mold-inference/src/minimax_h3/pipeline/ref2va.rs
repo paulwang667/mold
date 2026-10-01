@@ -1923,6 +1923,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             placement: None,
             id_image: None,
             id_image_name: None,
@@ -2653,11 +2654,7 @@ mod tests {
 
     #[test]
     fn the_refine_gate_runs_pass_one_small_then_the_tail_of_the_grid_at_the_final_canvas() {
-        let refine = refine_proto::H3RefineProto {
-            scale: 2,
-            start: 4,
-            uncap: false,
-        };
+        let refine = refine_proto::H3RefineProto { scale: 2, start: 4 };
         let (backend, prepared, staged, observer) = run_refined(Some(refine));
         let schedule = H3DualSchedule::new_for_sampler_with_video_shift(
             prepared.grid_points,
@@ -2809,11 +2806,7 @@ mod tests {
             &mut backend,
             &ProgressReporter::default(),
             &mut NoopH3PipelineObserver,
-            Some(refine_proto::H3RefineProto {
-                scale: 2,
-                start: 4,
-                uncap: false,
-            }),
+            Some(refine_proto::H3RefineProto { scale: 2, start: 4 }),
         )
         .unwrap_err();
         assert!(error.to_string().contains("multiple of 32"), "{error}");

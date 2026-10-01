@@ -706,6 +706,37 @@ impl GenerationDeliveryCapabilities {
     }
 }
 
+/// The two-pass `refine` control (`GenerateRequest.refine`), advertised on the
+/// one recipe that runs it. Present only where [`crate::RefineRequest`] is accepted;
+/// its absence means the field is refused here, so a client never offers a
+/// control the server would reject and an absent block on an OLDER server reads
+/// as "no refine" rather than as a refusal nobody wrote.
+///
+/// The numbers are `mold_core::minimax_h3`'s: [`crate::minimax_h3::RefinePlan`]
+/// owns the geometry and the door rule that enforces it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct RefineCapabilitiesProfile {
+    /// The only `refine.scale` the recipe accepts (final canvas / pass 1's).
+    pub scale: u32,
+    /// Both axes of the requested (FINAL) canvas must be multiples of this.
+    pub alignment: u32,
+    /// Largest FINAL canvas area, in pixels.
+    #[ts(type = "number")]
+    pub max_pixels: u64,
+    /// The `steps` value a refine request must carry: the tier's own grid.
+    pub steps: u32,
+}
+
+/// The refine contract a model identity advertises, `None` when it runs none.
+pub fn refine_capabilities_for_model(model: &str) -> Option<RefineCapabilitiesProfile> {
+    crate::minimax_h3::refine_supported_model(model).then(|| RefineCapabilitiesProfile {
+        scale: crate::minimax_h3::H3_REFINE_SCALE,
+        alignment: crate::minimax_h3::REFINE_FINAL_ALIGNMENT,
+        max_pixels: crate::minimax_h3::REFINE_MAX_PIXELS,
+        steps: crate::minimax_h3::steps_floor_for_model(model),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
 pub struct WanRecipeCapabilitiesProfile {
     pub mode: ControlMode,
@@ -778,6 +809,11 @@ pub struct GenerationCapabilitiesProfile {
     /// `GenerateRequest.mesh` is refused here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<MeshCapabilitiesProfile>,
+    /// The two-pass refine control. Present only on a recipe that runs it (the
+    /// MiniMax H3 Ref2VA Turbo 8-step 768p tier); its absence means
+    /// `GenerateRequest.refine` is refused here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refine: Option<RefineCapabilitiesProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
@@ -1519,8 +1555,9 @@ pub fn validate_request_against_recipe(
         validate_transparency_against(transparency, request)?;
     }
 
+    validate_refine_against_recipe(recipe, request)?;
     let resolution = &recipe.resolution;
-    if resolution.domain != ResolutionDomain::None {
+    if resolution.domain != ResolutionDomain::None && request.refine.is_none() {
         validate_resolution(resolution, request.width, request.height)?;
     }
 
@@ -1562,6 +1599,53 @@ pub fn validate_request_against_recipe(
         return Err("frames and fps are not supported by this recipe".to_string());
     }
     Ok(())
+}
+
+/// A request's `refine` block against ONE recipe's advertised refine contract.
+///
+/// Absent on the recipe means refused, never ignored. The FINAL canvas of an
+/// admitted refine request is checked here against the capability's own numbers
+/// (alignment, area) and `minimax_h3`'s pass-1 canvas rule, INSTEAD of the
+/// recipe's single-pass `resolution` ceiling, which describes the canvas a
+/// request without `refine` renders on.
+pub fn validate_refine_against_recipe(
+    recipe: &GenerationRecipeProfile,
+    request: &crate::GenerateRequest,
+) -> Result<(), String> {
+    let Some(refine) = request.refine.as_ref() else {
+        return Ok(());
+    };
+    let capability = recipe.capabilities.refine.as_ref().ok_or_else(|| {
+        "refine is not supported by this recipe (MiniMax H3 Ref2VA Turbo 8-step 768p only)"
+            .to_string()
+    })?;
+    if refine.scale != capability.scale {
+        return Err(format!(
+            "refine.scale must be {}; received {}",
+            capability.scale, refine.scale
+        ));
+    }
+    if request.steps != capability.steps {
+        return Err(format!(
+            "refine requires steps = {} (the tier's own grid); received {}",
+            capability.steps, request.steps
+        ));
+    }
+    let (width, height) = (request.width, request.height);
+    if !width.is_multiple_of(capability.alignment) || !height.is_multiple_of(capability.alignment) {
+        return Err(format!(
+            "refine needs both axes to be multiples of {}; received {width}x{height}",
+            capability.alignment
+        ));
+    }
+    if u64::from(width) * u64::from(height) > capability.max_pixels {
+        return Err(format!(
+            "refine admits final canvases of at most {} pixels; received {width}x{height}",
+            capability.max_pixels
+        ));
+    }
+    crate::minimax_h3::validate_reviewed_canvas(request)
+        .map_err(|error| format!("{}: {}", error.code, error.message))
 }
 
 pub fn validate_dimensions_against_recipe(
@@ -2768,6 +2852,7 @@ fn recipe(
             },
             supports_strength,
             mesh: mesh_only.then(|| mesh_capabilities_profile(&normalized_model)),
+            refine: refine_capabilities_for_model(input.model),
         },
         provenance: provenance(family),
     }
@@ -5396,6 +5481,84 @@ mod tests {
             None,
             recipe.capabilities.supports_audio
         ));
+    }
+
+    /// `capabilities.refine` is the one advertisement of the two-pass render:
+    /// present on exactly the Ref2VA Turbo 8-step 768p recipe, carrying the
+    /// numbers `minimax_h3` enforces, and the profile door follows it — a final
+    /// canvas above the single-pass ceiling passes only WITH `refine`.
+    #[test]
+    fn the_refine_capability_is_advertised_on_one_recipe_and_the_profile_door_follows_it() {
+        use crate::minimax_h3 as h3;
+        for model in h3::REVIEWED_COMPACT_MODELS {
+            let profile = resolve_generation_profile(input(model, "minimax-h3"));
+            let recipe = profile.default_recipe().unwrap();
+            let advertised = recipe.capabilities.refine.as_ref();
+            if *model == h3::REF2VA_COMFY_TURBO_8STEP_768P {
+                let advertised = advertised.expect("the refine tier advertises the control");
+                assert_eq!(advertised.scale, h3::H3_REFINE_SCALE);
+                assert_eq!(advertised.alignment, h3::REFINE_FINAL_ALIGNMENT);
+                assert_eq!(advertised.max_pixels, h3::REFINE_MAX_PIXELS);
+                assert_eq!(advertised.steps, h3::steps_floor_for_model(model));
+            } else {
+                assert!(advertised.is_none(), "{model}");
+            }
+        }
+        for model in ["flux-dev:q8", "sdxl-base:fp16"] {
+            let profile = resolve_generation_profile(input(model, "flux"));
+            assert!(profile
+                .default_recipe()
+                .unwrap()
+                .capabilities
+                .refine
+                .is_none());
+        }
+
+        let model = h3::REF2VA_COMFY_TURBO_8STEP_768P;
+        let profile = resolve_generation_profile(input(model, "minimax-h3"));
+        let recipe = profile.default_recipe().unwrap();
+        let mut request = crate::test_support::minimal_generate_request(model);
+        request.steps = h3::steps_floor_for_model(model);
+        request.width = 1920;
+        request.height = 1088;
+        request.frames = Some(h3::DEFAULT_COMPACT_FRAMES);
+        request.output_format = Some(OutputFormat::Mp4);
+        let single_pass = validate_request_against_recipe(recipe, &request).unwrap_err();
+        assert!(single_pass.contains("pixel limit"), "{single_pass}");
+        request.refine = Some(crate::RefineRequest {
+            scale: h3::H3_REFINE_SCALE,
+        });
+        validate_request_against_recipe(recipe, &request).expect("refine admits the final canvas");
+        request.width = 2560;
+        request.height = 1408;
+        assert!(validate_request_against_recipe(recipe, &request)
+            .unwrap_err()
+            .contains("at most 2088960 pixels"));
+        request.width = 1376;
+        request.height = 576;
+        assert!(validate_request_against_recipe(recipe, &request)
+            .unwrap_err()
+            .contains("multiples of 64"));
+        request.width = 1920;
+        request.height = 1088;
+        request.refine = Some(crate::RefineRequest { scale: 3 });
+        assert!(validate_request_against_recipe(recipe, &request)
+            .unwrap_err()
+            .contains("refine.scale must be 2"));
+
+        // A recipe that does not advertise the control refuses the block.
+        let other =
+            resolve_generation_profile(input(h3::REF2VA_COMFY_TURBO_4STEP_R21, "minimax-h3"));
+        let mut refused =
+            crate::test_support::minimal_generate_request(h3::REF2VA_COMFY_TURBO_4STEP_R21);
+        refused.steps = 5;
+        refused.output_format = Some(OutputFormat::Mp4);
+        refused.refine = Some(crate::RefineRequest { scale: 2 });
+        assert!(
+            validate_request_against_recipe(other.default_recipe().unwrap(), &refused)
+                .unwrap_err()
+                .contains("refine is not supported")
+        );
     }
 
     #[test]

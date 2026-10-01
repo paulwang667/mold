@@ -820,6 +820,7 @@ mod tests {
                 normalized_cpu_content_sha256: sha('6'),
             }],
             references: Vec::new(),
+            refine: None,
             rows: H3FactoryPreparedRowsInput {
                 qwen_output_text_rows: 594,
                 qwen_vision_rows: 2_304,

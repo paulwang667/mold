@@ -561,6 +561,11 @@ export interface GenerationMemoryEstimate {
 /** Re-exported so a wire type and the policy that reads it cannot drift. */
 export type { MeshWorkflowProvenance } from "@studio/lib/meshWorkflowProvenance";
 
+/** The `refine` request block (MiniMax H3 two-pass render). */
+export interface RefineRequest {
+  scale: number;
+}
+
 /**
  * Subset of mold-core GenerateRequest the desktop sends.
  *
@@ -696,6 +701,12 @@ export interface GenerateRequest {
   sample_shift?: number | null;
   distill_strength_high?: number | null;
   distill_strength_low?: number | null;
+  /** MiniMax H3 Ref2VA Turbo 8-step 768p only: render in two passes, the
+   * first on a canvas half the requested `width` x `height` in each axis.
+   * `scale` must be 2; read the recipe's `capabilities.refine` for the
+   * alignment and area limits. The server rejects — never ignores — it
+   * anywhere else. */
+  refine?: RefineRequest | null;
   placement?: DevicePlacement | null;
 }
 
@@ -910,6 +921,8 @@ export interface OutputMetadata {
   sample_shift?: number | null;
   distill_strength_high?: number | null;
   distill_strength_low?: number | null;
+  /** MiniMax H3 two-pass refine this print was rendered with (additive). */
+  refine?: RefineRequest | null;
   frames?: number | null;
   fps?: number | null;
   /** The 3-D controls that shaped a mesh print, RESOLVED (request values or

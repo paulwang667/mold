@@ -900,6 +900,7 @@ fn ref2va_prepared_request_input(
         reference_fingerprint: prepared.reference_fingerprint().into(),
         endpoints: Vec::new(),
         references,
+        refine: contract::RefinePlan::for_request(request),
         rows: H3FactoryPreparedRowsInput {
             qwen_output_text_rows,
             qwen_vision_rows,
@@ -1488,6 +1489,7 @@ fn prepared_request_input(
         reference_fingerprint,
         endpoints,
         references: Vec::new(),
+        refine: None,
         rows: H3FactoryPreparedRowsInput {
             qwen_output_text_rows,
             qwen_vision_rows,
@@ -2576,6 +2578,7 @@ mod tests {
             reference_fingerprint: sha256(b"mold.minimax-h3.fl2va-no-references.v1"),
             endpoints: vec![factory_endpoint],
             references: Vec::new(),
+            refine: None,
             rows: H3FactoryPreparedRowsInput {
                 qwen_output_text_rows: 3,
                 qwen_vision_rows: 64,

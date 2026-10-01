@@ -203,6 +203,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             job_id: None,
             prompt: "p".into(),
             negative_prompt: None,

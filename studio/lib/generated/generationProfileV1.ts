@@ -248,6 +248,24 @@ native_alpha: boolean,
  */
 reason?: string | null, };
 
+export type RefineCapabilitiesProfile = {
+/**
+ * The only `refine.scale` the recipe accepts (final canvas / pass 1's).
+ */
+scale: number,
+/**
+ * Both axes of the requested (FINAL) canvas must be multiples of this.
+ */
+alignment: number,
+/**
+ * Largest FINAL canvas area, in pixels.
+ */
+max_pixels: number,
+/**
+ * The `steps` value a refine request must carry: the tier's own grid.
+ */
+steps: number, };
+
 export type Scheduler = "ddim" | "euler-ancestral" | "uni-pc" | "edm-dpm-pp-2m" | "euler" | "dpm-pp";
 
 export type GenerationCapabilitiesProfile = { guidance: GuidanceCapabilities, negative_prompt: FeatureControlProfile, source_image?: SourceImageCapability | null, supports_lora: boolean, supports_controlnet: boolean,
@@ -296,7 +314,13 @@ transparency?: TransparencyCapabilitiesProfile | null,
  * 3-D controls. Present only on a mesh recipe; its absence means
  * `GenerateRequest.mesh` is refused here.
  */
-mesh?: MeshCapabilitiesProfile | null, };
+mesh?: MeshCapabilitiesProfile | null,
+/**
+ * The two-pass refine control. Present only on a recipe that runs it (the
+ * MiniMax H3 Ref2VA Turbo 8-step 768p tier); its absence means
+ * `GenerateRequest.refine` is refused here.
+ */
+refine?: RefineCapabilitiesProfile | null, };
 
 export type GenerationRecipeProfile = { id: string, label: string, request_selector: RecipeSelector, defaults: GenerationDefaultsProfile, resolution: ResolutionProfile, steps: IntegerControl, guidance: FloatControl, temporal?: TemporalProfile | null, capabilities: GenerationCapabilitiesProfile, provenance?: Array<ProfileProvenance>, };
 

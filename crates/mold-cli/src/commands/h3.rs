@@ -153,6 +153,7 @@ pub(crate) fn prepare_authoring(
     last_frame: Option<&Path>,
     references: &[ReferenceArg],
     reference_client: Option<&mold_core::MoldClient>,
+    refine: bool,
 ) -> Result<PreparedAuthoring> {
     let is_h3 = minimax_h3::is_family(family);
     let has_h3_authoring = duration_seconds.is_some()
@@ -160,6 +161,9 @@ pub(crate) fn prepare_authoring(
         || last_frame.is_some()
         || !references.is_empty();
     if !is_h3 {
+        if refine {
+            anyhow::bail!("--refine is a MiniMax H3 Ref2VA option");
+        }
         if has_h3_authoring {
             // `--reference` is deliberately absent from this list: the run
             // router resolves it against the recipe's `reference_images`
@@ -211,11 +215,25 @@ pub(crate) fn prepare_authoring(
             minimax_h3::recommended_frames(frames),
         );
     }
+    if refine && !minimax_h3::refine_supported_model(model) {
+        anyhow::bail!(
+            "--refine runs on {} only; {model} is not that tier",
+            minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P
+        );
+    }
     if width.is_some() != height.is_some() {
         anyhow::bail!("MiniMax H3 requires --width and --height to be supplied together");
     }
     if let (Some(width), Some(height)) = (width, height) {
-        validate_dimensions(width, height)?;
+        validate_dimensions(
+            width,
+            height,
+            if refine {
+                minimax_h3::CanvasRule::RefineFinal
+            } else {
+                minimax_h3::CanvasRule::Compact
+            },
+        )?;
     }
 
     let first_path =
@@ -405,12 +423,12 @@ fn frames_for_duration(seconds: f64) -> Result<u32> {
     Ok(rounded.clamp(minimax_h3::MIN_FRAMES, minimax_h3::MAX_FRAMES))
 }
 
-fn validate_dimensions(width: u32, height: u32) -> Result<()> {
+fn validate_dimensions(width: u32, height: u32, rule: minimax_h3::CanvasRule) -> Result<()> {
     let valid = width > 0
         && height > 0
         && width.is_multiple_of(minimax_h3::DIMENSION_ALIGNMENT)
         && height.is_multiple_of(minimax_h3::DIMENSION_ALIGNMENT)
-        && u64::from(width) * u64::from(height) <= minimax_h3::request_max_pixels()
+        && u64::from(width) * u64::from(height) <= minimax_h3::request_max_pixels(rule)
         && (minimax_h3::MIN_ASPECT_RATIO..=minimax_h3::MAX_ASPECT_RATIO)
             .contains(&(f64::from(width) / f64::from(height)));
     if !valid {
@@ -419,9 +437,20 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
         anyhow::bail!(
             "MiniMax H3 dimensions must be positive multiples of {}, at most {} pixels, with aspect ratio 1:4 through 4:1; nearest official canvas is {}x{}",
             minimax_h3::DIMENSION_ALIGNMENT,
-            minimax_h3::request_max_pixels(),
+            minimax_h3::request_max_pixels(rule),
             recommended_width,
             recommended_height,
+        );
+    }
+    if rule == minimax_h3::CanvasRule::RefineFinal
+        && !minimax_h3::is_admitted_refine_final_canvas(width, height)
+    {
+        anyhow::bail!(
+            "--refine renders pass 1 at half the requested size: both axes must be multiples of {}, the area at most {} pixels, and half of {width}x{height} must itself be an admitted compact canvas ({} px minimum axis, at most {} pixels)",
+            minimax_h3::REFINE_FINAL_ALIGNMENT,
+            minimax_h3::REFINE_MAX_PIXELS,
+            minimax_h3::MIN_COMPACT_AXIS_PIXELS,
+            minimax_h3::COMPACT_MAX_PIXELS,
         );
     }
     Ok(())
@@ -901,6 +930,7 @@ mod tests {
             Some(&last),
             &[],
             None,
+            false,
         )
         .unwrap();
         assert_eq!(prepared.frames, Some(124));
@@ -954,6 +984,7 @@ mod tests {
                 None,
                 &[],
                 None,
+                false,
             )
             .unwrap();
             // A square source stays square, at the largest square the
@@ -978,6 +1009,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1010,6 +1042,7 @@ mod tests {
             Some(&last),
             &[],
             None,
+            false,
         )
         .unwrap_err();
         assert!(error.to_string().contains("must be PNG or JPEG"));
@@ -1078,6 +1111,7 @@ mod tests {
                 path: missing,
             }],
             Some(&client),
+            false,
         )
         .expect_err("a missing API key must fail before touching the path");
         assert!(error.to_string().contains("MOLD_API_KEY"));

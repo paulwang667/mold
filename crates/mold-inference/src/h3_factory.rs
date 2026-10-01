@@ -211,6 +211,12 @@ pub struct H3FactoryPreparedRequestInput {
     /// Ordered Ref2VA references. Always empty for FL2VA, whose conditioning
     /// rides the endpoint contract instead.
     pub references: Vec<H3FactoryReferenceInput>,
+    /// The two-pass refine this request renders with (`GenerateRequest.refine`),
+    /// `None` for the ordinary single pass. `width` / `height` / `rows` are the
+    /// FINAL canvas either way; the plan names how pass 1 relates to it. It
+    /// joins the identity only when present, so a request without `refine`
+    /// hashes exactly as it did before the field existed.
+    pub refine: Option<contract::RefinePlan>,
     pub rows: H3FactoryPreparedRowsInput,
 }
 
@@ -2191,6 +2197,7 @@ fn validate_prepared_request(request: &H3FactoryPreparedRequestInput) -> Result<
         .checked_mul(u64::from(request.height))
         .ok_or_else(|| anyhow!("MiniMax H3 pixel count overflow"))?;
     let aspect_ratio = request.width as f64 / request.height as f64;
+    let canvas_rule = contract::CanvasRule::for_plan(request.refine.as_ref());
     if request.canonical_model != model_contract.canonical_model
         || request.task != model_contract.task
         || !mode_matches_task
@@ -2206,7 +2213,12 @@ fn validate_prepared_request(request: &H3FactoryPreparedRequestInput) -> Result<
         || request.height == 0
         || !request.width.is_multiple_of(contract::DIMENSION_ALIGNMENT)
         || !request.height.is_multiple_of(contract::DIMENSION_ALIGNMENT)
-        || pixel_count > contract::request_max_pixels()
+        || pixel_count > contract::request_max_pixels(canvas_rule)
+        || request.refine.is_some_and(|plan| {
+            plan != contract::RefinePlan::PUBLISHED
+                || request.task != Task::Ref2va
+                || !contract::is_admitted_refine_final_canvas(request.width, request.height)
+        })
         || !(contract::MIN_ASPECT_RATIO..=contract::MAX_ASPECT_RATIO).contains(&aspect_ratio)
         || !contract::valid_frame_count(request.frames)
         || request.video_latent_frames != expected_video_latent_frames
@@ -3934,6 +3946,13 @@ pub fn expected_h3_factory_prepared_request_identity(
     ] {
         hash.update(value.to_le_bytes());
     }
+    // Appended ONLY for a refine request, so every request without one hashes
+    // byte-identically to before the field existed.
+    if let Some(refine) = &request.refine {
+        hash.update(b"mold.minimax-h3.prepared-request.refine.v1\0");
+        hash.update(refine.scale.to_le_bytes());
+        hash.update((refine.start_index as u64).to_le_bytes());
+    }
     format!("{:x}", hash.finalize())
 }
 
@@ -5298,6 +5317,7 @@ mod tests {
                 normalized_cpu_content_sha256: sha('5'),
             }],
             references: Vec::new(),
+            refine: None,
             rows: H3FactoryPreparedRowsInput {
                 qwen_output_text_rows: 1,
                 qwen_vision_rows: 64,

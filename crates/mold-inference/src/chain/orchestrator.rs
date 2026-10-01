@@ -483,6 +483,7 @@ fn build_stage_generate_request(
         distill_strength_high: None,
         distill_strength_low: None,
         turbo_lora_strength: None,
+        refine: None,
         prompt: stage.prompt.clone(),
         negative_prompt: stage.negative_prompt.clone(),
         model: chain.model.clone(),

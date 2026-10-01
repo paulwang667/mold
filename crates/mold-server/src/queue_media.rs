@@ -727,6 +727,7 @@ fn extract_request_fields(
         distill_strength_high,
         distill_strength_low,
         turbo_lora_strength,
+        refine,
         placement,
         save_to_gallery,
     } = request;
@@ -921,6 +922,7 @@ fn extract_request_fields(
         distill_strength_high,
         distill_strength_low,
         turbo_lora_strength,
+        refine,
         placement,
         save_to_gallery,
     };
@@ -1619,10 +1621,12 @@ mod tests {
             "loras": [
                 { "path": "/private/stack-a.safetensors", "scale": 0.7 },
                 { "path": "/private/stack-b.safetensors", "scale": 0.8, "expert": "high" }
-            ]
+            ],
+            "refine": { "scale": 2 }
         }))
         .unwrap();
         let expected = serde_json::to_value(&request).unwrap();
+        assert_eq!(expected["refine"], serde_json::json!({ "scale": 2 }));
         let staging = tempfile::tempdir().unwrap();
         let resolved = staging.path().join("reference-1.media");
         std::fs::write(&resolved, b"resolved-reference-bytes").unwrap();
@@ -1642,6 +1646,9 @@ mod tests {
                 "{field} leaked into durable JSON"
             );
         }
+        // `refine` is a plain setting like `turbo_lora_strength`: it stays in
+        // the durable JSON, or a replayed job would render in one pass.
+        assert_eq!(durable["refine"], serde_json::json!({ "scale": 2 }));
         let json = extracted.request_json();
         for secret in [
             "source-private.png",

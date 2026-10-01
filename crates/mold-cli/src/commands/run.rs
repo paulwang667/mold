@@ -868,6 +868,10 @@ pub struct WanFlags {
     /// MiniMax H3 Turbo LoRA strength in (0, 1]; not a Wan recipe flag, grouped
     /// here only to keep the `run` signature from growing.
     pub turbo_strength: Option<f64>,
+    /// `--refine`: the MiniMax H3 two-pass render at scale 2 (see
+    /// [`mold_core::minimax_h3::H3_REFINE_SCALE`]); grouped here for the same
+    /// reason as `turbo_strength`.
+    pub refine: bool,
 }
 
 impl WanFlags {
@@ -905,6 +909,9 @@ impl WanFlags {
             distill_strength_high,
             distill_strength_low,
             turbo_lora_strength: self.turbo_strength,
+            refine: self.refine.then_some(mold_core::RefineRequest {
+                scale: mold_core::minimax_h3::H3_REFINE_SCALE,
+            }),
         })
     }
 }
@@ -915,6 +922,7 @@ pub(crate) struct ResolvedWanFlags {
     pub distill_strength_high: Option<f64>,
     pub distill_strength_low: Option<f64>,
     pub turbo_lora_strength: Option<f64>,
+    pub refine: Option<mold_core::RefineRequest>,
 }
 
 /// `high=1.5,low=1.0` (either half optional, any order) or one bare number
@@ -1309,6 +1317,7 @@ pub async fn run(
         last_frame.as_deref(),
         h3_references,
         reference_client.as_ref(),
+        wan_flags.refine,
     )?;
     let frames = h3_authoring.frames.or(frames);
     let fps = h3_authoring.fps.or(fps);
@@ -1966,6 +1975,7 @@ pub async fn run(
             distill_strength_high: wan.distill_strength_high,
             distill_strength_low: wan.distill_strength_low,
             turbo_lora_strength: wan.turbo_lora_strength,
+            refine: wan.refine,
             source_image_name: if is_h3 {
                 h3_authoring.source_image_name.or_else(|| {
                     image

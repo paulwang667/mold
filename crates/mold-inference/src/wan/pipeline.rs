@@ -3290,6 +3290,7 @@ mod tests {
             distill_strength_high: None,
             distill_strength_low: None,
             turbo_lora_strength: None,
+            refine: None,
             prompt: "a cat".to_string(),
             negative_prompt: None,
             model: "wan21-t2v-1.3b:bf16".to_string(),

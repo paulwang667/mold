@@ -1129,6 +1129,8 @@ pub struct Ltx2Options {
     pub distill_strength_low: Option<f64>,
     /// MiniMax H3 Turbo LoRA strength (`--turbo-strength`). `None` keeps the tier's.
     pub turbo_lora_strength: Option<f64>,
+    /// MiniMax H3 two-pass refine (`--refine`). `None` renders in one pass.
+    pub refine: Option<mold_core::RefineRequest>,
     /// Display-safe first-frame provenance. Never a client path.
     pub source_image_name: Option<String>,
     /// `--fit`: resample the source image onto the REQUESTED canvas before
@@ -1296,6 +1298,7 @@ pub async fn run(
         distill_strength_high,
         distill_strength_low,
         turbo_lora_strength,
+        refine,
         source_image_name,
         source_fit,
         references,
@@ -1646,6 +1649,7 @@ pub async fn run(
                         distill_strength_high: None,
                         distill_strength_low: None,
                         turbo_lora_strength: None,
+                        refine: None,
                         prompt: prompt.to_string(),
                         negative_prompt: None,
                         model: model.to_string(),
@@ -1837,6 +1841,7 @@ pub async fn run(
         distill_strength_high,
         distill_strength_low,
         turbo_lora_strength,
+        refine,
         prompt: prompt.to_string(),
         negative_prompt: effective_negative_prompt.clone(),
         model: model.to_string(),
@@ -5797,6 +5802,7 @@ mod tests {
                 distill_strength_high: None,
                 distill_strength_low: None,
                 turbo_lora_strength: None,
+                refine: None,
                 source_image_name: None,
                 source_fit: None,
                 references: None,

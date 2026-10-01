@@ -1976,6 +1976,14 @@ Examples:
         #[arg(long, value_name = "STRENGTH", help_heading = "Video")]
         turbo_strength: Option<f64>,
 
+        /// MiniMax H3 two-pass refine (hires-fix): render the whole distilled
+        /// schedule on a canvas half the requested WIDTH x HEIGHT in each
+        /// axis, upscale the latent 2x and finish the schedule's tail at the
+        /// requested size. Ref2VA Turbo 8-step 768p only; both axes must be
+        /// multiples of 64 and the final canvas at most 1920x1088.
+        #[arg(long, help_heading = "Video")]
+        refine: bool,
+
         /// Camera-control LoRA preset name or .safetensors path.
         ///
         /// Preset aliases (dolly-in, dolly-left, dolly-out, dolly-right,
@@ -3298,6 +3306,7 @@ async fn run() -> anyhow::Result<()> {
             sample_shift,
             distill_strength,
             turbo_strength,
+            refine,
             camera_control,
             host,
             format,
@@ -3505,6 +3514,7 @@ async fn run() -> anyhow::Result<()> {
                     sample_shift,
                     distill_strength,
                     turbo_strength,
+                    refine,
                 },
                 camera_control,
                 host,

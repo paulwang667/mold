@@ -100,8 +100,8 @@ pub use generation_profile::{
 };
 pub use generation_profile::{
     transparency_for_recipe, validate_transparency_against, validate_transparency_choice,
-    ImageInputFormat, ReferenceCanvasRule, TransparencyCapabilitiesProfile,
-    TRANSPARENCY_UNSUPPORTED_REASON,
+    ImageInputFormat, ReferenceCanvasRule, RefineCapabilitiesProfile,
+    TransparencyCapabilitiesProfile, TRANSPARENCY_UNSUPPORTED_REASON,
 };
 pub use install_error::InstallError;
 pub use media_paths::{configured_media_roots, parse_media_roots_env, resolve_server_media_path};
@@ -129,6 +129,7 @@ pub use print_title::{
 pub use prompt_text::normalize_prompt_newlines;
 pub use reference_upload::{ReferenceUploadLease, ReferenceUploadSource};
 pub use types::GenerateRequest;
+pub use types::RefineRequest;
 pub use types::Scheduler;
 pub use types::*;
 pub use validation::{

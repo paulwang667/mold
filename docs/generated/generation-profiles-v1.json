@@ -27605,7 +27605,7 @@
       "profile": {
         "schema_version": 1,
         "profile_id": "minimax-h3.minimax-h3-ref2va",
-        "profile_hash": "e6e374d2782a9f2e1946dbdddee04f6f49e58f4ce90bb47d8bde93665bd2c6f9",
+        "profile_hash": "53da6a8f7520ef4f2c4cb3a1801905f647b98e7b9220fa570efe44a5cd8d970b",
         "default_recipe_id": "default",
         "recipes": [
           {
@@ -27830,6 +27830,12 @@
                 "formats": [],
                 "native_alpha": false,
                 "reason": "This model does not render transparent backgrounds (transparent_background)."
+              },
+              "refine": {
+                "scale": 2,
+                "alignment": 64,
+                "max_pixels": 2088960,
+                "steps": 9
               }
             },
             "provenance": [

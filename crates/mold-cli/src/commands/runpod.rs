@@ -1790,6 +1790,7 @@ pub async fn run_run(opts: RunOptions) -> Result<()> {
         distill_strength_high: None,
         distill_strength_low: None,
         turbo_lora_strength: None,
+        refine: None,
         prompt: opts.prompt.clone(),
         negative_prompt,
         model,

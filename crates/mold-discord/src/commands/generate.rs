@@ -621,6 +621,7 @@ pub fn build_generate_request(params: BuildParams<'_>) -> GenerateRequest {
         distill_strength_high: None,
         distill_strength_low: None,
         turbo_lora_strength: None,
+        refine: None,
         prompt: params.prompt.to_string(),
         negative_prompt: if is_h3 {
             None

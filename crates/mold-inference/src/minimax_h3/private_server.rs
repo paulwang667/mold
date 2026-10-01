@@ -303,6 +303,18 @@ impl H3PrivateRuntimeEnvelopeRecord {
         task: Task,
         turbo: Option<&H3FactoryTurboAdapterAuthority>,
     ) -> Result<()> {
+        self.validate_for_task_with_adapter_under(task, turbo, contract::CanvasRule::Compact)
+    }
+
+    /// [`Self::validate_for_task_with_adapter`] under an explicit canvas rule:
+    /// the envelope of a refine request is minted at its FINAL canvas and held
+    /// to [`contract::CanvasRule::RefineFinal`] instead of the compact ceiling.
+    pub(crate) fn validate_for_task_with_adapter_under(
+        &self,
+        task: Task,
+        turbo: Option<&H3FactoryTurboAdapterAuthority>,
+        rule: contract::CanvasRule,
+    ) -> Result<()> {
         let reviewed_steps = match turbo {
             None => None,
             Some(turbo) => {
@@ -317,7 +329,7 @@ impl H3PrivateRuntimeEnvelopeRecord {
                 Some(turbo.grid_points())
             }
         };
-        self.validate_for_task_with_reviewed_steps(task, reviewed_steps)
+        self.validate_for_task_with_reviewed_steps(task, reviewed_steps, rule)
     }
 
     /// Apply a step count whose task scoping the CALLER has already
@@ -329,6 +341,7 @@ impl H3PrivateRuntimeEnvelopeRecord {
         &self,
         task: Task,
         turbo_steps: Option<u32>,
+        rule: contract::CanvasRule,
     ) -> Result<()> {
         // A Turbo tier's count is EXACT: it is the distilled adapter's own
         // schedule length, a property of the weights rather than a
@@ -359,10 +372,10 @@ impl H3PrivateRuntimeEnvelopeRecord {
                 }
             }
         }
-        self.validate_shape(task)
+        self.validate_shape(task, rule)
     }
 
-    fn validate_shape(&self, task: Task) -> Result<()> {
+    fn validate_shape(&self, task: Task, rule: contract::CanvasRule) -> Result<()> {
         let conditioning_ok = match task {
             Task::Fl2va => {
                 self.endpoint_count == 1
@@ -376,13 +389,15 @@ impl H3PrivateRuntimeEnvelopeRecord {
             }
         };
         // The canvas and the clip length are RULES, not equalities:
-        // `mold_core`'s `is_admitted_compact_canvas` and `valid_frame_count`
-        // are the single authorities, and the generation profile's range, the
-        // private bridge's advertised bounds, and this gate all read them.
+        // `mold_core`'s `is_admitted_request_canvas` (the compact rule, or the
+        // refine rule for a refine request's FINAL canvas) and
+        // `valid_frame_count` are the single authorities, and the generation
+        // profile's range, the private bridge's advertised bounds, and this
+        // gate all read them.
         // The envelope is minted for the request's own shape, so the row
         // ceilings below travel with it; the memory bounds it carries are
         // scaled from the campaign's measurement by that shape's packed rows.
-        if !contract::is_admitted_request_canvas(self.width, self.height)
+        if !contract::is_admitted_request_canvas(self.width, self.height, rule)
             || !contract::valid_frame_count(self.frames)
             || self.fps != contract::FIXED_FPS
             || self.batch_size != 1
@@ -418,7 +433,11 @@ impl H3PrivateRuntimeEnvelopeRecord {
         // The request's own task selects the conditioning contract, and the
         // adapter must have been reviewed for that same task before its step
         // count is applied.
-        self.validate_for_task_with_adapter(request.task, turbo)?;
+        self.validate_for_task_with_adapter_under(
+            request.task,
+            turbo,
+            contract::CanvasRule::for_plan(request.refine.as_ref()),
+        )?;
         // Name every differing axis: one bare mismatch sentence made a
         // wrong-tier step count, an off-canvas size, and an over-cap prompt
         // all read identically, which is undebuggable from a client.
@@ -710,6 +729,7 @@ fn precheck_private_h3_admission_capacity(
     compute_capability: Option<(u16, u16)>,
     available_device_bytes: u64,
     available_host_headroom_bytes: u64,
+    refine: Option<contract::RefinePlan>,
 ) -> Result<()> {
     let strict = precheck_private_h3_admission_capacity_strict(
         bounds,
@@ -717,23 +737,30 @@ fn precheck_private_h3_admission_capacity(
         available_device_bytes,
         available_host_headroom_bytes,
     );
-    waive_memory_shortfall_for_refine_uncap("admission floor", strict)
+    // PHASE-3: remove (plan docs/plans/h3-refine-productization.md)
+    waive_memory_shortfall_for_refine("admission floor", refine, strict)
 }
 
-/// RESEARCH PROTOTYPE (`MOLD_H3_REFINE_PROTO=...,uncap=1`, closed by default):
-/// the linear workspace grants are extrapolated from a 1344x768 measurement, so
-/// at a multi-megapixel final canvas they can exceed a card the render would in
-/// fact fit (or, honestly, not). Under the gate a memory shortfall is logged
-/// with both numbers and waived so the run can be measured; a real OOM then
-/// surfaces from the device. With the gate closed the result is returned as-is.
+/// PHASE-3: remove (plan docs/plans/h3-refine-productization.md).
+///
+/// The linear workspace grants are extrapolated from a 1344x768 measurement, so
+/// at a multi-megapixel FINAL canvas they can exceed a card the render would in
+/// fact fit (or, honestly, not). Until phase 3 measures the peak and re-derives
+/// the bounds for the refine range, a memory shortfall of a request that
+/// carries a [`contract::RefinePlan`] is logged with both numbers and waived; a
+/// real OOM then surfaces from the device. A request without one gets the
+/// result as-is.
 #[cfg(feature = "mp4")]
-fn waive_memory_shortfall_for_refine_uncap(what: &str, outcome: Result<()>) -> Result<()> {
+fn waive_memory_shortfall_for_refine(
+    what: &str,
+    refine: Option<contract::RefinePlan>,
+    outcome: Result<()>,
+) -> Result<()> {
     match outcome {
-        Err(error) if contract::refine_proto_uncap() => {
+        Err(error) if refine.is_some() => {
             tracing::warn!(
-                target: "mold::minimax_h3::refine_proto",
-                "H3 refine-proto uncap=1: waiving {what} memory refusal ({error:#}); \
-                 the run may OOM on the device"
+                target: "mold::minimax_h3::refine",
+                "H3 refine: waiving {what} memory refusal ({error:#}); the run may OOM on the device"
             );
             Ok(())
         }
@@ -871,6 +898,7 @@ fn check_private_h3_target_budget_fits(
     compute_capability: Option<(u16, u16)>,
     available_device_bytes: u64,
     available_host_headroom_bytes: u64,
+    refine: Option<contract::RefinePlan>,
 ) -> Result<()> {
     let strict = check_private_h3_target_budget_fits_strict(
         predicted_device_peak_bytes,
@@ -879,18 +907,19 @@ fn check_private_h3_target_budget_fits(
         available_device_bytes,
         available_host_headroom_bytes,
     );
-    if strict.is_ok() || !contract::refine_proto_uncap() {
+    // PHASE-3: remove (plan docs/plans/h3-refine-productization.md)
+    if strict.is_ok() || refine.is_none() {
         return strict;
     }
     tracing::warn!(
-        target: "mold::minimax_h3::refine_proto",
+        target: "mold::minimax_h3::refine",
         predicted_device_peak_bytes,
         predicted_host_increment_bytes,
         available_device_bytes,
         available_host_headroom_bytes,
-        "H3 refine-proto uncap=1: predicted target budget exceeds the admission sample"
+        "H3 refine: predicted target budget exceeds the admission sample"
     );
-    waive_memory_shortfall_for_refine_uncap("target budget", strict)
+    waive_memory_shortfall_for_refine("target budget", refine, strict)
 }
 
 #[cfg(feature = "mp4")]
@@ -1682,9 +1711,10 @@ impl H3PrivateFl2VaAdmissionEvidence {
         available_device_bytes: u64,
         available_host_headroom_bytes: u64,
     ) -> Result<()> {
-        // Research prototype (`MOLD_H3_REFINE_PROTO=...,uncap=1`, off by
-        // default): the four memory-vs-sample comparisons below are waived.
-        let refine_uncap = contract::refine_proto_uncap();
+        // PHASE-3: remove (plan docs/plans/h3-refine-productization.md).
+        // A request that carries a refine plan has the four memory-vs-sample
+        // comparisons below waived, exactly as admission waived them.
+        let refine_uncap = contract::RefinePlan::for_request(request).is_some();
         self.validate_resolved_request(request)?;
         self.base_factory_authority.validate_engine_seam(
             &self.canonical_model,
@@ -1776,8 +1806,8 @@ impl H3PrivateFl2VaAdmissionEvidence {
             ),
             (
                 "available device bytes >= predicted device peak",
-                // Research prototype: waived under `uncap=1` (see
-                // `waive_memory_shortfall_for_refine_uncap`).
+                // PHASE-3: remove (waived for a refine request; see
+                // `waive_memory_shortfall_for_refine`).
                 refine_uncap || available_device_bytes >= self.predicted_device_peak_bytes,
             ),
             (
@@ -2104,6 +2134,7 @@ fn prepare_reviewed_h3_private_fl2va_admission(
         compute_capability,
         available_device_bytes,
         available_host_headroom_bytes,
+        contract::RefinePlan::for_request(request),
     )?;
     // The prepared request is built BEFORE that artifact pass for the same
     // reason the capacity floors are checked before it: the conditioner
@@ -2280,6 +2311,7 @@ fn prepare_reviewed_h3_private_fl2va_admission(
         // already accepted. Ref2VA's conditioning envelope is a function of
         // it; FL2VA carries none.
         request.references.as_deref().unwrap_or_default(),
+        contract::RefinePlan::for_request(request),
     )?;
     progress.checkpoint()?;
 
@@ -2472,6 +2504,7 @@ fn prepare_reviewed_h3_private_fl2va_admission(
         compute_capability,
         available_device_bytes,
         available_host_headroom_bytes,
+        contract::RefinePlan::for_request(request),
     )?;
     let budget_echo = H3FactoryExecutionBudgetEchoInput {
         prepared_attempt_identity_sha256: prepared_attempt.identity_sha256.clone(),
@@ -3424,6 +3457,7 @@ fn prepare_reviewed_h3_private_fl2va_attempt(
         // reference set cannot reopen the plan.
         frozen_route.task,
         request.references.as_deref().unwrap_or_default(),
+        contract::RefinePlan::for_request(request),
     )?;
     if runtime_qualification.identity_sha256() != owner_fence.runtime_qualification_identity_sha256
         || runtime_qualification.artifact_qualification_identity_sha256()
@@ -5436,6 +5470,7 @@ enum RuntimeQualificationStorage {
     /// it was minted with, so revalidation stays exactly as strict as minting.
     PublicCompiled {
         turbo_steps: Option<u32>,
+        canvas_rule: contract::CanvasRule,
     },
     /// Provisional, non-qualifying bounds that exist only to admit an
     /// instrumented campaign run so it can measure the real ones. Constructible
@@ -5467,9 +5502,15 @@ impl RuntimeQualificationStorage {
                 record.bounds.validate()
             }
             #[cfg(feature = "h3")]
-            Self::PublicCompiled { turbo_steps } => {
-                validate_public_runtime_profile_with_turbo(record, record_file_sha256, *turbo_steps)
-            }
+            Self::PublicCompiled {
+                turbo_steps,
+                canvas_rule,
+            } => validate_public_runtime_profile_with_turbo(
+                record,
+                record_file_sha256,
+                *turbo_steps,
+                *canvas_rule,
+            ),
             #[cfg(feature = "h3-private-uat")]
             Self::CaptureCompiled => validate_capture_runtime_profile(record, record_file_sha256),
         }
@@ -5806,7 +5847,12 @@ fn validate_public_runtime_profile(
     record: &H3PrivateRuntimeQualificationRecord,
     profile_sha256: &str,
 ) -> Result<()> {
-    validate_public_runtime_profile_with_turbo(record, profile_sha256, None)
+    validate_public_runtime_profile_with_turbo(
+        record,
+        profile_sha256,
+        None,
+        contract::CanvasRule::Compact,
+    )
 }
 
 /// The compiled public profile identities for one task partition: schema,
@@ -5843,6 +5889,7 @@ fn validate_public_runtime_profile_with_turbo(
     record: &H3PrivateRuntimeQualificationRecord,
     profile_sha256: &str,
     turbo_steps: Option<u32>,
+    canvas_rule: contract::CanvasRule,
 ) -> Result<()> {
     // The record's own serialized task selects the conditioning contract, and
     // the identity tuple below pins that same task against the schema,
@@ -5856,7 +5903,7 @@ fn validate_public_runtime_profile_with_turbo(
     };
     record
         .envelope
-        .validate_for_task_with_reviewed_steps(task, turbo_steps)?;
+        .validate_for_task_with_reviewed_steps(task, turbo_steps, canvas_rule)?;
     record.bounds.validate()?;
     let (schema, decision, canonical_model, task_name) = public_runtime_profile_identities(task);
     if record.schema != schema
@@ -6597,6 +6644,9 @@ fn public_runtime_qualification(
     // none and its envelope is a pure function of the shape above.
     task: Task,
     references: &[mold_core::GenerationReference],
+    // The request's refine plan, when it carries one: the minted envelope's
+    // canvas is the FINAL canvas and is held to the refine rule.
+    refine: Option<contract::RefinePlan>,
 ) -> Result<H3PrivateRuntimeQualificationAuthority> {
     // A tier reviewed for another task may not set this record's step count —
     // the FL2V 768p and Ref2V tiers share a 5-point schedule, so a bare count
@@ -6687,10 +6737,14 @@ fn public_runtime_qualification(
     };
     record.identity_sha256 = runtime_qualification_identity(&record);
     let profile_sha256 = record.identity_sha256.clone();
-    validate_public_runtime_profile_with_turbo(&record, &profile_sha256, turbo_steps)?;
+    let canvas_rule = contract::CanvasRule::for_plan(refine.as_ref());
+    validate_public_runtime_profile_with_turbo(&record, &profile_sha256, turbo_steps, canvas_rule)?;
     let bounds = record.bounds.clone().into_authority();
     Ok(H3PrivateRuntimeQualificationAuthority {
-        storage: RuntimeQualificationStorage::PublicCompiled { turbo_steps },
+        storage: RuntimeQualificationStorage::PublicCompiled {
+            turbo_steps,
+            canvas_rule,
+        },
         record_file_sha256: profile_sha256,
         record,
         bounds,
@@ -8160,6 +8214,7 @@ mod tests {
             reference_fingerprint: format!("{:x}", Sha256::digest(b"references")),
             endpoints: Vec::new(),
             references: Vec::new(),
+            refine: None,
             rows: H3FactoryPreparedRowsInput {
                 qwen_output_text_rows: envelope.max_qwen_output_text_rows,
                 qwen_vision_rows: envelope.max_qwen_vision_rows,
@@ -8235,6 +8290,7 @@ mod tests {
                 None,
                 task,
                 references,
+                None,
             )
         };
         let authority = mint(&artifact, Task::Ref2va, &references).unwrap();
@@ -8703,6 +8759,7 @@ mod tests {
                 None,
                 Task::Fl2va,
                 &[],
+                None,
             )
         };
         // The rows a REAL request at this shape packs, so the row caps are
@@ -8816,6 +8873,7 @@ mod tests {
                 turbo,
                 Task::Fl2va,
                 &[],
+                None,
             )
         };
         let error = mint(Some(&ref2v))
@@ -9142,6 +9200,7 @@ mod tests {
                 normalized_cpu_content_sha256: sha('5'),
             }],
             references: Vec::new(),
+            refine: None,
             rows: H3FactoryPreparedRowsInput {
                 qwen_output_text_rows: 128,
                 qwen_vision_rows: 1_024,
@@ -10149,6 +10208,7 @@ mod tests {
                 Some((8, 9)),
                 SM89_CAMPAIGN_DEVICE_SAMPLE_BYTES,
                 SM89_CAMPAIGN_HOST_SAMPLE_BYTES,
+                None,
             )
             .unwrap();
             // Pin the derived floors so any re-derivation of the ceilings is
@@ -11017,21 +11077,24 @@ mod tests {
                 bounds,
                 Some((8, 9)),
                 device_floor.saturating_sub(1),
-                u64::MAX
+                u64::MAX,
+                None
             )
             .is_err());
             assert!(precheck_private_h3_admission_capacity(
                 bounds,
                 Some((8, 9)),
                 u64::MAX,
-                host_floor.saturating_sub(1)
+                host_floor.saturating_sub(1),
+                None
             )
             .is_err());
             assert!(precheck_private_h3_admission_capacity(
                 bounds,
                 Some((8, 9)),
                 device_floor,
-                host_floor
+                host_floor,
+                None
             )
             .is_ok());
 
@@ -11040,10 +11103,11 @@ mod tests {
                 bounds,
                 None,
                 unified_floor.saturating_sub(1),
-                1
+                1,
+                None
             )
             .is_err());
-            precheck_private_h3_admission_capacity(bounds, None, unified_floor, 1).unwrap();
+            precheck_private_h3_admission_capacity(bounds, None, unified_floor, 1, None).unwrap();
         }
     }
 
@@ -11060,6 +11124,7 @@ mod tests {
             Some((8, 9)),
             9_000_000_000,
             7_000_000_000,
+            None,
         )
         .unwrap();
 
@@ -11069,6 +11134,7 @@ mod tests {
             Some((8, 9)),
             9_000_000_000,
             7_000_000_000,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -11083,6 +11149,7 @@ mod tests {
             Some((8, 9)),
             9_000_000_000,
             7_000_000_000,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -11091,14 +11158,22 @@ mod tests {
         assert!(host.contains("host"), "{host}");
         assert!(!host.contains("device"), "{host}");
 
-        check_private_h3_target_budget_fits(9_000_000_000, 7_000_000_000, None, 9_000_000_000, 1)
-            .unwrap();
+        check_private_h3_target_budget_fits(
+            9_000_000_000,
+            7_000_000_000,
+            None,
+            9_000_000_000,
+            1,
+            None,
+        )
+        .unwrap();
         let metal = check_private_h3_target_budget_fits(
             9_000_000_001,
             7_000_000_000,
             None,
             9_000_000_000,
             1,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -11128,6 +11203,7 @@ mod tests {
             Some((8, 9)),
             u64::MAX,
             host_floor.saturating_sub(1),
+            None,
         )
         .unwrap_err();
         assert!(!floor_error.to_string().contains("device"), "{floor_error}");
@@ -11146,6 +11222,7 @@ mod tests {
             Some((8, 9)),
             9_000_000_000,
             12_659_979_674,
+            None,
         )
         .unwrap_err()
         .downcast::<H3PrivateHostHeadroomShortfall>()
@@ -11159,7 +11236,8 @@ mod tests {
         // A device shortfall must NOT be classified as one, or a reclaim would
         // evict the cache for memory eviction cannot supply.
         let device_error =
-            precheck_private_h3_admission_capacity(&bounds, Some((8, 9)), 0, u64::MAX).unwrap_err();
+            precheck_private_h3_admission_capacity(&bounds, Some((8, 9)), 0, u64::MAX, None)
+                .unwrap_err();
         assert!(device_error
             .downcast::<H3PrivateHostHeadroomShortfall>()
             .is_err());
@@ -11200,6 +11278,7 @@ mod tests {
                 Some((8, 9)),
                 device_floor.saturating_sub(1),
                 u64::MAX,
+                None,
             )
             .unwrap_err(),
         );
@@ -11217,6 +11296,7 @@ mod tests {
                     Some((8, 9)),
                     u64::MAX,
                     host_floor.saturating_sub(1),
+                    None,
                 )
                 .unwrap_err(),
             )
@@ -11230,6 +11310,7 @@ mod tests {
                 None,
                 unified_floor.saturating_sub(1),
                 0,
+                None,
             )
             .unwrap_err(),
         );
@@ -11243,6 +11324,7 @@ mod tests {
                 Some((8, 9)),
                 9_000_000_000,
                 7_000_000_000,
+                None,
             )
             .unwrap_err(),
         );
@@ -11258,6 +11340,7 @@ mod tests {
                     Some((8, 9)),
                     9_000_000_000,
                     7_000_000_000,
+                    None,
                 )
                 .unwrap_err(),
             )
@@ -11272,6 +11355,7 @@ mod tests {
                 None,
                 9_000_000_000,
                 1,
+                None,
             )
             .unwrap_err(),
         );
@@ -11392,6 +11476,7 @@ mod tests {
             None,
             Task::Fl2va,
             &[],
+            None,
         )
         .unwrap();
         authority.revalidate().unwrap();
@@ -11482,6 +11567,7 @@ mod tests {
                 None,
                 Task::Fl2va,
                 &[],
+                None,
             )
             .is_err());
             crossed.task = "ref2va";
@@ -11499,6 +11585,7 @@ mod tests {
                 None,
                 Task::Fl2va,
                 &[],
+                None,
             )
             .is_err());
         }
@@ -11518,6 +11605,7 @@ mod tests {
             None,
             Task::Fl2va,
             &[],
+            None,
         )
         .is_err());
     }

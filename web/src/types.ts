@@ -198,6 +198,8 @@ export interface OutputMetadata {
   sample_shift?: number | null;
   distill_strength_high?: number | null;
   distill_strength_low?: number | null;
+  /** MiniMax H3 two-pass refine this print was rendered with (additive). */
+  refine?: RefineRequest | null;
   frames?: number | null;
   fps?: number | null;
   /** The 3-D controls that shaped a mesh print, RESOLVED (request values or
@@ -449,6 +451,11 @@ export interface DevicePlacement {
   advanced?: AdvancedPlacement | null;
 }
 
+/** The `refine` request block (MiniMax H3 two-pass render). */
+export interface RefineRequest {
+  scale: number;
+}
+
 // Wire shape — what we POST to /api/generate/stream. snake_case to match serde.
 export interface GenerateRequestWire {
   prompt: string;
@@ -572,6 +579,12 @@ export interface GenerateRequestWire {
   sample_shift?: number | null;
   distill_strength_high?: number | null;
   distill_strength_low?: number | null;
+  /** MiniMax H3 Ref2VA Turbo 8-step 768p only: render in two passes, the
+   * first on a canvas half the requested `width` x `height` in each axis.
+   * `scale` must be 2; read the recipe's `capabilities.refine` for the
+   * alignment and area limits. The server rejects — never ignores — it
+   * anywhere else. */
+  refine?: RefineRequest | null;
 }
 
 export interface ModelDefaults {

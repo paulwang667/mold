@@ -22,6 +22,7 @@ pub(crate) fn minimal_generate_request(model: &str) -> crate::types::GenerateReq
         distill_strength_high: None,
         distill_strength_low: None,
         turbo_lora_strength: None,
+        refine: None,
         prompt: "a red apple".to_string(),
         negative_prompt: None,
         model: model.to_string(),
