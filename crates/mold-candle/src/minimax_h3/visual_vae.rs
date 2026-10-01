@@ -85,8 +85,8 @@ impl MiniMaxH3VisualVaeConfig {
             token_drop: 3,
             latents_mean: H3_LATENTS_MEAN.to_vec(),
             latents_std: H3_LATENTS_STD.to_vec(),
-            tile_size: 256,
-            tile_overlap_min: 64,
+            tile_size: diag_tile().0,
+            tile_overlap_min: diag_tile().1,
             tiling: true,
         }
     }
@@ -2828,4 +2828,18 @@ mod tests {
         assert_eq!(gpu.dims5().unwrap(), (1, 3, 5, 36, 36));
         assert!(max_error < 0.08, "CPU/CUDA max error {max_error}");
     }
+}
+
+/// THROWAWAY experiment knob: `/root/h3_vae_tile` holds "<tile> <overlap>" in
+/// pixels, re-read at every VAE construction. Absent file keeps 256/64.
+fn diag_tile() -> (usize, usize) {
+    std::fs::read_to_string("/root/h3_vae_tile")
+        .ok()
+        .and_then(|text| {
+            let mut parts = text
+                .split_whitespace()
+                .map(|part| part.parse::<usize>().ok());
+            Some((parts.next()??, parts.next()??))
+        })
+        .unwrap_or((256, 64))
 }
