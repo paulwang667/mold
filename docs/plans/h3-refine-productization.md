@@ -2,6 +2,12 @@
 
 Status: plan, 2026-10-01. Branch `aiva/h3-refine`, based on the research
 prototype `aiva/h3-refine-proto` (env-gated; measurements in "Evidence").
+Phases 1 and 2 landed together on this branch (2026-10-01): the contract, door
+rules, canvas-rule split, capability advertisement, plan-driven pipeline, ledger
+and two-pass provenance exist and the environment gate is gone. The memory
+waivers in `private_server.rs` (marked `PHASE-3`) and the open bitrate question
+remain; phases 3 to 6 are untouched.
+
 Fork-only: this does not target upstream `utensils/mold`, so the upstream
 reviewed-IDs-only / qualification-record rules bind only where they already bind
 this fork's H3 route (they do; see Constraints).

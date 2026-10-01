@@ -1781,3 +1781,70 @@ Any change to the pinned license, Q&A, source revisions, component identities,
 supported territory, execution layout, attention backend, quantization policy,
 or public product surface requires updating this record and re-running the
 applicable review before release.
+
+## Refine: the two-pass render (phase 1 and 2 facts, 2026-10-01)
+
+`GenerateRequest.refine = { scale: 2 }` is a fork-only, request-driven control
+on `minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p`. The plan, the
+decisions and the rejected alternatives are in
+`docs/plans/h3-refine-productization.md`; this section records what the code
+now guarantees and what the research prototype measured. It is **not** a
+qualified runtime: no measured-peak table exists yet (phase 3), and the private
+runtime qualification must be re-captured on a CUDA host because
+`PRIVATE_RUNTIME_CODE_IDENTITY_SHA256` changed.
+
+What the code guarantees:
+
+- Geometry has one owner, `mold_core::minimax_h3::RefinePlan { scale: 2,
+  start_index: 4 }`. Grid index 4 of the 8-step shift-12 grid is
+  `sigma_video = 12 * 0.5 / (1 + 11 * 0.5) = 0.9231` (the audio grid's shift 3
+  gives `0.75`); a `mold-core` test derives it from the formula and a
+  `mold-inference` test reads it off the real schedule.
+- Door: the Ref2VA Turbo 8-step 768p tag only, `scale == 2`, `steps == 9`,
+  both final axes multiples of 64, final area <= 2,088,960 pixels (1920x1088),
+  and the pass-1 canvas (final / 2) an admitted compact canvas. Codes
+  `MINIMAX_H3_REFINE_{TIER,SCALE,GRID,ALIGNMENT,PIXELS,PASS1_CANVAS}`. Requests
+  without `refine` keep `COMPACT_MAX_PIXELS` (1,032,192) and `MAX_PIXELS`
+  exactly; a 1920x1088 request without `refine` is still refused.
+- Pass 1 is the whole 8-forward schedule at the pass-1 canvas; the unpatchified
+  video latent is bilinearly upsampled (half-pixel centres, time untouched,
+  F32); both latents are re-noised with fresh noise from streams seeded
+  `seed ^ "H3REFINV"` (video) and `seed ^ "H3REFINA"` (audio), so pass 1's draw
+  order is untouched; pass 2 is forwards 4..8 of the same frozen schedule on the
+  final canvas with the references and text states reused. The transformer
+  stays resident across both passes (the phase ledger expects `n + (n - start)`
+  = 12 forwards), so the VAE-reload / transformer-drop order the release
+  contract anchors is unchanged.
+- Provenance keeps `requested_grid_points`, `transformer_evaluations` and
+  `noise_draws` at their pass-1 meaning (admission freezes exactly those and
+  the terminal gate compares against them) and adds `refine`: scale, start
+  index, pass-1 dimensions, forwards per pass and the two re-noise sigmas. The
+  terminal gate requires it to name the plan admission froze.
+- The prepared-request identity gains `refine` bytes only when a plan is
+  present; the bounded thumbnail PNG shrinks a first frame above 1344x768
+  before encoding (a full-size PNG of a 2560x1408 frame exceeded the 4 MiB
+  bound and failed a finished job).
+- The MP4 sink stays at its fixed 10 Mbps openh264 setting. Whether it should
+  scale with area has not been measured and is deliberately left open.
+
+What was measured by the research prototype (single character/scene, seed
+20260930 unless noted; the evidence lives with the deployer):
+
+- Laplacian variance +53% (1344x576) and +69% (1536x640, against a 3-seed
+  direct mean) over a direct render at Turbo strength 0.5; subject position
+  stays near centre. At a common 1920 width the 1920x1088 refine render has 52%
+  more Laplacian variance than the 1536x640 one stretched to 1920.
+- Start-index sweep (3/4/5 x 2 seeds): position unchanged; index 5 leaves
+  floating gold specks and ghost trails in both seeds; index 3 is slower and
+  softer; index 4 kept.
+- Pass 2 costs about 45 s/forward at 1536x640, 104 s at 1920x1088 and 243 s at
+  2560x1408 on a 46 GB L20 (compute-bound as the canvas grows). Free VRAM at the
+  end of pass 2 left about 23 GB used at 1920x1088 and 33 GB at 2560x1408.
+  These are not peaks.
+
+Open until phase 3: the measured PEAK table for 1344x768, 1536x640 and
+1920x1088, and the Ref2VA runtime bounds re-derived for the refine range. Until
+then admission waives the extrapolated memory refusals for a request that
+carries a plan (each waiver is marked `PHASE-3` in `private_server.rs`), and
+private-UAT builds, which validate against external campaign records under the
+compact rule, refuse refine at the envelope.

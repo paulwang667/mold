@@ -259,6 +259,30 @@ maintainers' probes (2026-09-28) with no obvious softening at draft
 resolution. `1.0` is the same render as naming no strength, and any other
 value is a different render (it is part of the frozen adapter identity).
 
+### Refine (two-pass render)
+
+`minimax-h3-ref2va:comfy-pruned-int8-turbo-8step-768p` can render in two passes
+for a sharper clip at a larger size. Ask for it with `refine: { "scale": 2 }`
+in the request (CLI: `mold run --refine`). The request's `width` and `height`
+are the **final** size; pass 1 runs the whole 8-step schedule at half that size
+in each axis, the latent is upscaled 2x, re-noised part-way up the schedule, and
+the last four steps run at the final size with your references reused.
+
+| Rule | Value |
+| --- | --- |
+| Model | the Ref2VA Turbo 8-step 768p tag only |
+| `refine.scale` | exactly `2` |
+| `steps` | `9` (the tier's own grid) |
+| Final size | both axes multiples of 64, at most 1920x1088 (2,088,960 pixels) |
+| Pass-1 size | half the final size, itself a valid single-pass canvas (axes of at least 256 px, at most 1,032,192 pixels, aspect 1:4 to 4:1) |
+
+Requests without `refine` keep every existing size limit. Any other model
+rejects the field, and the recipe advertises the control as
+`capabilities.refine`. A refine render runs 12 model evaluations instead of 8:
+eight at the pass-1 size and four at the final size. Measurements and the
+memory bounds for the refine range are tracked in the MiniMax H3 qualification
+record (`docs/qualification/minimax-h3.md`).
+
 An adapter is reviewed for exactly one task partition, so a `ref2v` adapter
 can never mint an FL2VA qualification and vice versa. Each `-r21` tier
 carries pinned-identity evidence (size, SHA-256, and the full-rank adapter it
