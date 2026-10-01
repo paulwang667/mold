@@ -1714,7 +1714,7 @@ impl H3PrivateFl2VaAdmissionEvidence {
         // PHASE-3: remove (plan docs/plans/h3-refine-productization.md).
         // A request that carries a refine plan has the four memory-vs-sample
         // comparisons below waived, exactly as admission waived them.
-        let refine_uncap = contract::RefinePlan::for_request(request).is_some();
+        let refine_waiver = contract::RefinePlan::for_request(request).is_some();
         self.validate_resolved_request(request)?;
         self.base_factory_authority.validate_engine_seam(
             &self.canonical_model,
@@ -1808,21 +1808,21 @@ impl H3PrivateFl2VaAdmissionEvidence {
                 "available device bytes >= predicted device peak",
                 // PHASE-3: remove (waived for a refine request; see
                 // `waive_memory_shortfall_for_refine`).
-                refine_uncap || available_device_bytes >= self.predicted_device_peak_bytes,
+                refine_waiver || available_device_bytes >= self.predicted_device_peak_bytes,
             ),
             (
                 "available host headroom >= predicted host increment",
-                refine_uncap
+                refine_waiver
                     || available_host_headroom_bytes >= self.predicted_host_increment_bytes,
             ),
             (
                 "admitted available device bytes >= predicted device peak",
-                refine_uncap
+                refine_waiver
                     || self.admitted_available_device_bytes >= self.predicted_device_peak_bytes,
             ),
             (
                 "admitted host headroom >= predicted host increment",
-                refine_uncap
+                refine_waiver
                     || self.admitted_host_headroom_bytes >= self.predicted_host_increment_bytes,
             ),
             (
