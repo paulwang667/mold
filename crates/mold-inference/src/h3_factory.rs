@@ -2117,7 +2117,7 @@ fn validate_prepared_references(
     Ok(totals)
 }
 
-fn validate_prepared_request(request: &H3FactoryPreparedRequestInput) -> Result<()> {
+pub(crate) fn validate_prepared_request(request: &H3FactoryPreparedRequestInput) -> Result<()> {
     for (value, label) in [
         (&request.identity_sha256, "H3 prepared request"),
         (&request.prompt_sha256, "H3 prepared prompt"),
@@ -2255,7 +2255,12 @@ fn validate_prepared_request(request: &H3FactoryPreparedRequestInput) -> Result<
         || !request.height.is_multiple_of(contract::DIMENSION_ALIGNMENT)
         || pixel_count > contract::request_max_pixels(canvas_rule)
         || request.refine.is_some_and(|plan| {
-            plan != contract::RefinePlan::PUBLISHED
+            // The plan is the one this request's grid runs (EXPERIMENT: the
+            // 4-step tier's 5 points re-enter at index 2, the 8-step tier's 9
+            // at index 4). `canonical_model` is the BASE partition here, never
+            // the tier tag, so the tier is read off `grid_points`.
+            Some(plan)
+                != contract::RefinePlan::for_grid_points_scale(request.grid_points, plan.scale)
                 || request.task != Task::Ref2va
                 || !contract::is_admitted_refine_final_canvas(request.width, request.height)
         })
@@ -5572,24 +5577,55 @@ mod tests {
         );
         validate_prepared_request(&plain).unwrap();
 
-        let planned = reseal(H3FactoryPreparedRequestInput {
+        // The plan is the one the request's GRID runs (a prepared request
+        // carries `grid_points`, not the tier tag; `canonical_model` is the
+        // base partition). The 8-step tier is 9 points / 8 forwards.
+        let eight_step = |request: H3FactoryPreparedRequestInput| H3FactoryPreparedRequestInput {
+            grid_points: 9,
+            denoise_forward_count: 8,
+            ..request
+        };
+        let planned = reseal(eight_step(H3FactoryPreparedRequestInput {
             refine: Some(contract::RefinePlan::PUBLISHED),
             ..plain.clone()
-        });
+        }));
         assert_ne!(planned.identity_sha256, plain.identity_sha256);
         validate_prepared_request(&planned).expect("1344x768 splits into 672x384");
-        let later = reseal(H3FactoryPreparedRequestInput {
+        let later = reseal(eight_step(H3FactoryPreparedRequestInput {
             refine: Some(contract::RefinePlan {
                 start_index: 5,
                 ..contract::RefinePlan::PUBLISHED
             }),
             ..plain.clone()
-        });
+        }));
         assert_ne!(later.identity_sha256, planned.identity_sha256);
         assert!(
             validate_prepared_request(&later).is_err(),
-            "not the published plan"
+            "not the tier's plan"
         );
+
+        // EXPERIMENT (throwaway): the 4-step tier (5 points, 4 forwards -- the
+        // fixture's own grid) re-enters at index 2. The 8-step plan on that
+        // grid, and the 4-step plan on the 9-point grid, are refused even when
+        // resealed.
+        let plan4 =
+            contract::RefinePlan::for_model_scale(contract::REF2VA_COMFY_TURBO_4STEP, 2).unwrap();
+        let planned4 = reseal(H3FactoryPreparedRequestInput {
+            refine: Some(plan4),
+            ..plain.clone()
+        });
+        assert_ne!(planned4.identity_sha256, planned.identity_sha256);
+        validate_prepared_request(&planned4).expect("the 4-step tier's own plan");
+        let crossed_eight = reseal(H3FactoryPreparedRequestInput {
+            refine: Some(contract::RefinePlan::PUBLISHED),
+            ..plain.clone()
+        });
+        assert!(validate_prepared_request(&crossed_eight).is_err());
+        let crossed_four = reseal(eight_step(H3FactoryPreparedRequestInput {
+            refine: Some(plan4),
+            ..plain.clone()
+        }));
+        assert!(validate_prepared_request(&crossed_four).is_err());
 
         // A plan on an FL2VA request is refused even when the identity is
         // honestly resealed.
@@ -6264,14 +6300,19 @@ mod tests {
         let checkpoint = raw_checkpoint();
         let plain_request = ref2va_prepared_request();
         let plain = target_budget(&plain_request, &checkpoint);
-        let planned_request = |plan: contract::RefinePlan| {
+        // The plan is validated against the request's grid (9 points for the
+        // 8-step tier, the fixture's own 5 for the 4-step tier).
+        let planned_request_on = |grid_points: u32, plan: contract::RefinePlan| {
             let mut request = H3FactoryPreparedRequestInput {
+                grid_points,
+                denoise_forward_count: grid_points - 1,
                 refine: Some(plan),
                 ..plain_request.clone()
             };
             request.identity_sha256 = expected_prepared_request_identity(&request);
             request
         };
+        let planned_request = |plan: contract::RefinePlan| planned_request_on(9, plan);
         let published = planned_request(contract::RefinePlan::PUBLISHED);
         let later = planned_request(contract::RefinePlan {
             start_index: 5,
@@ -6294,6 +6335,17 @@ mod tests {
         assert!(validate(&plain, &published).is_err());
         assert!(validate(&with_later_plan, &published).is_err());
         assert!(validate(&with_plan, &plain_request).is_err());
+
+        // EXPERIMENT (throwaway): the 4-step tier's plan is a different budget
+        // identity and validates against its own request.
+        let plan4 =
+            contract::RefinePlan::for_model_scale(contract::REF2VA_COMFY_TURBO_4STEP, 2).unwrap();
+        let request4 = planned_request_on(5, plan4);
+        let budget4 = target_budget(&request4, &checkpoint);
+        assert_eq!(budget4.refine, Some(plan4));
+        assert_ne!(budget4.identity_sha256, with_plan.identity_sha256);
+        validate(&budget4, &request4).expect("the 4-step budget names its request's plan");
+        assert!(validate(&with_plan, &request4).is_err());
     }
 
     fn raw_checkpoint() -> H3FactoryRawCheckpointInput {

@@ -217,8 +217,10 @@ pub(crate) fn prepare_authoring(
     }
     if refine && !minimax_h3::refine_supported_model(model) {
         anyhow::bail!(
-            "--refine runs on {} only; {model} is not that tier",
-            minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P
+            // EXPERIMENT (throwaway): the 4-step tier is accepted on this branch.
+            "--refine runs on {} (or, in the 4-step experiment, {}) only; {model} is not that tier",
+            minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P,
+            minimax_h3::REF2VA_COMFY_TURBO_4STEP
         );
     }
     if width.is_some() != height.is_some() {
@@ -985,6 +987,15 @@ mod tests {
             true
         )
         .contains("--refine runs on"));
+        // EXPERIMENT: the 4-step tier passes the same gate.
+        assert!(author(
+            minimax_h3::REF2VA_COMFY_TURBO_4STEP,
+            minimax_h3::FAMILY,
+            Some(1344),
+            Some(576),
+            true
+        )
+        .contains("at least one ordered --reference"));
         // Without --refine the same canvas is a dimensions error; with it the
         // canvas passes and authoring moves on to the (missing) references.
         let tier = minimax_h3::REF2VA_COMFY_TURBO_8STEP_768P;

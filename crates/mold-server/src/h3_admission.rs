@@ -765,7 +765,9 @@ impl H3PreparedRequestShape {
                     self.refine.as_ref(),
                 ))
             || self.refine.is_some_and(|plan| {
-                plan != minimax_h3::RefinePlan::PUBLISHED
+                // The shape carries no model; the request door already held
+                // the plan to its tier (EXPERIMENT: 4-step index 2, 8-step 4).
+                !plan.is_tier_plan()
                     || !minimax_h3::is_admitted_refine_final_canvas(self.width, self.height)
             })
             || !(minimax_h3::MIN_ASPECT_RATIO..=minimax_h3::MAX_ASPECT_RATIO)

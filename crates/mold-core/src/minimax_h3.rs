@@ -629,7 +629,32 @@ pub const H3_REFINE_SCALE: u32 = 2;
 /// bilinear upscale cannot invent, low enough to keep pass 1's composition. The
 /// start-index sweep (3 slower and softer, 5 leaves pass-1 artefacts) is in
 /// `docs/plans/h3-refine-productization.md`; it is not a request field.
+///
+/// This is the 8-step tier's index; [`refine_start_index_for_model`] is the
+/// per-tier authority.
 pub const H3_REFINE_START_INDEX: usize = 4;
+
+/// EXPERIMENT (throwaway, never merged into `aiva/h3-refine`; see
+/// `docs/plans/h3-refine-4step-experiment.md`): the Ref2VA Turbo 4-step tier's
+/// re-entry index. Its 5-point shift-12 grid has video sigmas
+/// `[1, .9730, .9231, .8, 0]`, so index 2 is the same `sigma_video = 0.9231`
+/// as the 8-step tier's index 4: pass 1 is 4 forwards, pass 2 the last 2.
+pub const H3_REFINE_START_INDEX_4STEP_EXPERIMENT: usize = 2;
+
+/// The grid index a model's refine pass 2 re-enters at: 4 on the Ref2VA Turbo
+/// 8-step 768p tier, 2 on the Ref2VA Turbo 4-step tier (EXPERIMENT), `None` for
+/// every other model. The one place a tier is mapped to its re-entry point.
+pub fn refine_start_index_for_model(model: &str) -> Option<u32> {
+    let canonical = resolve_model_name(model)?;
+    if canonical == REF2VA_COMFY_TURBO_8STEP_768P {
+        Some(H3_REFINE_START_INDEX as u32)
+    } else if canonical == REF2VA_COMFY_TURBO_4STEP {
+        // EXPERIMENT (throwaway): see the constant's note.
+        Some(H3_REFINE_START_INDEX_4STEP_EXPERIMENT as u32)
+    } else {
+        None
+    }
+}
 
 /// Both axes of a refine request's FINAL canvas are multiples of this, so pass
 /// 1 lands on the 32-pixel packed-row grid.
@@ -641,13 +666,31 @@ pub const REFINE_FINAL_ALIGNMENT: u32 = H3_REFINE_SCALE * VIDEO_ROW_STRIDE;
 /// is not admitted.
 pub const REFINE_MAX_PIXELS: u64 = 1920 * 1088;
 
-/// Whether a model identity can run `refine`: the Ref2VA Turbo 8-step 768p
-/// tier only. It is the one tier whose sampler is an Euler integrator (the
-/// second pass re-enters the frozen grid mid-way, which a multistep RES history
-/// cannot do) and whose 8-step shift-12 grid [`H3_REFINE_START_INDEX`] is
-/// calibrated on.
+/// The refine models, in one place: every reader that must go from a tier to
+/// its grid or plan iterates this, so a tier cannot be enabled in one reader and
+/// forgotten in another.
+const REFINE_MODELS: [&str; 2] = [REF2VA_COMFY_TURBO_8STEP_768P, REF2VA_COMFY_TURBO_4STEP];
+
+/// The re-entry index for a prepared request's sigma-grid length. A prepared
+/// request (the factory/admission authority) carries its `grid_points` but NOT
+/// the tier tag -- its `canonical_model` is the base partition -- so the tier
+/// is recovered from the grid the tier owns: 9 points -> 4, 5 points -> 2.
+/// Agrees with [`refine_start_index_for_model`] by construction.
+pub fn refine_start_index_for_grid_points(grid_points: u32) -> Option<u32> {
+    REFINE_MODELS
+        .into_iter()
+        .find(|model| steps_floor_for_model(model) == grid_points)
+        .and_then(refine_start_index_for_model)
+}
+
+/// Whether a model identity can run `refine`: the Ref2VA Turbo tiers
+/// [`refine_start_index_for_model`] names (8-step 768p; plus the 4-step tier in
+/// this EXPERIMENT branch). They are the tiers whose sampler is an Euler
+/// integrator (the second pass re-enters the frozen grid mid-way, which a
+/// multistep RES history cannot do) and whose shift-12 grid has a point at
+/// `sigma_video = 0.9231`.
 pub fn refine_supported_model(model: &str) -> bool {
-    resolve_model_name(model) == Some(REF2VA_COMFY_TURBO_8STEP_768P)
+    refine_start_index_for_model(model).is_some()
 }
 
 /// Which area rule a request's FINAL canvas is held to.
@@ -694,15 +737,46 @@ pub struct RefinePlan {
 }
 
 impl RefinePlan {
-    /// The one plan the contract defines.
+    /// The plan the contract defines for the 8-step tier (the published tier;
+    /// the EXPERIMENT 4-step tier's plan comes from [`Self::for_model_scale`]).
     pub const PUBLISHED: Self = Self {
         scale: H3_REFINE_SCALE,
         start_index: H3_REFINE_START_INDEX,
     };
 
-    /// The plan a published `scale` selects, `None` for any other scale.
+    /// The 8-step tier's plan for a published `scale`, `None` for any other
+    /// scale. A request resolves its plan with [`Self::for_model_scale`].
     pub fn for_scale(scale: u32) -> Option<Self> {
         (scale == H3_REFINE_SCALE).then_some(Self::PUBLISHED)
+    }
+
+    /// The plan a model's tier runs for a `scale`: the published scale and the
+    /// tier's own [`refine_start_index_for_model`]; `None` for another scale or
+    /// a model that cannot refine.
+    pub fn for_model_scale(model: &str, scale: u32) -> Option<Self> {
+        let start_index = usize::try_from(refine_start_index_for_model(model)?).ok()?;
+        (scale == H3_REFINE_SCALE).then_some(Self { scale, start_index })
+    }
+
+    /// The plan a prepared request's grid length runs, for a `scale`: the
+    /// published scale and [`refine_start_index_for_grid_points`]. This is the
+    /// tier-correct plan wherever only `grid_points` is known (the prepared
+    /// request authority); `None` for another scale or a grid no tier refines on.
+    pub fn for_grid_points_scale(grid_points: u32, scale: u32) -> Option<Self> {
+        let start_index = usize::try_from(refine_start_index_for_grid_points(grid_points)?).ok()?;
+        (scale == H3_REFINE_SCALE).then_some(Self { scale, start_index })
+    }
+
+    /// Whether this plan is one some reviewed tier runs. Admission shapes carry
+    /// no model, so this is the strongest check available there; the model-aware
+    /// comparison is `Some(self) == Self::for_model_scale(model, self.scale)`.
+    pub fn is_tier_plan(&self) -> bool {
+        self.scale == H3_REFINE_SCALE
+            && [
+                H3_REFINE_START_INDEX,
+                H3_REFINE_START_INDEX_4STEP_EXPERIMENT,
+            ]
+            .contains(&self.start_index)
     }
 
     /// The plan a request asks for. `None` when it carries no `refine` block
@@ -713,7 +787,7 @@ impl RefinePlan {
     pub fn for_request(req: &GenerateRequest) -> Option<Self> {
         req.refine
             .as_ref()
-            .and_then(|refine| Self::for_scale(refine.scale))
+            .and_then(|refine| Self::for_model_scale(&req.model, refine.scale))
     }
 
     /// Pass 1's canvas for a final canvas, `None` unless both final axes are
@@ -2827,16 +2901,17 @@ fn validate_refine_request(
     req: &GenerateRequest,
     refine: &RefineRequest,
 ) -> Result<(), ContractError> {
-    if !refine_supported_model(&req.model) {
+    let Some(start_index) = refine_start_index_for_model(&req.model) else {
         return Err(violation(
             "MINIMAX_H3_REFINE_TIER",
             format!(
-                "refine runs on {REF2VA_COMFY_TURBO_8STEP_768P} only (the Ref2VA Turbo 8-step tier \
-                 whose Euler grid its second pass re-enters); {} is not that tier",
+                "refine runs on {REF2VA_COMFY_TURBO_8STEP_768P} (or, in the 4-step experiment, \
+                 {REF2VA_COMFY_TURBO_4STEP}) only, the Ref2VA Turbo tiers whose Euler grid its \
+                 second pass re-enters; {} is not one",
                 req.model
             ),
         ));
-    }
+    };
     if refine.scale != H3_REFINE_SCALE {
         return Err(violation(
             "MINIMAX_H3_REFINE_SCALE",
@@ -2854,7 +2929,7 @@ fn validate_refine_request(
             "MINIMAX_H3_REFINE_GRID",
             format!(
                 "refine re-enters the {tier_steps}-point sigma grid of {} at index \
-                 {H3_REFINE_START_INDEX}; steps must be {tier_steps}, received {}",
+                 {start_index}; steps must be {tier_steps}, received {}",
                 req.model, req.steps
             ),
         ));
@@ -4498,7 +4573,7 @@ mod tests {
     #[test]
     fn refine_is_refused_off_its_tier_with_the_tier_code() {
         for model in REVIEWED_COMPACT_MODELS {
-            if *model == REF2VA_COMFY_TURBO_8STEP_768P {
+            if refine_start_index_for_model(model).is_some() {
                 continue;
             }
             let mut req = refine_request();
@@ -4516,6 +4591,7 @@ mod tests {
             assert!(!refine_supported_model(model));
         }
         assert!(refine_supported_model(REF2VA_COMFY_TURBO_8STEP_768P));
+        assert!(refine_supported_model(REF2VA_COMFY_TURBO_4STEP));
     }
 
     #[test]
@@ -4635,6 +4711,161 @@ mod tests {
         assert!((video - 0.9231).abs() < 5e-5, "{video}");
         assert!((audio - 0.75).abs() < 1e-12, "{audio}");
         assert!(H3_REFINE_START_INDEX < steps);
+    }
+
+    // ----- EXPERIMENT (throwaway): refine on the Ref2VA Turbo 4-step tier. -----
+    // See docs/plans/h3-refine-4step-experiment.md.
+
+    /// A valid refine request on the 4-step tier (5 grid points).
+    fn refine_request_4step() -> GenerateRequest {
+        let mut req = refine_request();
+        req.model = REF2VA_COMFY_TURBO_4STEP.to_string();
+        req.steps = steps_floor_for_model(&req.model);
+        req
+    }
+
+    #[test]
+    fn the_refine_start_index_is_derived_from_the_tier() {
+        assert_eq!(
+            refine_start_index_for_model(REF2VA_COMFY_TURBO_8STEP_768P),
+            Some(4)
+        );
+        assert_eq!(
+            refine_start_index_for_model(REF2VA_COMFY_TURBO_8STEP_768P),
+            Some(H3_REFINE_START_INDEX as u32)
+        );
+        assert_eq!(
+            refine_start_index_for_model(REF2VA_COMFY_TURBO_4STEP),
+            Some(2)
+        );
+        for model in REVIEWED_COMPACT_MODELS {
+            if *model != REF2VA_COMFY_TURBO_8STEP_768P && *model != REF2VA_COMFY_TURBO_4STEP {
+                assert_eq!(refine_start_index_for_model(model), None, "{model}");
+            }
+        }
+        assert_eq!(refine_start_index_for_model("flux-dev:q8"), None);
+        assert_eq!(
+            RefinePlan::for_model_scale(REF2VA_COMFY_TURBO_8STEP_768P, 2),
+            Some(RefinePlan::PUBLISHED)
+        );
+        let plan4 = RefinePlan::for_model_scale(REF2VA_COMFY_TURBO_4STEP, 2).unwrap();
+        assert_eq!((plan4.scale, plan4.start_index), (2, 2));
+        assert_ne!(plan4, RefinePlan::PUBLISHED);
+        assert_eq!(
+            RefinePlan::for_model_scale(REF2VA_COMFY_TURBO_4STEP, 3),
+            None
+        );
+        assert_eq!(RefinePlan::for_model_scale(FL2VA_COMFY, 2), None);
+        assert!(plan4.is_tier_plan() && RefinePlan::PUBLISHED.is_tier_plan());
+        assert!(!RefinePlan {
+            scale: 2,
+            start_index: 3
+        }
+        .is_tier_plan());
+    }
+
+    #[test]
+    fn the_four_step_door_admits_refine_at_two_canvases_and_holds_its_own_grid() {
+        for (width, height) in [(1344, 576), (1920, 1088)] {
+            let mut req = refine_request_4step();
+            req.width = width;
+            req.height = height;
+            assert_eq!(req.steps, 5);
+            assert_eq!(
+                validate_request_contract(&req, Task::Ref2va).unwrap(),
+                Mode::ReferenceToAudioVideo,
+                "{width}x{height}"
+            );
+            validate_reviewed_canvas(&req).expect("the reviewed-canvas door agrees");
+            let plan = RefinePlan::for_request(&req).expect("a plan from the tier");
+            assert_eq!(plan.start_index, 2);
+            assert_eq!(
+                plan.pass1_canvas(width, height),
+                Some((width / 2, height / 2))
+            );
+        }
+        // The 8-step grid on the 4-step tier, and the 4-step grid on the 8-step tier.
+        let mut nine = refine_request_4step();
+        nine.steps = 9;
+        assert_eq!(refine_code(&nine), "MINIMAX_H3_REFINE_GRID");
+        let mut five = refine_request();
+        five.steps = 5;
+        assert_eq!(refine_code(&five), "MINIMAX_H3_REFINE_GRID");
+        // The 8-step tier is unchanged.
+        validate_request_contract(&refine_request(), Task::Ref2va).unwrap();
+        // The other 4-step tier (the rank-21 resize) is not enabled.
+        let mut r21 = refine_request_4step();
+        r21.model = REF2VA_COMFY_TURBO_4STEP_R21.to_string();
+        assert_eq!(refine_code(&r21), "MINIMAX_H3_REFINE_TIER");
+    }
+
+    #[test]
+    fn the_refine_plan_follows_the_grid_a_prepared_request_carries() {
+        // A prepared request has grid_points but no tier tag.
+        assert_eq!(refine_start_index_for_grid_points(9), Some(4));
+        assert_eq!(refine_start_index_for_grid_points(5), Some(2));
+        for grid_points in [0, 1, 2, 3, 4, 6, 8, 10, 21] {
+            assert_eq!(refine_start_index_for_grid_points(grid_points), None);
+        }
+        for model in REFINE_MODELS {
+            assert_eq!(
+                refine_start_index_for_grid_points(steps_floor_for_model(model)),
+                refine_start_index_for_model(model),
+                "{model}"
+            );
+            assert_eq!(
+                RefinePlan::for_grid_points_scale(steps_floor_for_model(model), 2),
+                RefinePlan::for_model_scale(model, 2),
+                "{model}"
+            );
+        }
+        // Every refine-capable reviewed model is in REFINE_MODELS.
+        for model in REVIEWED_COMPACT_MODELS {
+            assert_eq!(
+                refine_start_index_for_model(model).is_some(),
+                REFINE_MODELS.contains(model),
+                "{model}"
+            );
+        }
+        assert_eq!(RefinePlan::for_grid_points_scale(5, 3), None);
+    }
+
+    #[test]
+    fn the_four_step_forwards_are_four_then_two() {
+        let plan = RefinePlan::for_model_scale(REF2VA_COMFY_TURBO_4STEP, 2).unwrap();
+        // Five grid points are four forwards: pass 1 runs all of them at half
+        // canvas, pass 2 the last two at the final canvas.
+        assert_eq!(plan.pass1_forwards(4), 4);
+        assert_eq!(plan.pass2_forwards(4), Some(2));
+        assert_eq!(plan.total_forwards(4), Some(6), "the ledger count");
+        assert_eq!(plan.total_forwards(2), None, "start 2 addresses no forward");
+    }
+
+    /// Index 2 of the 4-step grid is the 8-step grid's index-4 sigma, derived
+    /// from the real schedule the 4-step tier runs (H3DualSchedule lives in
+    /// mold-inference; this uses the same rectified-flow shift formula as the
+    /// 8-step test above, and `mold-inference` pins it on the real schedule).
+    #[test]
+    fn the_four_step_refine_start_index_is_the_same_sigma_as_the_eight_step_one() {
+        fn shifted(shift: f64, step: usize, steps: usize) -> f64 {
+            let t = 1.0 - step as f64 / steps as f64;
+            shift * t / (1.0 + (shift - 1.0) * t)
+        }
+        let steps4 = (steps_floor_for_model(REF2VA_COMFY_TURBO_4STEP) - 1) as usize;
+        let steps8 = (steps_floor_for_model(REF2VA_COMFY_TURBO_8STEP_768P) - 1) as usize;
+        assert_eq!((steps4, steps8), (4, 8));
+        let start4 = refine_start_index_for_model(REF2VA_COMFY_TURBO_4STEP).unwrap() as usize;
+        let start8 = refine_start_index_for_model(REF2VA_COMFY_TURBO_8STEP_768P).unwrap() as usize;
+        let video = [0, 1, 2, 3, 4].map(|i| shifted(12.0, i, steps4));
+        assert!((video[1] - 0.9730).abs() < 5e-5, "{video:?}");
+        assert!((video[3] - 0.8).abs() < 1e-12, "{video:?}");
+        assert!((video[start4] - 0.9231).abs() < 5e-5, "{video:?}");
+        assert!(
+            (shifted(12.0, start4, steps4) - shifted(12.0, start8, steps8)).abs() < 1e-12,
+            "both tiers re-enter at the same video sigma"
+        );
+        assert!((shifted(3.0, start4, steps4) - 0.75).abs() < 1e-12);
+        assert!(start4 < steps4);
     }
 
     #[test]

@@ -714,6 +714,11 @@ impl GenerationDeliveryCapabilities {
 ///
 /// The numbers are `mold_core::minimax_h3`'s: [`crate::minimax_h3::RefinePlan`]
 /// owns the geometry and the door rule that enforces it.
+///
+/// EXPERIMENT (`docs/plans/h3-refine-4step-experiment.md`): the profile is
+/// derived from [`crate::minimax_h3::refine_supported_model`] and the tier's own
+/// `steps`, so the 4-step tier advertises it too (`steps` = 5) with no change
+/// here. The re-entry index is not advertised (it is not a request field).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
 pub struct RefineCapabilitiesProfile {
     /// The only `refine.scale` the recipe accepts (final canvas / pass 1's).
@@ -5484,7 +5489,8 @@ mod tests {
     }
 
     /// `capabilities.refine` is the one advertisement of the two-pass render:
-    /// present on exactly the Ref2VA Turbo 8-step 768p recipe, carrying the
+    /// present on exactly the recipes `refine_start_index_for_model` names (8-step 768p;
+    /// 4-step in the EXPERIMENT branch), carrying the
     /// numbers `minimax_h3` enforces, and the profile door follows it — a final
     /// canvas above the single-pass ceiling passes only WITH `refine`.
     #[test]
@@ -5494,7 +5500,8 @@ mod tests {
             let profile = resolve_generation_profile(input(model, "minimax-h3"));
             let recipe = profile.default_recipe().unwrap();
             let advertised = recipe.capabilities.refine.as_ref();
-            if *model == h3::REF2VA_COMFY_TURBO_8STEP_768P {
+            // EXPERIMENT: the 4-step tier advertises the control as well.
+            if h3::refine_start_index_for_model(model).is_some() {
                 let advertised = advertised.expect("the refine tier advertises the control");
                 assert_eq!(advertised.scale, h3::H3_REFINE_SCALE);
                 assert_eq!(advertised.alignment, h3::REFINE_FINAL_ALIGNMENT);

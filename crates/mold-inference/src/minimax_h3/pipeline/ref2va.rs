@@ -2836,6 +2836,58 @@ mod tests {
         );
     }
 
+    /// EXPERIMENT (throwaway; docs/plans/h3-refine-4step-experiment.md): the
+    /// 4-step tier's plan re-enters its 5-point grid at index 2 -- 4 forwards
+    /// at pass-1 canvas, then the last 2 at the final canvas.
+    #[test]
+    fn the_four_step_plan_runs_four_forwards_then_the_last_two_at_the_final_canvas() {
+        let refine =
+            contract::RefinePlan::for_model_scale(contract::REF2VA_COMFY_TURBO_4STEP, 2).unwrap();
+        let mut prepared = prepare(&refine_request());
+        prepared.grid_points = 5;
+        prepared.refine = Some(refine);
+        let mut backend = refine_backend(37);
+        let mut observer = RecordingObserver::default();
+        let staged = execute_staged(
+            &prepared,
+            &bindings(&prepared),
+            &mut backend,
+            &ProgressReporter::default(),
+            &mut observer,
+        )
+        .unwrap();
+        let schedule = H3DualSchedule::new_for_sampler_with_video_shift(
+            5,
+            H3SamplerKind::OfficialEuler,
+            crate::minimax_h3::sampler::H3_VIDEO_SHIFT,
+        )
+        .unwrap();
+        assert_eq!(schedule.counts().transformer_evaluations, 4);
+        assert_eq!(backend.forward_log.len(), 4 + 2);
+        let prefix = backend.forward_log[0].0.dims3().unwrap().1 - 37;
+        for (index, (rows, _)) in backend.forward_log.iter().enumerate() {
+            let generated = if index < 4 { 37 } else { 37 * 4 };
+            assert_eq!(
+                rows.dims3().unwrap().1,
+                prefix + generated,
+                "forward {index}"
+            );
+        }
+        let record = staged.provenance.refine.as_ref().expect("a refine record");
+        assert_eq!(record.plan(), refine);
+        assert_eq!((record.pass1_forwards, record.pass2_forwards), (4, 2));
+        assert_eq!(record.start_index, 2);
+        assert!((record.sigma_video - 0.9231).abs() < 5e-5);
+        assert!((record.sigma_audio - 0.75).abs() < 1e-6);
+        let denoise: Vec<_> = observer
+            .events
+            .iter()
+            .filter(|event| event.phase == H3PipelinePhase::Denoise)
+            .map(|event| (event.completed, event.total))
+            .collect();
+        assert_eq!(denoise, (0..=6).map(|done| (done, 6)).collect::<Vec<_>>());
+    }
+
     #[test]
     fn a_refine_plan_refuses_an_unsplittable_canvas_before_any_media_is_touched() {
         let mut req = request();
@@ -2876,6 +2928,14 @@ mod tests {
             (refined.geometry.width, refined.geometry.height),
             (1344, 768)
         );
+
+        // EXPERIMENT: the 4-step tier's plan re-enters at its own index.
+        let mut req4 = req.clone();
+        req4.model = contract::REF2VA_COMFY_TURBO_4STEP.into();
+        req4.steps = contract::steps_floor_for_model(&req4.model);
+        let refined4 = prepare(&req4);
+        assert_eq!(refined4.refine().map(|plan| plan.start_index), Some(2));
+        assert_eq!(refined4.grid_points, 5);
 
         // A refine block the door refuses never reaches a plan: preparation
         // runs the same contract, so it cannot quietly render one pass.
