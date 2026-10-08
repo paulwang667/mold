@@ -565,7 +565,8 @@ mod tests {
     ///
     /// Needs the 691 MB bf16 checkpoint, so it is ignored by default:
     /// `MOLD_H3_LATENT_UPSCALER_WEIGHTS=/path/to/...bf16.safetensors cargo test -p mold-ai-candle --lib -- --ignored latent_upscaler`.
-    /// Set `MOLD_H3_LATENT_UPSCALER_TEST_DEVICE=cuda` to run it on a GPU.
+    /// Set `MOLD_H3_LATENT_UPSCALER_TEST_DEVICE=cuda` to run it on a GPU, and
+    /// `MOLD_H3_LATENT_UPSCALER_TEST_DTYPE=bf16` to check the production precision.
     #[test]
     #[ignore = "needs the released upscaler weights; set MOLD_H3_LATENT_UPSCALER_WEIGHTS"]
     fn latent_upscaler_matches_the_comfy_node_reference() {
@@ -583,7 +584,12 @@ mod tests {
         let tensors = candle::safetensors::load(fixture, &device).unwrap();
         let input = &tensors["input"];
         let expected = &tensors["expected"];
-        let upscaler = LatentUpscaler::load_file(Path::new(&weights), &device, DType::F32).unwrap();
+        let (dtype, max_tolerance, relative_tolerance) =
+            match std::env::var("MOLD_H3_LATENT_UPSCALER_TEST_DTYPE").as_deref() {
+                Ok("bf16") => (DType::BF16, 0.1, 2e-2),
+                _ => (DType::F32, 2e-3, 1e-4),
+            };
+        let upscaler = LatentUpscaler::load_file(Path::new(&weights), &device, dtype).unwrap();
         let (_, _, _, height, width) = expected.dims5().unwrap();
         let output = upscaler.forward(input, 2.0, height, width).unwrap();
         assert_eq!(output.dims(), expected.dims());
@@ -598,16 +604,16 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         eprintln!(
-            "latent upscaler vs node: max abs {max_diff:.3e}, mean relative {:.3e}",
+            "latent upscaler vs node ({dtype:?}): max abs {max_diff:.3e}, mean relative {:.3e}",
             mean_diff / scale
         );
         assert!(
-            max_diff < 2e-3,
-            "max abs diff {max_diff} against the node reference"
+            max_diff < max_tolerance,
+            "max abs diff {max_diff} against the node reference ({dtype:?})"
         );
         assert!(
-            mean_diff / scale < 1e-4,
-            "mean relative diff {}",
+            mean_diff / scale < relative_tolerance,
+            "mean relative diff {} ({dtype:?})",
             mean_diff / scale
         );
     }
