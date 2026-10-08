@@ -142,13 +142,14 @@ pub(crate) const LATENT_UPSCALER_VARIABLE: &str = "MOLD_H3_LATENT_UPSCALER";
 /// The refine pass's spatial upsample of a normalised video latent: the learned
 /// upscaler when [`LATENT_UPSCALER_VARIABLE`] names its checkpoint, otherwise
 /// [`upsample_video_latent`]. The learned path loads the checkpoint for each
-/// call and runs it in BF16, the checkpoint's own precision.
+/// call and runs it in F32: BF16 weights and activations drift by up to
+/// 0.49 against the node's float32 output on the reference latent.
 pub(crate) fn upsample_for_refine(latent: &Tensor, scale: usize) -> Result<Tensor> {
     let Some(path) = crate::runtime_env::value(LATENT_UPSCALER_VARIABLE) else {
         return upsample_video_latent(latent, scale);
     };
     let (_, _, _, height, width) = latent.dims5()?;
-    let upscaler = LatentUpscaler::load_file(Path::new(&path), latent.device(), DType::BF16)?;
+    let upscaler = LatentUpscaler::load_file(Path::new(&path), latent.device(), DType::F32)?;
     upscaler
         .forward(latent, scale as f64, height * scale, width * scale)
         .map_err(Into::into)
