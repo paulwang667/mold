@@ -140,6 +140,10 @@ pub(crate) fn upsample_video_latent(latent: &Tensor, scale: usize) -> Result<Ten
 /// (`refine.upscaler`); this only says where the learned weights live.
 pub(crate) const LATENT_UPSCALER_VARIABLE: &str = "MOLD_H3_LATENT_UPSCALER";
 
+/// DIAGNOSTIC (temporary): when set, the learned upscaler's input and output
+/// are written to this safetensors path on every refine render.
+pub(crate) const UPSCALER_DUMP_VARIABLE: &str = "MOLD_H3_UPSCALER_DUMP";
+
 /// The refine pass's spatial upsample of a normalised video latent, by the
 /// request's `upscaler`. The learned path loads the checkpoint from
 /// [`LATENT_UPSCALER_VARIABLE`] for each call and runs it in F32: BF16 weights
@@ -161,9 +165,42 @@ pub(crate) fn upsample_for_refine(
     };
     let (_, _, _, height, width) = latent.dims5()?;
     let upscaler = LatentUpscaler::load_file(Path::new(&path), latent.device(), DType::F32)?;
-    upscaler
+    let output = upscaler
         .forward(latent, scale as f64, height * scale, width * scale)
-        .map_err(Into::into)
+        .map_err(anyhow::Error::from)?;
+    // DIAGNOSTIC (temporary): record the learned upscaler's real input and
+    // output, and optionally dump them for an offline comparison against the
+    // official node.
+    log_latent_stats("learned upscaler input", latent)?;
+    log_latent_stats("learned upscaler output", &output)?;
+    if let Ok(path) = std::env::var(UPSCALER_DUMP_VARIABLE) {
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert("input".to_string(), latent.to_dtype(DType::F32)?.contiguous()?);
+        tensors.insert("output".to_string(), output.contiguous()?);
+        candle_core::safetensors::save(&tensors, &path)?;
+        tracing::info!(path = path.as_str(), "H3 refine upscaler IO dumped");
+    }
+    Ok(output)
+}
+
+/// Diagnostic (temporary): min, max, mean and standard deviation of a latent.
+pub(crate) fn log_latent_stats(label: &str, latent: &Tensor) -> Result<()> {
+    let values = latent.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let count = values.len() as f32;
+    let mean = values.iter().sum::<f32>() / count;
+    let variance = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / count;
+    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    tracing::info!(
+        label = label,
+        min = min,
+        max = max,
+        mean = mean,
+        std = variance.sqrt(),
+        elements = values.len(),
+        "H3 refine latent stats"
+    );
+    Ok(())
 }
 
 /// `sigma * noise + (1 - sigma) * clean`, in F32: the rectified-flow point at
