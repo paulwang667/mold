@@ -10,6 +10,7 @@ mod comfy_dit;
 mod comfy_quant;
 mod config;
 mod dit;
+mod latent_upscaler;
 mod loader;
 mod model;
 mod presentation;
@@ -193,6 +194,7 @@ pub use visual_geometry::{
     TemporalDecodePlan, TemporalEncodeChunk, TemporalEncodePlan, VisualTemporalGeometry,
 };
 #[cfg(feature = "h3-private-uat")]
+pub use latent_upscaler::{LatentUpscaler, LATENT_UPSCALER_CHANNELS};
 pub use visual_vae::VisualVaeCaptureEvidence;
 pub use visual_vae::{
     DecodeComputePolicy, DecodeSink, MiniMaxH3VisualVae, MiniMaxH3VisualVaeConfig,

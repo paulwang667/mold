@@ -48,6 +48,10 @@ pub const ENGINE_SHAPING_VARIABLES: &[&str] = &[
     // quantizes the ACTIVATION, which the widen path never does. Different
     // numerics and different latency.
     "MOLD_FLUX2_FP8_GEMM",
+    // The learned MiniMax H3 latent upscaler replaces the refine pass's
+    // bilinear spatial upsample when this names its checkpoint. It changes the
+    // latent the second pass denoises from, so it is engine-shaping.
+    "MOLD_H3_LATENT_UPSCALER",
     // #1174 follow-up: the reviewed MiniMax H3 Turbo LoRA tier is selected by
     // adapter path plus tier id until manifests own it. Both change which
     // adapter runs, which integrator consumes it, and the step count, so both

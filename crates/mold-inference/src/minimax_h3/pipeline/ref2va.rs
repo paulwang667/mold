@@ -944,7 +944,7 @@ impl H3RefineSecondPass<'_> {
         let clean_audio =
             audio_rows.narrow(1, pass1.condition_audio_rows, pass1.generated_audio_rows)?;
         let upsampled =
-            refine::upsample_video_latent(&clean_video, usize::try_from(self.plan.scale)?)?;
+            refine::upsample_for_refine(&clean_video, usize::try_from(self.plan.scale)?)?;
         if upsampled.dims() != self.final_geometry.generated_video_shape() {
             bail!(
                 "MiniMax H3 refine upsample produced {:?}, expected {:?}",
