@@ -166,7 +166,7 @@ pub(crate) fn upsample_for_refine(
     let (_, _, _, height, width) = latent.dims5()?;
     let upscaler = LatentUpscaler::load_file(Path::new(&path), latent.device(), DType::F32)?;
     let output = upscaler
-        .forward(latent, scale as f64, height * scale, width * scale)
+        .forward_in_latent_space(latent, scale as f64, height * scale, width * scale)
         .map_err(anyhow::Error::from)?;
     // DIAGNOSTIC (temporary): record the learned upscaler's real input and
     // output, and optionally dump them for an offline comparison against the

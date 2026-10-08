@@ -23,6 +23,8 @@ use std::path::Path;
 use candle::{DType, Device, IndexOp, Result, Tensor, bail};
 use candle_nn::{Linear, Module, VarBuilder, linear, ops};
 
+use super::visual_condition::{H3_LATENTS_MEAN, H3_LATENTS_STD};
+
 /// Latent channels the released network consumes and produces (`conv_in` and
 /// `conv_out` are 24-channel).
 pub const LATENT_UPSCALER_CHANNELS: usize = 24;
@@ -396,6 +398,37 @@ impl LatentUpscaler {
         Self::load(vb)
     }
 
+    /// The official node's full path on a latent in mold's normalised space.
+    ///
+    /// The node normalises its input with the H3 latent statistics and
+    /// denormalises its output with the same statistics, in one space. With the
+    /// ComfyUI latent taken as `s = z` (mold's space), the network sees
+    /// `(z - mean) / std` and the result is `net(...) * std + mean`, back in
+    /// `z`'s space. [`Self::forward`] alone is only the network.
+    pub fn forward_in_latent_space(
+        &self,
+        latent: &Tensor,
+        scale: f64,
+        height: usize,
+        width: usize,
+    ) -> Result<Tensor> {
+        let (_, _, _, in_height, in_width) = latent.dims5()?;
+        if (height, width) == (in_height, in_width) {
+            return Ok(latent.clone());
+        }
+        let device = latent.device();
+        let shape = (1, LATENT_UPSCALER_CHANNELS, 1, 1, 1);
+        let mean = Tensor::from_slice(&H3_LATENTS_MEAN[..], shape, device)?;
+        let std = Tensor::from_slice(&H3_LATENTS_STD[..], shape, device)?;
+        let normalised = latent
+            .to_dtype(DType::F32)?
+            .broadcast_sub(&mean)?
+            .broadcast_div(&std)?;
+        self.forward(&normalised, scale, height, width)?
+            .broadcast_mul(&std)?
+            .broadcast_add(&mean)
+    }
+
     /// Upscales a normalised latent `[1, 24, T, H, W]` to `[1, 24, T, height, width]`.
     /// `scale` is the spatial factor the scale embedding is conditioned on.
     pub fn forward(
@@ -567,6 +600,38 @@ mod tests {
     /// `MOLD_H3_LATENT_UPSCALER_WEIGHTS=/path/to/...bf16.safetensors cargo test -p mold-ai-candle --lib -- --ignored latent_upscaler`.
     /// Set `MOLD_H3_LATENT_UPSCALER_TEST_DEVICE=cuda` to run it on a GPU, and
     /// `MOLD_H3_LATENT_UPSCALER_TEST_DTYPE=bf16` to check the production precision.
+    #[test]
+    #[ignore = "needs the released upscaler weights; set MOLD_H3_LATENT_UPSCALER_WEIGHTS"]
+    fn latent_upscaler_node_literal_path_matches_the_comfy_node() {
+        let Ok(weights) = std::env::var("MOLD_H3_LATENT_UPSCALER_WEIGHTS") else {
+            return;
+        };
+        let device = Device::Cpu;
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/minimax_h3/fixture_node_literal_t4h3w5_s2.safetensors"
+        );
+        let tensors = candle::safetensors::load(fixture, &device).unwrap();
+        let upscaler = LatentUpscaler::load_file(Path::new(&weights), &device, DType::F32).unwrap();
+        let expected = &tensors["expected"];
+        let (_, _, _, height, width) = expected.dims5().unwrap();
+        let output = upscaler
+            .forward_in_latent_space(&tensors["input"], 2.0, height, width)
+            .unwrap();
+        let max_diff = (&output - expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            max_diff < 2e-3,
+            "max abs diff {max_diff} against the node-literal reference"
+        );
+    }
+
     #[test]
     #[ignore = "needs the released upscaler weights; set MOLD_H3_LATENT_UPSCALER_WEIGHTS"]
     fn latent_upscaler_matches_the_comfy_node_reference() {
