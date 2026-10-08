@@ -606,7 +606,10 @@ mod tests {
         let Ok(weights) = std::env::var("MOLD_H3_LATENT_UPSCALER_WEIGHTS") else {
             return;
         };
-        let device = Device::Cpu;
+        let device = match std::env::var("MOLD_H3_LATENT_UPSCALER_TEST_DEVICE").as_deref() {
+            Ok("cuda") => Device::new_cuda(0).unwrap(),
+            _ => Device::Cpu,
+        };
         let fixture = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/testdata/minimax_h3/fixture_node_literal_t4h3w5_s2.safetensors"
