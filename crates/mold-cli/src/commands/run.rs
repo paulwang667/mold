@@ -911,6 +911,7 @@ impl WanFlags {
             turbo_lora_strength: self.turbo_strength,
             refine: self.refine.then_some(mold_core::RefineRequest {
                 scale: mold_core::minimax_h3::H3_REFINE_SCALE,
+                upscaler: Default::default(),
             }),
         })
     }
