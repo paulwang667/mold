@@ -587,6 +587,7 @@ mod tests {
         let (dtype, max_tolerance, relative_tolerance) =
             match std::env::var("MOLD_H3_LATENT_UPSCALER_TEST_DTYPE").as_deref() {
                 Ok("bf16") => (DType::BF16, 0.1, 2e-2),
+                Ok("f16") => (DType::F16, 0.1, 2e-2),
                 _ => (DType::F32, 2e-3, 1e-4),
             };
         let upscaler = LatentUpscaler::load_file(Path::new(&weights), &device, dtype).unwrap();
@@ -615,6 +616,46 @@ mod tests {
             mean_diff / scale < relative_tolerance,
             "mean relative diff {} ({dtype:?})",
             mean_diff / scale
+        );
+    }
+
+    /// Wall-clock cost of one refine-sized upscale: 31 latent frames, a 20x48
+    /// pass-1 latent doubled to 40x96 (the 1536x640 final canvas). Ignored by
+    /// default; the same dtype variables as the parity test apply.
+    #[test]
+    #[ignore = "timing probe; needs MOLD_H3_LATENT_UPSCALER_WEIGHTS"]
+    fn latent_upscaler_refine_sized_forward_time() {
+        let Ok(weights) = std::env::var("MOLD_H3_LATENT_UPSCALER_WEIGHTS") else {
+            return;
+        };
+        let device = match std::env::var("MOLD_H3_LATENT_UPSCALER_TEST_DEVICE").as_deref() {
+            Ok("cuda") => Device::new_cuda(0).unwrap(),
+            _ => Device::Cpu,
+        };
+        let dtype = match std::env::var("MOLD_H3_LATENT_UPSCALER_TEST_DTYPE").as_deref() {
+            Ok("bf16") => DType::BF16,
+            Ok("f16") => DType::F16,
+            _ => DType::F32,
+        };
+        let upscaler = LatentUpscaler::load_file(Path::new(&weights), &device, dtype).unwrap();
+        let input = Tensor::rand(
+            -1f32,
+            1f32,
+            (1, LATENT_UPSCALER_CHANNELS, 31, 20, 48),
+            &device,
+        )
+        .unwrap();
+        let run = || {
+            let output = upscaler.forward(&input, 2.0, 40, 96).unwrap();
+            // A host read forces the device to finish before the clock stops.
+            output.mean_all().unwrap().to_scalar::<f32>().unwrap()
+        };
+        run();
+        let started = std::time::Instant::now();
+        let mean = run();
+        eprintln!(
+            "refine-sized upscale ({dtype:?}): {:?} (output mean {mean:.4})",
+            started.elapsed()
         );
     }
 }
