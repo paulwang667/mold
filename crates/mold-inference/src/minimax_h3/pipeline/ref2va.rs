@@ -969,9 +969,7 @@ impl H3RefineSecondPass<'_> {
             refine::draw_refine_noise(self.seed, self.final_geometry, self.device)?;
         let sigma_video = self.schedule.video_sigmas()[start];
         let sigma_audio = self.schedule.audio_sigmas()[start];
-        refine::log_latent_stats("refine upsampled video", &upsampled)?;
         let renoised_video = refine::renoise_at_sigma(&upsampled, &video_noise, sigma_video)?;
-        refine::log_latent_stats("refine renoised video", &renoised_video)?;
         let renoised_audio = refine::renoise_at_sigma(&clean_audio, &audio_noise, sigma_audio)?;
         let video_rows = preserve_prefix(
             &video_rows,
