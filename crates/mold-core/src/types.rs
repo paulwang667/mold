@@ -1794,6 +1794,38 @@ pub struct RefineRequest {
     /// Spatial ratio between the final canvas and pass 1's canvas. Must be `2`.
     #[schema(example = 2)]
     pub scale: u32,
+    /// The spatial upsample between the two passes. Omitted means `learned`.
+    /// `bilinear` leaves visible ghosting on the latent and is kept only for
+    /// side-by-side comparison.
+    #[serde(default, skip_serializing_if = "RefineUpscaler::is_learned")]
+    pub upscaler: RefineUpscaler,
+}
+
+/// How the refine pass upsamples pass 1's latent before re-noising it.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RefineUpscaler {
+    /// The learned MiniMax H3 latent upscaler (the default). The server must be
+    /// configured with its checkpoint; the request names the mode, never a path.
+    #[default]
+    Learned,
+    /// Bilinear 2x interpolation of the normalised latent. It shows ghosting,
+    /// so it is an explicit comparison mode only.
+    Bilinear,
+}
+
+impl RefineUpscaler {
+    /// True for the default, so serialisation omits it.
+    pub fn is_learned(&self) -> bool {
+        matches!(self, Self::Learned)
+    }
+
+    /// True for the comparison mode; identity hashes add a marker for it.
+    pub fn is_bilinear(&self) -> bool {
+        matches!(self, Self::Bilinear)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -14964,11 +14996,11 @@ mod mesh_reference_contract_tests {
     fn refine_round_trips_mirrors_into_metadata_and_is_absent_when_unset() {
         let json = serde_json::json!({"prompt": "p", "model": "m", "width": 64, "height": 64, "steps": 1, "refine": {"scale": 2}});
         let req: GenerateRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(req.refine, Some(RefineRequest { scale: 2 }));
+        assert_eq!(req.refine, Some(RefineRequest { scale: 2, upscaler: Default::default() }));
         let back = serde_json::to_value(&req).unwrap();
         assert_eq!(back["refine"], serde_json::json!({"scale": 2}));
         let metadata = OutputMetadata::from_generate_request(&req, 1, None, "test");
-        assert_eq!(metadata.refine, Some(RefineRequest { scale: 2 }));
+        assert_eq!(metadata.refine, Some(RefineRequest { scale: 2, upscaler: Default::default() }));
         assert_eq!(
             serde_json::to_value(&metadata).unwrap()["refine"],
             serde_json::json!({"scale": 2})

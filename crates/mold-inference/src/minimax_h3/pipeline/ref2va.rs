@@ -350,6 +350,14 @@ pub(crate) fn execute_staged(
 ) -> Result<H3StagedAvOutput> {
     // The request's own plan, never the environment's.
     let refine = prepared.refine;
+    if refine.is_some_and(|plan| !plan.upscaler.is_bilinear())
+        && crate::runtime_env::value(refine::LATENT_UPSCALER_VARIABLE).is_none()
+    {
+        anyhow::bail!(
+            "MiniMax H3 refine uses the learned latent upscaler, but this server has no {} checkpoint configured",
+            refine::LATENT_UPSCALER_VARIABLE
+        );
+    }
     validate_reference_bindings(prepared, bindings)?;
     let frozen_identity = backend.identity();
     frozen_identity.validate(backend.device())?;
@@ -667,6 +675,7 @@ pub(crate) fn execute_staged(
         pass2_forwards,
         sigma_video: schedule.video_sigmas()[plan.start_index],
         sigma_audio: schedule.audio_sigmas()[plan.start_index],
+        upscaler: plan.upscaler,
     });
     let (video_rows, audio_rows, packed, geometry) = match (&refine, final_packed) {
         (Some(plan), Some(final_packed)) => {
@@ -944,7 +953,11 @@ impl H3RefineSecondPass<'_> {
         let clean_audio =
             audio_rows.narrow(1, pass1.condition_audio_rows, pass1.generated_audio_rows)?;
         let upsampled =
-            refine::upsample_for_refine(&clean_video, usize::try_from(self.plan.scale)?)?;
+            refine::upsample_for_refine(
+            &clean_video,
+            usize::try_from(self.plan.scale)?,
+            self.plan.upscaler,
+        )?;
         if upsampled.dims() != self.final_geometry.generated_video_shape() {
             bail!(
                 "MiniMax H3 refine upsample produced {:?}, expected {:?}",
@@ -2677,7 +2690,12 @@ mod tests {
 
     #[test]
     fn a_refine_plan_runs_pass_one_small_then_the_tail_of_the_grid_at_the_final_canvas() {
-        let refine = contract::RefinePlan::PUBLISHED;
+        // Geometry test: the upsample is not what it checks, so it runs the
+        // bilinear mode and needs no checkpoint.
+        let refine = contract::RefinePlan {
+            upscaler: mold_core::RefineUpscaler::Bilinear,
+            ..contract::RefinePlan::PUBLISHED
+        };
         let (backend, prepared, staged, observer) = run_refined(Some(refine));
         let schedule = H3DualSchedule::new_for_sampler_with_video_shift(
             prepared.grid_points,
@@ -2842,7 +2860,11 @@ mod tests {
     #[test]
     fn the_four_step_plan_runs_four_forwards_then_the_last_two_at_the_final_canvas() {
         let refine =
-            contract::RefinePlan::for_model_scale(contract::REF2VA_COMFY_TURBO_4STEP, 2).unwrap();
+            contract::RefinePlan {
+                upscaler: mold_core::RefineUpscaler::Bilinear,
+                ..contract::RefinePlan::for_model_scale(contract::REF2VA_COMFY_TURBO_4STEP, 2)
+                    .unwrap()
+            };
         let mut prepared = prepare(&refine_request());
         prepared.grid_points = 5;
         prepared.refine = Some(refine);
@@ -2894,7 +2916,10 @@ mod tests {
         req.width = 96;
         req.height = 96;
         let mut prepared = prepare(&req);
-        prepared.refine = Some(contract::RefinePlan::PUBLISHED);
+        prepared.refine = Some(contract::RefinePlan {
+            upscaler: mold_core::RefineUpscaler::Bilinear,
+            ..contract::RefinePlan::PUBLISHED
+        });
         let mut backend = SyntheticBackend::new();
         let error = execute_staged(
             &prepared,
@@ -2920,6 +2945,7 @@ mod tests {
         req.height = 768;
         req.refine = Some(mold_core::RefineRequest {
             scale: contract::H3_REFINE_SCALE,
+            upscaler: Default::default(),
         });
         let refined = prepare(&req);
         assert_eq!(refined.refine(), Some(contract::RefinePlan::PUBLISHED));
@@ -2939,7 +2965,7 @@ mod tests {
 
         // A refine block the door refuses never reaches a plan: preparation
         // runs the same contract, so it cannot quietly render one pass.
-        req.refine = Some(mold_core::RefineRequest { scale: 3 });
+        req.refine = Some(mold_core::RefineRequest { scale: 3, upscaler: Default::default() });
         let error = prepare_request(
             &req,
             &ProgressReporter::default(),

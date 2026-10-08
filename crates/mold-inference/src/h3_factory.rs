@@ -934,6 +934,9 @@ impl H3FactoryTargetBudgetInput {
             hash.update(b"mold.minimax-h3.target-attempt-budget.refine.v1\0");
             hash.update(refine.scale.to_le_bytes());
             hash.update((refine.start_index as u64).to_le_bytes());
+            if refine.upscaler.is_bilinear() {
+                hash.update(b"mold.minimax-h3.target-attempt-budget.refine.upscaler.bilinear.v1\0");
+            }
         }
     }
 }
@@ -2259,8 +2262,8 @@ pub(crate) fn validate_prepared_request(request: &H3FactoryPreparedRequestInput)
             // 4-step tier's 5 points re-enter at index 2, the 8-step tier's 9
             // at index 4). `canonical_model` is the BASE partition here, never
             // the tier tag, so the tier is read off `grid_points`.
-            Some(plan)
-                != contract::RefinePlan::for_grid_points_scale(request.grid_points, plan.scale)
+            !contract::RefinePlan::for_grid_points_scale(request.grid_points, plan.scale)
+                .is_some_and(|tier| tier.same_schedule(&plan))
                 || request.task != Task::Ref2va
                 || !contract::is_admitted_refine_final_canvas(request.width, request.height)
         })
@@ -3985,6 +3988,9 @@ pub fn expected_h3_factory_prepared_request_identity(
         hash.update(b"mold.minimax-h3.prepared-request.refine.v1\0");
         hash.update(refine.scale.to_le_bytes());
         hash.update((refine.start_index as u64).to_le_bytes());
+        if refine.upscaler.is_bilinear() {
+            hash.update(b"mold.minimax-h3.prepared-request.refine.upscaler.bilinear.v1\0");
+        }
     }
     format!("{:x}", hash.finalize())
 }

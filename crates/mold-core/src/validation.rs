@@ -5374,7 +5374,7 @@ mod tests {
         let plain = validate_generate_request_after_activation(&req, family).unwrap_err();
         assert!(plain.contains("exceeds"), "{plain}");
 
-        req.refine = Some(crate::RefineRequest { scale: 2 });
+        req.refine = Some(crate::RefineRequest { scale: 2, upscaler: Default::default() });
         validate_generate_request_after_activation(&req, family)
             .expect("the final canvas is held to the refine rule");
 
@@ -5395,7 +5395,7 @@ mod tests {
     #[test]
     fn refine_is_rejected_off_the_h3_family() {
         let mut req = valid_req();
-        req.refine = Some(crate::RefineRequest { scale: 2 });
+        req.refine = Some(crate::RefineRequest { scale: 2, upscaler: Default::default() });
         let err = validate_generate_request(&req).unwrap_err();
         assert!(err.contains("refine"), "{err}");
         req.refine = None;

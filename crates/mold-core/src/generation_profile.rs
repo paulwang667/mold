@@ -5534,6 +5534,7 @@ mod tests {
         assert!(single_pass.contains("pixel limit"), "{single_pass}");
         request.refine = Some(crate::RefineRequest {
             scale: h3::H3_REFINE_SCALE,
+            upscaler: Default::default(),
         });
         validate_request_against_recipe(recipe, &request).expect("refine admits the final canvas");
         request.width = 2560;
@@ -5548,7 +5549,7 @@ mod tests {
             .contains("multiples of 64"));
         request.width = 1920;
         request.height = 1088;
-        request.refine = Some(crate::RefineRequest { scale: 3 });
+        request.refine = Some(crate::RefineRequest { scale: 3, upscaler: Default::default() });
         assert!(validate_request_against_recipe(recipe, &request)
             .unwrap_err()
             .contains("refine.scale must be 2"));
@@ -5560,7 +5561,7 @@ mod tests {
             crate::test_support::minimal_generate_request(h3::REF2VA_COMFY_TURBO_4STEP_R21);
         refused.steps = 5;
         refused.output_format = Some(OutputFormat::Mp4);
-        refused.refine = Some(crate::RefineRequest { scale: 2 });
+        refused.refine = Some(crate::RefineRequest { scale: 2, upscaler: Default::default() });
         assert!(
             validate_request_against_recipe(other.default_recipe().unwrap(), &refused)
                 .unwrap_err()

@@ -8,7 +8,7 @@
 use crate::manifest::{ManifestDefaults, ModelComponent, ModelFile, ModelManifest};
 use crate::{
     GenerateRequest, GenerationReference, GenerationReferenceAuthority, OutputFormat,
-    RefineRequest, MINIMAX_H3_LICENSE_SHA256, MINIMAX_H3_LICENSE_URL,
+    RefineRequest, RefineUpscaler, MINIMAX_H3_LICENSE_SHA256, MINIMAX_H3_LICENSE_URL,
 };
 
 pub const FAMILY: &str = "minimax-h3";
@@ -734,6 +734,10 @@ pub struct RefinePlan {
     pub scale: u32,
     /// Index into the frozen sigma grid where pass 2 begins.
     pub start_index: usize,
+    /// The spatial upsample between the passes. Not part of the tier identity
+    /// ([`Self::is_tier_plan`] ignores it); identity hashes add it only when it
+    /// is not the bilinear default.
+    pub upscaler: RefineUpscaler,
 }
 
 impl RefinePlan {
@@ -742,6 +746,7 @@ impl RefinePlan {
     pub const PUBLISHED: Self = Self {
         scale: H3_REFINE_SCALE,
         start_index: H3_REFINE_START_INDEX,
+        upscaler: RefineUpscaler::Learned,
     };
 
     /// The 8-step tier's plan for a published `scale`, `None` for any other
@@ -755,7 +760,11 @@ impl RefinePlan {
     /// a model that cannot refine.
     pub fn for_model_scale(model: &str, scale: u32) -> Option<Self> {
         let start_index = usize::try_from(refine_start_index_for_model(model)?).ok()?;
-        (scale == H3_REFINE_SCALE).then_some(Self { scale, start_index })
+        (scale == H3_REFINE_SCALE).then_some(Self {
+            scale,
+            start_index,
+            upscaler: RefineUpscaler::Learned,
+        })
     }
 
     /// The plan a prepared request's grid length runs, for a `scale`: the
@@ -764,7 +773,17 @@ impl RefinePlan {
     /// request authority); `None` for another scale or a grid no tier refines on.
     pub fn for_grid_points_scale(grid_points: u32, scale: u32) -> Option<Self> {
         let start_index = usize::try_from(refine_start_index_for_grid_points(grid_points)?).ok()?;
-        (scale == H3_REFINE_SCALE).then_some(Self { scale, start_index })
+        (scale == H3_REFINE_SCALE).then_some(Self {
+            scale,
+            start_index,
+            upscaler: RefineUpscaler::Learned,
+        })
+    }
+
+    /// Whether two plans run the same schedule: the same scale and re-entry
+    /// point. The upsample is not part of the schedule.
+    pub fn same_schedule(&self, other: &Self) -> bool {
+        self.scale == other.scale && self.start_index == other.start_index
     }
 
     /// Whether this plan is one some reviewed tier runs. Admission shapes carry
@@ -785,9 +804,12 @@ impl RefinePlan {
     /// the runtime treats it as a contract violation rather than rendering one
     /// pass).
     pub fn for_request(req: &GenerateRequest) -> Option<Self> {
-        req.refine
-            .as_ref()
-            .and_then(|refine| Self::for_model_scale(&req.model, refine.scale))
+        req.refine.as_ref().and_then(|refine| {
+            Self::for_model_scale(&req.model, refine.scale).map(|plan| Self {
+                upscaler: refine.upscaler,
+                ..plan
+            })
+        })
     }
 
     /// Pass 1's canvas for a final canvas, `None` unless both final axes are
@@ -4527,6 +4549,7 @@ mod tests {
         req.height = 1088;
         req.refine = Some(RefineRequest {
             scale: H3_REFINE_SCALE,
+            upscaler: Default::default(),
         });
         req
     }
@@ -4598,7 +4621,10 @@ mod tests {
     fn refine_takes_scale_two_and_the_tiers_own_grid_only() {
         for scale in [0, 1, 3, 4] {
             let mut req = refine_request();
-            req.refine = Some(RefineRequest { scale });
+            req.refine = Some(RefineRequest {
+                scale,
+                upscaler: Default::default(),
+            });
             assert_eq!(refine_code(&req), "MINIMAX_H3_REFINE_SCALE", "{scale}");
             assert_eq!(RefinePlan::for_request(&req), None);
         }
@@ -4759,7 +4785,8 @@ mod tests {
         assert!(plan4.is_tier_plan() && RefinePlan::PUBLISHED.is_tier_plan());
         assert!(!RefinePlan {
             scale: 2,
-            start_index: 3
+            start_index: 3,
+            upscaler: RefineUpscaler::Learned,
         }
         .is_tier_plan());
     }
@@ -4879,9 +4906,9 @@ mod tests {
         let wire = serde_json::to_value(&refined).unwrap();
         assert_eq!(wire["refine"], serde_json::json!({"scale": 2}));
         let back: GenerateRequest = serde_json::from_value(wire).unwrap();
-        assert_eq!(back.refine, Some(RefineRequest { scale: 2 }));
+        assert_eq!(back.refine, Some(RefineRequest { scale: 2, upscaler: Default::default() }));
         let metadata = crate::OutputMetadata::from_generate_request(&refined, 42, None, "test");
-        assert_eq!(metadata.refine, Some(RefineRequest { scale: 2 }));
+        assert_eq!(metadata.refine, Some(RefineRequest { scale: 2, upscaler: Default::default() }));
     }
 
     #[test]

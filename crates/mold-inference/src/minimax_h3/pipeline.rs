@@ -24,7 +24,7 @@ use mold_core::minimax_h3::{
     self as contract, Mode, Task, AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CONDITION_POSTERIOR_SEED,
     FIXED_FPS, MAX_REFERENCE_DIMENSION, MAX_REFERENCE_IMAGE_PIXELS, NOISE_DOMAIN_VERSION,
 };
-use mold_core::GenerateRequest;
+use mold_core::{GenerateRequest, RefineUpscaler};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
@@ -527,6 +527,10 @@ pub(crate) struct H3RefineProvenance {
     /// The sigmas the upscaled latents were re-noised to.
     pub sigma_video: f32,
     pub sigma_audio: f32,
+    /// The spatial upsample pass 1's latent went through. Serialised only when
+    /// it is not the default learned upscaler.
+    #[serde(default, skip_serializing_if = "RefineUpscaler::is_learned")]
+    pub upscaler: RefineUpscaler,
 }
 
 // Sigmas are finite by construction (the schedule validates its grid), so
@@ -539,6 +543,7 @@ impl H3RefineProvenance {
         contract::RefinePlan {
             scale: self.scale,
             start_index: self.start_index,
+            upscaler: self.upscaler,
         }
     }
 }

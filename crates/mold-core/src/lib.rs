@@ -129,7 +129,7 @@ pub use print_title::{
 pub use prompt_text::normalize_prompt_newlines;
 pub use reference_upload::{ReferenceUploadLease, ReferenceUploadSource};
 pub use types::GenerateRequest;
-pub use types::RefineRequest;
+pub use types::{RefineRequest, RefineUpscaler};
 pub use types::Scheduler;
 pub use types::*;
 pub use validation::{
