@@ -2265,7 +2265,11 @@ pub(crate) fn validate_prepared_request(request: &H3FactoryPreparedRequestInput)
             !contract::RefinePlan::for_grid_points_scale(request.grid_points, plan.scale)
                 .is_some_and(|tier| tier.same_schedule(&plan))
                 || request.task != Task::Ref2va
-                || !contract::is_admitted_refine_final_canvas(request.width, request.height)
+                || !contract::is_admitted_refine_final_canvas(
+                    request.width,
+                    request.height,
+                    plan.scale,
+                )
         })
         || !(contract::MIN_ASPECT_RATIO..=contract::MAX_ASPECT_RATIO).contains(&aspect_ratio)
         || !contract::valid_frame_count(request.frames)

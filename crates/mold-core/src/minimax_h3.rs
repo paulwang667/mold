@@ -619,9 +619,19 @@ pub fn is_admitted_compact_canvas(width: u32, height: u32) -> bool {
 // qualified campaign's arithmetic actually applies to.
 // ---------------------------------------------------------------------------
 
-/// The only `scale` a refine request may carry: the final canvas is exactly
-/// twice pass 1's in each axis.
+/// The `scale` values a refine request may carry: the final canvas is that many
+/// times pass 1's in each axis. 2 is the published scale; 3 and 4 run on the
+/// learned latent upscaler (trained over 1.0–4.0) and are admitted only on the
+/// canvases [`is_admitted_refine_final_canvas`] allows.
+pub const H3_REFINE_SCALES: [u32; 3] = [2, 3, 4];
+
+/// The default `scale`: the published 2x.
 pub const H3_REFINE_SCALE: u32 = 2;
+
+/// Whether a refine request's `scale` is one the door admits.
+pub fn is_supported_refine_scale(scale: u32) -> bool {
+    H3_REFINE_SCALES.contains(&scale)
+}
 
 /// The sigma-grid index pass 2 re-enters at. Index 4 of the 8-step, shift-12
 /// video grid is `sigma_video = 12 * 0.5 / (1 + 11 * 0.5) = 0.9231` (the audio
@@ -659,6 +669,12 @@ pub fn refine_start_index_for_model(model: &str) -> Option<u32> {
 /// Both axes of a refine request's FINAL canvas are multiples of this, so pass
 /// 1 lands on the 32-pixel packed-row grid.
 pub const REFINE_FINAL_ALIGNMENT: u32 = H3_REFINE_SCALE * VIDEO_ROW_STRIDE;
+
+/// Both axes of a refine request's FINAL canvas for `scale`: pass 1 at `1/scale`
+/// must land on the 32-pixel packed-row grid.
+pub const fn refine_final_alignment(scale: u32) -> u32 {
+    scale * VIDEO_ROW_STRIDE
+}
 
 /// Area ceiling of a refine request's FINAL canvas: 1920x1088 = 2,088,960.
 /// 2560x1408 ran in the research prototype but needs a flash-attention
@@ -698,17 +714,18 @@ pub fn refine_supported_model(model: &str) -> bool {
 pub enum CanvasRule {
     /// Every request without `refine`: the family/compact ceilings, unchanged.
     Compact,
-    /// A refine request: see [`is_admitted_refine_final_canvas`].
-    RefineFinal,
+    /// A refine request at `scale`: see [`is_admitted_refine_final_canvas`].
+    RefineFinal { scale: u32 },
 }
 
 impl CanvasRule {
     /// The rule for a request that may carry a refine block.
     pub fn for_refine(refine: Option<&RefineRequest>) -> Self {
-        if refine.is_some() {
-            Self::RefineFinal
-        } else {
-            Self::Compact
+        match refine {
+            Some(refine) => Self::RefineFinal {
+                scale: refine.scale,
+            },
+            None => Self::Compact,
         }
     }
 
@@ -719,10 +736,9 @@ impl CanvasRule {
 
     /// The rule for a request that resolved (or did not) to a [`RefinePlan`].
     pub fn for_plan(plan: Option<&RefinePlan>) -> Self {
-        if plan.is_some() {
-            Self::RefineFinal
-        } else {
-            Self::Compact
+        match plan {
+            Some(plan) => Self::RefineFinal { scale: plan.scale },
+            None => Self::Compact,
         }
     }
 }
@@ -752,7 +768,10 @@ impl RefinePlan {
     /// The 8-step tier's plan for a published `scale`, `None` for any other
     /// scale. A request resolves its plan with [`Self::for_model_scale`].
     pub fn for_scale(scale: u32) -> Option<Self> {
-        (scale == H3_REFINE_SCALE).then_some(Self::PUBLISHED)
+        is_supported_refine_scale(scale).then(|| Self {
+            scale,
+            ..Self::PUBLISHED
+        })
     }
 
     /// The plan a model's tier runs for a `scale`: the published scale and the
@@ -760,7 +779,7 @@ impl RefinePlan {
     /// a model that cannot refine.
     pub fn for_model_scale(model: &str, scale: u32) -> Option<Self> {
         let start_index = usize::try_from(refine_start_index_for_model(model)?).ok()?;
-        (scale == H3_REFINE_SCALE).then_some(Self {
+        is_supported_refine_scale(scale).then_some(Self {
             scale,
             start_index,
             upscaler: RefineUpscaler::Learned,
@@ -773,7 +792,7 @@ impl RefinePlan {
     /// request authority); `None` for another scale or a grid no tier refines on.
     pub fn for_grid_points_scale(grid_points: u32, scale: u32) -> Option<Self> {
         let start_index = usize::try_from(refine_start_index_for_grid_points(grid_points)?).ok()?;
-        (scale == H3_REFINE_SCALE).then_some(Self {
+        is_supported_refine_scale(scale).then_some(Self {
             scale,
             start_index,
             upscaler: RefineUpscaler::Learned,
@@ -790,7 +809,7 @@ impl RefinePlan {
     /// no model, so this is the strongest check available there; the model-aware
     /// comparison is `Some(self) == Self::for_model_scale(model, self.scale)`.
     pub fn is_tier_plan(&self) -> bool {
-        self.scale == H3_REFINE_SCALE
+        is_supported_refine_scale(self.scale)
             && [
                 H3_REFINE_START_INDEX,
                 H3_REFINE_START_INDEX_4STEP_EXPERIMENT,
@@ -846,19 +865,21 @@ impl RefinePlan {
 /// [`REFINE_FINAL_ALIGNMENT`], area within [`REFINE_MAX_PIXELS`], and the pass-1
 /// canvas (final / [`H3_REFINE_SCALE`]) inside the ordinary compact rule
 /// ([`is_admitted_compact_canvas`]: minimum axis, compact area ceiling, aspect).
-pub fn is_admitted_refine_final_canvas(width: u32, height: u32) -> bool {
-    refine_final_canvas_refusal(width, height).is_none()
+pub fn is_admitted_refine_final_canvas(width: u32, height: u32, scale: u32) -> bool {
+    refine_final_canvas_refusal(width, height, scale).is_none()
 }
 
 /// The first clause of the refine canvas rule a final canvas breaks.
-fn refine_final_canvas_refusal(width: u32, height: u32) -> Option<ContractError> {
-    let Some((pass1_width, pass1_height)) = RefinePlan::PUBLISHED.pass1_canvas(width, height)
+fn refine_final_canvas_refusal(width: u32, height: u32, scale: u32) -> Option<ContractError> {
+    let alignment = refine_final_alignment(scale);
+    let Some((pass1_width, pass1_height)) =
+        RefinePlan { scale, ..RefinePlan::PUBLISHED }.pass1_canvas(width, height)
     else {
         return Some(violation(
             "MINIMAX_H3_REFINE_ALIGNMENT",
             format!(
-                "refine renders pass 1 at half the requested canvas, so both axes must be \
-                 multiples of {REFINE_FINAL_ALIGNMENT}; received {width}x{height}"
+                "refine renders pass 1 at 1/{scale} of the requested canvas, so both axes must \
+                 be multiples of {alignment}; received {width}x{height}"
             ),
         ));
     };
@@ -876,7 +897,7 @@ fn refine_final_canvas_refusal(width: u32, height: u32) -> Option<ContractError>
         return Some(violation(
             "MINIMAX_H3_REFINE_PASS1_CANVAS",
             format!(
-                "refine's pass-1 canvas {pass1_width}x{pass1_height} (half of {width}x{height}) \
+                "refine's pass-1 canvas {pass1_width}x{pass1_height} (1/{scale} of {width}x{height}) \
                  must itself be an admitted compact canvas: axes multiples of {VIDEO_ROW_STRIDE}, \
                  at least {MIN_COMPACT_AXIS_PIXELS} px, at most {COMPACT_MAX_PIXELS} pixels in \
                  total, aspect ratio in [{MIN_ASPECT_RATIO}, {MAX_ASPECT_RATIO}]"
@@ -892,7 +913,7 @@ fn refine_final_canvas_refusal(width: u32, height: u32) -> Option<ContractError>
 pub fn request_max_pixels(rule: CanvasRule) -> u64 {
     match rule {
         CanvasRule::Compact => MAX_PIXELS,
-        CanvasRule::RefineFinal => REFINE_MAX_PIXELS.max(MAX_PIXELS),
+        CanvasRule::RefineFinal { .. } => REFINE_MAX_PIXELS.max(MAX_PIXELS),
     }
 }
 
@@ -903,7 +924,7 @@ pub fn request_max_pixels(rule: CanvasRule) -> u64 {
 pub fn is_admitted_request_canvas(width: u32, height: u32, rule: CanvasRule) -> bool {
     match rule {
         CanvasRule::Compact => is_admitted_compact_canvas(width, height),
-        CanvasRule::RefineFinal => is_admitted_refine_final_canvas(width, height),
+        CanvasRule::RefineFinal { scale } => is_admitted_refine_final_canvas(width, height, scale),
     }
 }
 
@@ -2831,8 +2852,8 @@ pub fn validate_reviewed_canvas(req: &GenerateRequest) -> Result<(), ContractErr
     if valid_dimensions_for_model_with_rule(FAMILY, &req.model, req.width, req.height, rule) {
         return Ok(());
     }
-    if rule == CanvasRule::RefineFinal {
-        if let Some(error) = refine_final_canvas_refusal(req.width, req.height) {
+    if let CanvasRule::RefineFinal { scale } = rule {
+        if let Some(error) = refine_final_canvas_refusal(req.width, req.height, scale) {
             return Err(error);
         }
     }
@@ -2934,11 +2955,11 @@ fn validate_refine_request(
             ),
         ));
     };
-    if refine.scale != H3_REFINE_SCALE {
+    if !is_supported_refine_scale(refine.scale) {
         return Err(violation(
             "MINIMAX_H3_REFINE_SCALE",
             format!(
-                "refine.scale must be {H3_REFINE_SCALE}; received {}",
+                "refine.scale must be one of 2, 3 or 4; received {}",
                 refine.scale
             ),
         ));
@@ -2956,7 +2977,7 @@ fn validate_refine_request(
             ),
         ));
     }
-    match refine_final_canvas_refusal(req.width, req.height) {
+    match refine_final_canvas_refusal(req.width, req.height, refine.scale) {
         Some(error) => Err(error),
         None => Ok(()),
     }
@@ -4619,7 +4640,7 @@ mod tests {
 
     #[test]
     fn refine_takes_scale_two_and_the_tiers_own_grid_only() {
-        for scale in [0, 1, 3, 4] {
+        for scale in [0, 1, 5, 6] {
             let mut req = refine_request();
             req.refine = Some(RefineRequest {
                 scale,
@@ -4659,8 +4680,46 @@ mod tests {
             let reviewed = validate_reviewed_canvas(&req).unwrap_err();
             assert_eq!(reviewed.code, code, "{width}x{height} reviewed canvas");
         }
-        assert!(is_admitted_refine_final_canvas(1920, 1088));
-        assert!(!is_admitted_refine_final_canvas(1920, 1152));
+        assert!(is_admitted_refine_final_canvas(1920, 1088, 2));
+        assert!(!is_admitted_refine_final_canvas(1920, 1152, 2));
+    }
+
+    #[test]
+    fn refine_admits_3x_and_4x_only_on_their_own_alignment_and_pass_one_floor() {
+        // 3x: both final axes multiples of 96; pass 1 (1/3) at least 256 px a side.
+        assert!(is_admitted_refine_final_canvas(1344, 768, 3));
+        assert!(is_admitted_refine_final_canvas(1920, 960, 3));
+        assert!(!is_admitted_refine_final_canvas(1344, 576, 3), "pass 1 would be 192 px high");
+        assert!(!is_admitted_refine_final_canvas(1344, 672, 3), "672 is not a multiple of 96");
+        // 4x: multiples of 128; pass 1 (1/4) at least 256 px a side.
+        assert!(is_admitted_refine_final_canvas(1920, 1024, 4));
+        assert!(!is_admitted_refine_final_canvas(1344, 768, 4), "1344 is not a multiple of 128");
+        assert!(!is_admitted_refine_final_canvas(1280, 768, 4), "pass 1 would be 192 px high");
+        assert_eq!(refine_final_alignment(2), 64);
+        assert_eq!(refine_final_alignment(3), 96);
+        assert_eq!(refine_final_alignment(4), 128);
+    }
+
+    #[test]
+    fn the_door_admits_the_supported_scales_and_refuses_the_rest() {
+        for scale in H3_REFINE_SCALES {
+            assert!(is_supported_refine_scale(scale));
+        }
+        assert!(!is_supported_refine_scale(1));
+        assert!(!is_supported_refine_scale(5));
+        let mut req = refine_request();
+        req.width = 1344;
+        req.height = 768;
+        req.refine = Some(RefineRequest {
+            scale: 3,
+            upscaler: Default::default(),
+        });
+        validate_request_contract(&req, Task::Ref2va).expect("3x on 1344x768 is admitted");
+        req.refine = Some(RefineRequest {
+            scale: 5,
+            upscaler: Default::default(),
+        });
+        assert_eq!(refine_code(&req), "MINIMAX_H3_REFINE_SCALE");
     }
 
     #[test]
@@ -4693,10 +4752,10 @@ mod tests {
         assert_eq!(CanvasRule::for_request(&req), CanvasRule::Compact);
         assert_eq!(
             CanvasRule::for_request(&refine_request()),
-            CanvasRule::RefineFinal
+            CanvasRule::RefineFinal { scale: 2 }
         );
         assert_eq!(
-            request_max_pixels(CanvasRule::RefineFinal),
+            request_max_pixels(CanvasRule::RefineFinal { scale: 2 }),
             REFINE_MAX_PIXELS
         );
     }
@@ -4715,7 +4774,7 @@ mod tests {
         assert_eq!(plan.total_forwards(8), Some(12));
         assert_eq!(plan.total_forwards(4), None, "start 4 addresses no forward");
         assert_eq!(RefinePlan::for_scale(2), Some(plan));
-        assert_eq!(RefinePlan::for_scale(3), None);
+        assert_eq!(RefinePlan::for_scale(5), None);
         assert_eq!(REFINE_FINAL_ALIGNMENT, 64);
         assert_eq!(REFINE_MAX_PIXELS, 2_088_960);
     }
@@ -4778,7 +4837,7 @@ mod tests {
         assert_eq!((plan4.scale, plan4.start_index), (2, 2));
         assert_ne!(plan4, RefinePlan::PUBLISHED);
         assert_eq!(
-            RefinePlan::for_model_scale(REF2VA_COMFY_TURBO_4STEP, 3),
+            RefinePlan::for_model_scale(REF2VA_COMFY_TURBO_4STEP, 5),
             None
         );
         assert_eq!(RefinePlan::for_model_scale(FL2VA_COMFY, 2), None);
@@ -4854,7 +4913,7 @@ mod tests {
                 "{model}"
             );
         }
-        assert_eq!(RefinePlan::for_grid_points_scale(5, 3), None);
+        assert_eq!(RefinePlan::for_grid_points_scale(5, 5), None);
     }
 
     #[test]

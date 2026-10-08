@@ -3135,7 +3135,9 @@ fn validate_generate_request_after_activation_with(
                 family,
                 composition,
                 dimension_alignment_for_model(&req.model, family),
-                crate::minimax_h3::request_max_pixels(crate::minimax_h3::CanvasRule::RefineFinal),
+                crate::minimax_h3::request_max_pixels(crate::minimax_h3::CanvasRule::RefineFinal {
+                    scale: crate::minimax_h3::H3_REFINE_SCALE,
+                }),
             )?;
         } else {
             validate_generation_dimensions_for_model(

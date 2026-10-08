@@ -1624,10 +1624,10 @@ pub fn validate_refine_against_recipe(
         "refine is not supported by this recipe (MiniMax H3 Ref2VA Turbo 8-step 768p only)"
             .to_string()
     })?;
-    if refine.scale != capability.scale {
+    if !crate::minimax_h3::is_supported_refine_scale(refine.scale) {
         return Err(format!(
-            "refine.scale must be {}; received {}",
-            capability.scale, refine.scale
+            "refine.scale must be one of 2, 3 or 4; received {}",
+            refine.scale
         ));
     }
     if request.steps != capability.steps {
@@ -1637,10 +1637,10 @@ pub fn validate_refine_against_recipe(
         ));
     }
     let (width, height) = (request.width, request.height);
-    if !width.is_multiple_of(capability.alignment) || !height.is_multiple_of(capability.alignment) {
+    let alignment = crate::minimax_h3::refine_final_alignment(refine.scale);
+    if !width.is_multiple_of(alignment) || !height.is_multiple_of(alignment) {
         return Err(format!(
-            "refine needs both axes to be multiples of {}; received {width}x{height}",
-            capability.alignment
+            "refine needs both axes to be multiples of {alignment}; received {width}x{height}"
         ));
     }
     if u64::from(width) * u64::from(height) > capability.max_pixels {
@@ -5549,10 +5549,10 @@ mod tests {
             .contains("multiples of 64"));
         request.width = 1920;
         request.height = 1088;
-        request.refine = Some(crate::RefineRequest { scale: 3, upscaler: Default::default() });
+        request.refine = Some(crate::RefineRequest { scale: 5, upscaler: Default::default() });
         assert!(validate_request_against_recipe(recipe, &request)
             .unwrap_err()
-            .contains("refine.scale must be 2"));
+            .contains("refine.scale must be one of 2, 3 or 4"));
 
         // A recipe that does not advertise the control refuses the block.
         let other =

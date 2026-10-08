@@ -231,7 +231,9 @@ pub(crate) fn prepare_authoring(
             width,
             height,
             if refine {
-                minimax_h3::CanvasRule::RefineFinal
+                minimax_h3::CanvasRule::RefineFinal {
+                    scale: minimax_h3::H3_REFINE_SCALE,
+                }
             } else {
                 minimax_h3::CanvasRule::Compact
             },
@@ -444,16 +446,16 @@ fn validate_dimensions(width: u32, height: u32, rule: minimax_h3::CanvasRule) ->
             recommended_height,
         );
     }
-    if rule == minimax_h3::CanvasRule::RefineFinal
-        && !minimax_h3::is_admitted_refine_final_canvas(width, height)
-    {
-        anyhow::bail!(
-            "--refine renders pass 1 at half the requested size: both axes must be multiples of {}, the area at most {} pixels, and half of {width}x{height} must itself be an admitted compact canvas ({} px minimum axis, at most {} pixels)",
-            minimax_h3::REFINE_FINAL_ALIGNMENT,
-            minimax_h3::REFINE_MAX_PIXELS,
-            minimax_h3::MIN_COMPACT_AXIS_PIXELS,
-            minimax_h3::COMPACT_MAX_PIXELS,
-        );
+    if let minimax_h3::CanvasRule::RefineFinal { scale } = rule {
+        if !minimax_h3::is_admitted_refine_final_canvas(width, height, scale) {
+            anyhow::bail!(
+                "--refine renders pass 1 at 1/{scale} of the requested size: both axes must be multiples of {}, the area at most {} pixels, and 1/{scale} of {width}x{height} must itself be an admitted compact canvas ({} px minimum axis, at most {} pixels)",
+                minimax_h3::refine_final_alignment(scale),
+                minimax_h3::REFINE_MAX_PIXELS,
+                minimax_h3::MIN_COMPACT_AXIS_PIXELS,
+                minimax_h3::COMPACT_MAX_PIXELS,
+            );
+        }
     }
     Ok(())
 }
@@ -948,12 +950,17 @@ mod tests {
     fn refine_widens_the_cli_canvas_ceiling_only_for_a_refine_request() {
         use minimax_h3::CanvasRule;
         assert!(validate_dimensions(1920, 1088, CanvasRule::Compact).is_err());
-        validate_dimensions(1920, 1088, CanvasRule::RefineFinal).unwrap();
+        let refine = CanvasRule::RefineFinal { scale: 2 };
+        validate_dimensions(1920, 1088, refine).unwrap();
         validate_dimensions(1344, 768, CanvasRule::Compact).unwrap();
-        validate_dimensions(1344, 768, CanvasRule::RefineFinal).unwrap();
+        validate_dimensions(1344, 768, refine).unwrap();
         // The refine rule still refuses what it cannot split or hold.
-        assert!(validate_dimensions(1376, 576, CanvasRule::RefineFinal).is_err());
-        assert!(validate_dimensions(2560, 1408, CanvasRule::RefineFinal).is_err());
+        assert!(validate_dimensions(1376, 576, refine).is_err());
+        assert!(validate_dimensions(2560, 1408, refine).is_err());
+        // 3x and 4x run on their own alignment; 1344x576 at 3x leaves pass 1 too short.
+        validate_dimensions(1344, 768, CanvasRule::RefineFinal { scale: 3 }).unwrap();
+        validate_dimensions(1920, 1024, CanvasRule::RefineFinal { scale: 4 }).unwrap();
+        assert!(validate_dimensions(1344, 576, CanvasRule::RefineFinal { scale: 3 }).is_err());
     }
 
     #[test]
